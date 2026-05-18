@@ -9,3 +9,7 @@ description = "Binary space partitioning over 2D polygon sets."
 
 [dependencies]
 rsnav-common.workspace = true
+rsnav-navmesh.workspace = true
+
+[dev-dependencies]
+rsnav-triangle.workspace = true
