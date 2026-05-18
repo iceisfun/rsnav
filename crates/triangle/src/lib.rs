@@ -12,10 +12,11 @@ pub mod io;
 pub mod mesh;
 pub mod predicates;
 pub mod pslg;
+pub mod segment;
 pub mod sort;
 
 pub use divconq::{delaunay, DivConqOptions};
-
 pub use mesh::{CdtMesh, Otri, Osub, VertexSlot, VertexType};
 pub use predicates::{incircle, orient2d};
 pub use pslg::{Pslg, PslgHole, PslgSegment, PslgVertex};
+pub use segment::{form_skeleton, insert_segment, make_vertex_map, mark_hull};
