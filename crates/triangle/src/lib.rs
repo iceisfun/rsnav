@@ -6,8 +6,11 @@
 //!
 //! Work in progress — see crate README for porting status.
 
+pub mod io;
 pub mod mesh;
 pub mod predicates;
+pub mod pslg;
 
 pub use mesh::{CdtMesh, Otri, Osub, VertexSlot, VertexType};
 pub use predicates::{incircle, orient2d};
+pub use pslg::{Pslg, PslgHole, PslgSegment, PslgVertex};
