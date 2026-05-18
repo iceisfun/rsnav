@@ -8,6 +8,7 @@ members = [
     "crates/bsp",
     "crates/navigation",
     "crates/pathing",
+    "crates/demo",
 ]
 
 [workspace.package]
