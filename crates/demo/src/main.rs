@@ -15,7 +15,7 @@
 //!     source is set) a line-of-sight indicator (green clear / red blocked
 //!     at the wall hit).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use egui::{Color32, Pos2, Sense, Shape, Stroke, Vec2};
@@ -35,6 +35,11 @@ use rsnav_triangle::{
 /// File the Save / Load buttons read and write. Kept in CWD so it's easy
 /// to find next to the binary; rename interesting captures to keep them.
 const DEBUG_FILE: &str = "rsnav-debug.json";
+
+/// Default directory for the "fixtures" browser. The text input under the
+/// Fixtures section is pre-filled with this and is editable, so you can
+/// point at any directory of *.json files.
+const DEFAULT_FIXTURES_DIR: &str = "~/work/gonav/testdata";
 
 // =========================================================================
 // Entry point
@@ -58,7 +63,6 @@ fn main() -> eframe::Result<()> {
 // App state
 // =========================================================================
 
-#[derive(Default)]
 struct DemoApp {
     // Authoring
     perimeters: Vec<Polygon>,
@@ -79,6 +83,12 @@ struct DemoApp {
 
     // Status line shown under the tool panel (Save / Load / Build feedback).
     status: Option<String>,
+
+    // Fixture browser: which directory to scan and the last-scanned listing
+    // so we don't read the filesystem every frame.
+    fixtures_dir: String,
+    fixture_listing: Vec<PathBuf>,
+    fixtures_scanned_from: Option<String>,
 }
 
 #[derive(Clone)]
@@ -98,6 +108,28 @@ struct Drawing {
 enum DrawingKind {
     Perimeter,
     Hole,
+}
+
+impl Default for DemoApp {
+    fn default() -> Self {
+        Self {
+            perimeters: Vec::new(),
+            holes: Vec::new(),
+            drawing: None,
+            next_marker: 0,
+            navmesh: None,
+            bsp: None,
+            last_build_error: None,
+            path_src: None,
+            last_path: None,
+            path_distance_from_wall: 0.0,
+            hover_canvas: None,
+            status: None,
+            fixtures_dir: DEFAULT_FIXTURES_DIR.to_string(),
+            fixture_listing: Vec::new(),
+            fixtures_scanned_from: None,
+        }
+    }
 }
 
 impl DemoApp {
@@ -154,7 +186,13 @@ impl DemoApp {
     /// (`outer_polygon`, single perimeter).
     fn load_debug(&mut self) {
         let path = save_path();
-        let text = match std::fs::read_to_string(&path) {
+        self.load_from_path(&path);
+    }
+
+    /// Read and adopt polygons from any JSON file. Used by both the
+    /// debug Save/Load flow and the fixture browser.
+    fn load_from_path(&mut self, path: &Path) {
+        let text = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
                 self.status = Some(format!("load failed: {e}"));
@@ -173,10 +211,17 @@ impl DemoApp {
             perimeters.insert(0, single);
         }
         if perimeters.is_empty() {
-            self.status = Some("load: no perimeters in file".into());
+            self.status = Some(format!(
+                "load: no perimeter in {} (fixture probably has only `holes`)",
+                path.display()
+            ));
             return;
         }
-        // Reset everything else and adopt the loaded geometry.
+        // Preserve fixture-browser state across the reset so the user
+        // can keep clicking through fixtures.
+        let fixtures_dir = self.fixtures_dir.clone();
+        let fixture_listing = self.fixture_listing.clone();
+        let fixtures_scanned_from = self.fixtures_scanned_from.clone();
         let mut new_app = DemoApp::default();
         new_app.perimeters = perimeters
             .into_iter()
@@ -196,8 +241,42 @@ impl DemoApp {
             })
             .collect();
         new_app.next_marker = 2000;
+        new_app.fixtures_dir = fixtures_dir;
+        new_app.fixture_listing = fixture_listing;
+        new_app.fixtures_scanned_from = fixtures_scanned_from;
         new_app.status = Some(format!("loaded ← {}", path.display()));
         *self = new_app;
+    }
+
+    /// Refresh the fixture browser list from `self.fixtures_dir`. Expands
+    /// a leading `~` to `$HOME`. Sorts results so the order is stable.
+    fn refresh_fixture_listing(&mut self) {
+        let dir = expand_tilde(&self.fixtures_dir);
+        match std::fs::read_dir(&dir) {
+            Ok(entries) => {
+                let mut files: Vec<PathBuf> = entries
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| {
+                        p.extension()
+                            .and_then(|x| x.to_str())
+                            .map_or(false, |x| x.eq_ignore_ascii_case("json"))
+                    })
+                    .collect();
+                files.sort();
+                self.fixture_listing = files;
+                self.fixtures_scanned_from = Some(self.fixtures_dir.clone());
+                self.status = Some(format!(
+                    "scanned {}: {} .json file(s)",
+                    dir.display(),
+                    self.fixture_listing.len()
+                ));
+            }
+            Err(e) => {
+                self.fixture_listing.clear();
+                self.fixtures_scanned_from = None;
+                self.status = Some(format!("scan failed {}: {}", dir.display(), e));
+            }
+        }
     }
 
     fn cancel_drawing(&mut self) {
@@ -465,6 +544,45 @@ impl DemoApp {
                 .clicked()
             {
                 self.load_debug();
+            }
+        });
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.collapsing("Fixtures", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("dir:");
+                ui.add(egui::TextEdit::singleline(&mut self.fixtures_dir).desired_width(160.0));
+            });
+            if ui.button("Scan").clicked() {
+                self.refresh_fixture_listing();
+            }
+            // Auto-scan on first open of this collapser so the list
+            // doesn't appear empty after launch.
+            if self.fixtures_scanned_from.as_deref() != Some(self.fixtures_dir.as_str()) {
+                self.refresh_fixture_listing();
+            }
+            if self.fixture_listing.is_empty() {
+                ui.label("no .json files");
+            } else {
+                let listing = self.fixture_listing.clone();
+                egui::ScrollArea::vertical()
+                    .max_height(200.0)
+                    .show(ui, |ui| {
+                        for path in &listing {
+                            let name = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.display().to_string());
+                            if ui
+                                .button(&name)
+                                .on_hover_text(path.display().to_string())
+                                .clicked()
+                            {
+                                self.load_from_path(path);
+                            }
+                        }
+                    });
             }
         });
 
@@ -805,6 +923,21 @@ fn save_path() -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(DEBUG_FILE)
+}
+
+/// Expand a leading `~` to `$HOME`. Leaves everything else alone.
+fn expand_tilde(s: &str) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~") {
+        if let Ok(home) = std::env::var("HOME") {
+            let mut p = PathBuf::from(home);
+            let rest = rest.strip_prefix('/').unwrap_or(rest);
+            if !rest.is_empty() {
+                p.push(rest);
+            }
+            return p;
+        }
+    }
+    PathBuf::from(s)
 }
 
 /// Deterministic per-region color so disconnected regions are visually
