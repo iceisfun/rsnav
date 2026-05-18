@@ -206,7 +206,6 @@ fn make_triangle_or_edges(
         mesh.set_dest(tri1, a);
         mesh.set_org(tri3, a);
 
-        let farright;
         if area > 0.0 {
             // CCW order.
             mesh.set_dest(midtri, b);
@@ -215,7 +214,6 @@ fn make_triangle_or_edges(
             mesh.set_apex(midtri, c);
             mesh.set_org(tri2, c);
             mesh.set_dest(tri3, c);
-            farright = tri2;
         } else {
             // CW order — internally reorder so midtri ends up CCW (a, c, b).
             mesh.set_dest(midtri, c);
@@ -224,8 +222,6 @@ fn make_triangle_or_edges(
             mesh.set_apex(midtri, b);
             mesh.set_org(tri2, b);
             mesh.set_dest(tri3, b);
-            // farright is computed below from lnext(*farleft).
-            farright = Otri::DUMMY; // placeholder; reassigned after bonding.
         }
 
         // Same topology either way.
@@ -244,12 +240,17 @@ fn make_triangle_or_edges(
         tri3 = tri3.lprev();
         mesh.bond(tri2, tri3);
 
+        // "Ensure that the origin of farleft is sortarray[0]"
+        // → after the bonds, tri1 is at orient 1; org(tri1@1) = a. ✓
         let farleft = tri1;
+        // "Ensure that the destination of farright is sortarray[2]"
+        // CCW: farright = tri2 (at orient 2 after the lnexts); dest(tri2@2) = sortarray[2].
+        // CW (input order): tri2 stores (sortarray[2] at vertices[1], sortarray[1] at vertices[2]),
+        // so dest(tri2@2) = sortarray[1] (wrong). Instead farright = lnext(farleft) = tri1@2;
+        // dest(tri1@2) = sortarray[2]. ✓
         let farright = if area > 0.0 {
-            farright
+            tri2
         } else {
-            // "Ensure that the destination of farright is sortarray[2]"
-            // i.e. dest = c. With CW input, farright = lnext(farleft).
             farleft.lnext()
         };
         (farleft, farright)
@@ -765,20 +766,7 @@ mod tests {
     /// Stress test: 200 deterministically-pseudo-random points in [0, 1)^2.
     /// Validates the Euler relation, CCW orientation of every triangle, and
     /// the global Delaunay property.
-    ///
-    /// **Known bug:** ignored pending a fix to `merge_hulls`. Inputs whose
-    /// recursion bottoms out with two 3-vertex base cases adjacent (n >= 6
-    /// in many configurations) leak ghost triangles that `remove_ghosts`
-    /// can't reach, and one of the input vertices ends up missing from any
-    /// real triangle. The base-case helpers and the elimination-loop logic
-    /// individually look correct against the C reference; the suspected
-    /// regression is in the vertex-slot writes of the first elimination
-    /// step's in-place flip when both `nextedge` and `leftcand` already
-    /// share a half-edge structure inherited from the 3-vertex base case.
-    /// See `crates/triangle/examples/probe.rs` (deleted but recoverable
-    /// from git history) for the reduced repro.
     #[test]
-    #[ignore = "merge_hulls bug: 6+ point inputs leak ghosts and lose a vertex"]
     fn random_200_points_delaunay() {
         let mut m = CdtMesh::new();
         let mut state = 0xDEAD_BEEF_C0DE_F00Du64;
