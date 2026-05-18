@@ -6,6 +6,8 @@
 //!
 //! Work in progress — see crate README for porting status.
 
+pub mod mesh;
 pub mod predicates;
 
+pub use mesh::{CdtMesh, Otri, Osub, VertexSlot, VertexType};
 pub use predicates::{incircle, orient2d};
