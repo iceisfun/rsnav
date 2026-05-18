@@ -11,6 +11,7 @@ pub mod io;
 pub mod mesh;
 pub mod predicates;
 pub mod pslg;
+pub mod sort;
 
 pub use mesh::{CdtMesh, Otri, Osub, VertexSlot, VertexType};
 pub use predicates::{incircle, orient2d};
