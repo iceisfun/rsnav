@@ -10,3 +10,7 @@ description = "Path search, funnel/string-pull, line-of-sight, visibility, neare
 [dependencies]
 rsnav-common.workspace = true
 rsnav-navmesh.workspace = true
+rsnav-bsp.workspace = true
+
+[dev-dependencies]
+rsnav-triangle.workspace = true
