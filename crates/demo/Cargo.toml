@@ -15,6 +15,8 @@ rsnav-bsp.workspace = true
 rsnav-navigation.workspace = true
 eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
 egui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [[bin]]
 name = "rsnav-demo"

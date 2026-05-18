@@ -15,8 +15,11 @@
 //!     source is set) a line-of-sight indicator (green clear / red blocked
 //!     at the wall hit).
 
+use std::path::PathBuf;
+
 use eframe::egui;
 use egui::{Color32, Pos2, Sense, Shape, Stroke, Vec2};
+use serde::{Deserialize, Serialize};
 
 use rsnav_bsp::Bsp;
 use rsnav_common::{TriangleId, Vertex};
@@ -28,6 +31,10 @@ use rsnav_triangle::{
     pslg::{Pslg, PslgHole, PslgSegment, PslgVertex},
     CdtMesh, DivConqOptions, VertexSlot,
 };
+
+/// File the Save / Load buttons read and write. Kept in CWD so it's easy
+/// to find next to the binary; rename interesting captures to keep them.
+const DEBUG_FILE: &str = "rsnav-debug.json";
 
 // =========================================================================
 // Entry point
@@ -69,6 +76,9 @@ struct DemoApp {
     last_path: Option<Vec<Vertex>>,
     path_distance_from_wall: f64,
     hover_canvas: Option<Vertex>,
+
+    // Status line shown under the tool panel (Save / Load / Build feedback).
+    status: Option<String>,
 }
 
 #[derive(Clone)]
@@ -97,6 +107,97 @@ impl DemoApp {
 
     fn reset(&mut self) {
         *self = DemoApp::default();
+    }
+
+    /// Tear down the built navmesh and any exploration state, but keep
+    /// the authored polygons so the user can edit and re-Create.
+    fn back_to_authoring(&mut self) {
+        self.navmesh = None;
+        self.bsp = None;
+        self.path_src = None;
+        self.last_path = None;
+        self.last_build_error = None;
+        self.drawing = None;
+    }
+
+    /// Serialize the current authored polygons to JSON and write to
+    /// [`DEBUG_FILE`]. Updates `status`.
+    fn save_debug(&mut self) {
+        let file = SaveFile {
+            version: 1,
+            perimeters: self
+                .perimeters
+                .iter()
+                .map(|p| p.verts.iter().map(Point::from).collect())
+                .collect(),
+            outer_polygon: None,
+            holes: self
+                .holes
+                .iter()
+                .map(|p| p.verts.iter().map(Point::from).collect())
+                .collect(),
+        };
+        match serde_json::to_string_pretty(&file) {
+            Ok(json) => {
+                let path = save_path();
+                match std::fs::write(&path, json) {
+                    Ok(()) => self.status = Some(format!("saved → {}", path.display())),
+                    Err(e) => self.status = Some(format!("save failed: {e}")),
+                }
+            }
+            Err(e) => self.status = Some(format!("serialize failed: {e}")),
+        }
+    }
+
+    /// Load polygons from [`DEBUG_FILE`]. Accepts both our own format
+    /// (`perimeters` array) and the gonav fixture format
+    /// (`outer_polygon`, single perimeter).
+    fn load_debug(&mut self) {
+        let path = save_path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = Some(format!("load failed: {e}"));
+                return;
+            }
+        };
+        let parsed: SaveFile = match serde_json::from_str(&text) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = Some(format!("parse failed: {e}"));
+                return;
+            }
+        };
+        let mut perimeters = parsed.perimeters;
+        if let Some(single) = parsed.outer_polygon {
+            perimeters.insert(0, single);
+        }
+        if perimeters.is_empty() {
+            self.status = Some("load: no perimeters in file".into());
+            return;
+        }
+        // Reset everything else and adopt the loaded geometry.
+        let mut new_app = DemoApp::default();
+        new_app.perimeters = perimeters
+            .into_iter()
+            .enumerate()
+            .map(|(i, verts)| Polygon {
+                verts: verts.into_iter().map(Into::into).collect(),
+                marker: (i as i32 + 1) * 10,
+            })
+            .collect();
+        new_app.holes = parsed
+            .holes
+            .into_iter()
+            .enumerate()
+            .map(|(i, verts)| Polygon {
+                verts: verts.into_iter().map(Into::into).collect(),
+                marker: 1000 + i as i32 * 10,
+            })
+            .collect();
+        new_app.next_marker = 2000;
+        new_app.status = Some(format!("loaded ← {}", path.display()));
+        *self = new_app;
     }
 
     fn cancel_drawing(&mut self) {
@@ -304,6 +405,15 @@ impl DemoApp {
             ));
 
             ui.add_space(8.0);
+            if ui
+                .add(egui::Button::new("← Back to edit"))
+                .on_hover_text("Tear down the navmesh and edit the polygons. Geometry is preserved.")
+                .clicked()
+            {
+                self.back_to_authoring();
+            }
+
+            ui.add_space(8.0);
             ui.label("Path");
             ui.add(
                 egui::Slider::new(&mut self.path_distance_from_wall, 0.0..=40.0)
@@ -321,15 +431,44 @@ impl DemoApp {
             }
         }
 
+        // Save / Load are available in both modes — capturing a confusing
+        // build is exactly the case where you want to write to disk.
         ui.add_space(16.0);
         ui.separator();
+        ui.label(format!("Debug file: {}", DEBUG_FILE));
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.perimeters.is_empty() || !self.holes.is_empty(),
+                    egui::Button::new("Save"),
+                )
+                .on_hover_text("Write all perimeters + holes to rsnav-debug.json in the current directory.")
+                .clicked()
+            {
+                self.save_debug();
+            }
+            if ui
+                .button("Load")
+                .on_hover_text("Replace the current authoring state with rsnav-debug.json.")
+                .clicked()
+            {
+                self.load_debug();
+            }
+        });
+
+        ui.add_space(8.0);
         if ui.button("Reset everything").clicked() {
             self.reset();
         }
 
+        if let Some(s) = &self.status {
+            ui.add_space(8.0);
+            ui.colored_label(Color32::from_rgb(160, 200, 220), s);
+        }
+
         ui.add_space(12.0);
         ui.label("Tip: left-click to drop vertices.");
-        ui.label("Polygons close on the 'Close' button.");
+        ui.label("Right-click while drawing closes the polygon.");
     }
 
     fn canvas_panel(&mut self, ui: &mut egui::Ui) {
@@ -617,6 +756,44 @@ impl DemoApp {
 // =========================================================================
 // Helpers
 // =========================================================================
+
+// --- Save / Load JSON schema --------------------------------------------
+
+#[derive(Serialize, Deserialize)]
+struct SaveFile {
+    version: u32,
+    #[serde(default)]
+    perimeters: Vec<Vec<Point>>,
+    /// gonav-fixture compatibility: a single perimeter under this key gets
+    /// merged into `perimeters` on load. Never written on save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outer_polygon: Option<Vec<Point>>,
+    #[serde(default)]
+    holes: Vec<Vec<Point>>,
+}
+
+#[derive(Copy, Clone, Serialize, Deserialize)]
+struct Point {
+    x: f64,
+    y: f64,
+}
+
+impl From<&Vertex> for Point {
+    fn from(v: &Vertex) -> Self {
+        Self { x: v.x, y: v.y }
+    }
+}
+impl From<Point> for Vertex {
+    fn from(p: Point) -> Self {
+        Vertex::new(p.x, p.y)
+    }
+}
+
+fn save_path() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(DEBUG_FILE)
+}
 
 /// Deterministic per-region color so disconnected regions are visually
 /// distinguishable.
