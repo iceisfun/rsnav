@@ -91,6 +91,52 @@ impl Pslg {
     pub fn has_segment_markers(&self) -> bool {
         self.segments.iter().any(|s| s.marker != 0)
     }
+
+    /// Collapse exact-position duplicate vertices into single IDs and
+    /// remap every segment endpoint accordingly. Useful preprocessing
+    /// before [`crate::form_skeleton`], because the divide-and-conquer
+    /// Delaunay drops exact-position duplicates from its triangulation
+    /// — if any segment references one of the dropped IDs the segment
+    /// insertion later panics looking for a vertex that's no longer in
+    /// any live triangle.
+    ///
+    /// Two vertices are considered duplicates only when both coordinates
+    /// match bit-for-bit. Attribute and marker mismatches are resolved
+    /// to the first-encountered vertex (later duplicates inherit nothing
+    /// from the survivor).
+    ///
+    /// Degenerate segments (endpoints collapsed into the same canonical
+    /// vertex) are dropped silently. Holes are unchanged.
+    pub fn deduplicate(&self) -> Self {
+        use std::collections::HashMap;
+        let mut canonical_id: HashMap<(u64, u64), u32> = HashMap::new();
+        let mut new_vertices: Vec<PslgVertex> = Vec::new();
+        let mut remap: Vec<u32> = Vec::with_capacity(self.vertices.len());
+        for v in &self.vertices {
+            let key = (v.position.x.to_bits(), v.position.y.to_bits());
+            let id = *canonical_id.entry(key).or_insert_with(|| {
+                let new_id = new_vertices.len() as u32;
+                new_vertices.push(v.clone());
+                new_id
+            });
+            remap.push(id);
+        }
+        let new_segments: Vec<PslgSegment> = self
+            .segments
+            .iter()
+            .map(|s| PslgSegment {
+                a: remap[s.a as usize],
+                b: remap[s.b as usize],
+                marker: s.marker,
+            })
+            .filter(|s| s.a != s.b)
+            .collect();
+        Self {
+            vertices: new_vertices,
+            segments: new_segments,
+            holes: self.holes.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -103,6 +149,41 @@ mod tests {
         p.vertices.push(PslgVertex::new(Vertex::new(0.0, 0.0)).with_attribute(1.0));
         p.vertices.push(PslgVertex::new(Vertex::new(1.0, 0.0)).with_attribute(2.0));
         assert_eq!(p.vertex_attribute_count(), 1);
+    }
+
+    #[test]
+    fn deduplicate_collapses_exact_position_duplicates() {
+        let mut p = Pslg::new();
+        // Three positions: (0,0), (1,0), (0,0) again.
+        p.vertices.push(PslgVertex::new(Vertex::new(0.0, 0.0)));
+        p.vertices.push(PslgVertex::new(Vertex::new(1.0, 0.0)));
+        p.vertices.push(PslgVertex::new(Vertex::new(0.0, 0.0)));
+        // Segment 0 → 2 references the duplicate-of-0; should collapse to 0→0 and drop.
+        p.segments.push(PslgSegment::new(0, 1));
+        p.segments.push(PslgSegment::new(0, 2)); // degenerate after dedup
+        p.segments.push(PslgSegment::new(2, 1)); // should remap to 0→1
+
+        let d = p.deduplicate();
+        assert_eq!(d.vertices.len(), 2);
+        assert_eq!(d.segments.len(), 2);
+        // Both surviving segments should connect IDs 0 and 1 in some order.
+        for s in &d.segments {
+            assert!((s.a == 0 && s.b == 1) || (s.a == 1 && s.b == 0));
+        }
+    }
+
+    #[test]
+    fn deduplicate_preserves_unique_input_unchanged() {
+        let mut p = Pslg::new();
+        p.vertices.push(PslgVertex::new(Vertex::new(0.0, 0.0)));
+        p.vertices.push(PslgVertex::new(Vertex::new(1.0, 0.0)));
+        p.vertices.push(PslgVertex::new(Vertex::new(0.0, 1.0)));
+        p.segments.push(PslgSegment::new(0, 1));
+        p.segments.push(PslgSegment::new(1, 2));
+        p.segments.push(PslgSegment::new(2, 0));
+        let d = p.deduplicate();
+        assert_eq!(d.vertices, p.vertices);
+        assert_eq!(d.segments, p.segments);
     }
 
     #[test]

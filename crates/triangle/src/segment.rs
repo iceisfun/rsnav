@@ -429,26 +429,46 @@ pub fn insert_segment(
 }
 
 /// Look up a triangle that has `v` as one of its corners and return a handle
-/// at that corner (i.e. with `org` = v). Walks around `v` (via [`onextself`])
-/// until it finds the corner.
-fn locate_vertex(mesh: &CdtMesh, v: VertexId) -> Otri {
+/// at that corner (i.e. with `org` = v).
+///
+/// Tries the cached `vertex.triangle` first (set by [`make_vertex_map`])
+/// — rotating through its three orientations to handle flips that left
+/// the same triangle but shuffled the vertex slots. If that fails the
+/// cache is stale (a prior segment-insertion flip moved `v` to a
+/// different triangle entirely) and we fall back to a linear scan over
+/// live triangles. On a successful scan we refresh the cache so the next
+/// lookup is O(1) again.
+///
+/// This mirrors triangle.c's `insertsegment()` which checks the cached
+/// triangle's org and falls back to `locate()` (point location) on
+/// mismatch. We use a linear scan instead of point location — it's O(n)
+/// per fallback, but the fallback only fires when flips have stale-d the
+/// cache, which scales with mesh complexity, not query count.
+fn locate_vertex(mesh: &mut CdtMesh, v: VertexId) -> Otri {
     let encoded = mesh.vertex(v).triangle;
-    assert!(
-        encoded.tri() != DUMMY_TRI,
-        "locate_vertex: vertex {} has no incident triangle (call make_vertex_map first)",
-        v.get()
-    );
-    let mut h = encoded.to_otri();
-    // Rotate the handle around v until `org` of h = v.
-    for _ in 0..3 {
-        if mesh.org(h) == v {
-            return h;
+    if encoded.tri() != DUMMY_TRI {
+        let base = encoded.to_otri();
+        for orient_off in 0..3u8 {
+            let candidate = Otri::new(base.tri, (base.orient + orient_off) % 3);
+            if mesh.org(candidate) == v {
+                return candidate;
+            }
         }
-        h = h.lnext();
+    }
+    for tri_idx in 1..mesh.triangles.len() as u32 {
+        if mesh.triangle(tri_idx).is_dead() {
+            continue;
+        }
+        for orient in 0..3u8 {
+            let h = Otri::new(tri_idx, orient);
+            if mesh.org(h) == v {
+                mesh.vertex_mut(v).triangle = h.encode();
+                return h;
+            }
+        }
     }
     panic!(
-        "locate_vertex: triangle {} doesn't actually contain vertex {}",
-        h.tri,
+        "locate_vertex: vertex {} not found in any live triangle",
         v.get()
     );
 }
@@ -561,7 +581,7 @@ mod tests {
         let c = push(&mut m, 2.5, 5.0);
         delaunay(&mut m, DivConqOptions::default());
         make_vertex_map(&mut m);
-        let mut handle = locate_vertex(&m, a);
+        let mut handle = locate_vertex(&mut m, a);
         let result = find_direction(&m, &mut handle, c);
         assert_eq!(m.org(handle), a);
         // c is a corner of the only real triangle; the handle should end

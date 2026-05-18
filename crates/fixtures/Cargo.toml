@@ -1,0 +1,20 @@
+[package]
+name = "rsnav-fixtures"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI: run the navmesh pipeline over a directory of PSLG fixtures (gonav-format JSON) and report per-file status."
+
+[dependencies]
+rsnav-common.workspace = true
+rsnav-triangle.workspace = true
+rsnav-navmesh.workspace = true
+rsnav-bsp.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "rsnav-fixtures"
+path = "src/main.rs"

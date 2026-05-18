@@ -274,6 +274,14 @@ impl DemoApp {
             }
         }
 
+        // Collapse exact-position duplicate vertices before the CDT —
+        // delaunay() drops duplicates from its triangulation and any
+        // segment referencing a dropped vertex then crashes
+        // segment insertion. Real authored fixtures hit this (e.g. when
+        // adjacent perimeter and hole rings happen to share a vertex
+        // position).
+        let pslg = pslg.deduplicate();
+
         // Build pipeline.
         let mut cdt = CdtMesh::new();
         for v in &pslg.vertices {

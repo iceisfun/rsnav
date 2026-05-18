@@ -1653,6 +1653,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsnav-fixtures"
+version = "0.1.0"
+dependencies = [
+ "rsnav-bsp",
+ "rsnav-common",
+ "rsnav-navmesh",
+ "rsnav-triangle",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rsnav-navigation"
 version = "0.1.0"
 dependencies = [
