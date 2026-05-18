@@ -17,7 +17,9 @@ pub mod astar;
 pub mod funnel;
 pub mod los;
 pub mod path;
+pub mod visibility;
 pub mod wall;
 
 pub use los::{line_of_sight, LineOfSightResult};
 pub use path::{find_path, nearest_point, NearestPoint, PathError, PathOptions, PathResult};
+pub use visibility::{visibility_region, VisibilityRegion};

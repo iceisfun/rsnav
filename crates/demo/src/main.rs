@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 
 use rsnav_bsp::Bsp;
 use rsnav_common::{Aabb, Polygon as CommonPolygon, TriangleId, Vertex};
-use rsnav_navigation::{find_path, line_of_sight, nearest_point, LineOfSightResult, PathOptions};
+use rsnav_navigation::{
+    find_path, line_of_sight, nearest_point, visibility_region, LineOfSightResult, PathOptions,
+};
 use rsnav_navmesh::{build_from_cdt, NavMesh};
 use rsnav_triangle::{
     carve_holes, delaunay,
@@ -80,6 +82,9 @@ struct DemoApp {
     last_path: Option<Vec<Vertex>>,
     path_distance_from_wall: f64,
     hover_canvas: Option<Vertex>,
+    show_visibility: bool,
+    visibility_radius: f64,
+    visibility_samples: usize,
 
     // Status line shown under the tool panel (Save / Load / Build feedback).
     status: Option<String>,
@@ -184,6 +189,9 @@ impl Default for DemoApp {
             last_path: None,
             path_distance_from_wall: 0.0,
             hover_canvas: None,
+            show_visibility: false,
+            visibility_radius: 200.0,
+            visibility_samples: 180,
             status: None,
             fixtures_dir: DEFAULT_FIXTURES_DIR.to_string(),
             fixture_listing: Vec::new(),
@@ -617,6 +625,24 @@ impl DemoApp {
                 self.path_src = None;
                 self.last_path = None;
             }
+
+            ui.add_space(8.0);
+            ui.label("Visibility");
+            ui.checkbox(&mut self.show_visibility, "show from cursor");
+            if self.show_visibility {
+                ui.add(
+                    egui::Slider::new(&mut self.visibility_radius, 10.0..=2000.0)
+                        .text("radius")
+                        .logarithmic(true),
+                );
+                let mut samples_i = self.visibility_samples as i32;
+                if ui
+                    .add(egui::Slider::new(&mut samples_i, 32..=720).text("samples"))
+                    .changed()
+                {
+                    self.visibility_samples = samples_i.max(8) as usize;
+                }
+            }
         }
 
         // Save / Load are available in both modes — capturing a confusing
@@ -907,6 +933,46 @@ impl DemoApp {
 
     fn draw_exploration_overlays(&self, painter: &egui::Painter, rect: egui::Rect) {
         let (Some(nav), Some(bsp)) = (&self.navmesh, &self.bsp) else { return };
+
+        // Visibility overlay — drawn FIRST so other overlays sit on top.
+        // The region is star-shaped from the cursor, so we render it as a
+        // fan of translucent triangles. No triangulation needed.
+        if self.show_visibility {
+            if let Some(h) = self.hover_canvas {
+                if let Some(vr) = visibility_region(
+                    nav,
+                    bsp,
+                    h,
+                    self.visibility_radius,
+                    self.visibility_samples,
+                ) {
+                    let src_screen = self.world_to_screen(rect, vr.source);
+                    let fill = Color32::from_rgba_unmultiplied(255, 230, 130, 36);
+                    let stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 220, 110, 130));
+                    let n = vr.boundary.len();
+                    for i in 0..n {
+                        let a = self.world_to_screen(rect, vr.boundary[i]);
+                        let b = self.world_to_screen(rect, vr.boundary[(i + 1) % n]);
+                        painter.add(Shape::convex_polygon(
+                            vec![src_screen, a, b],
+                            fill,
+                            Stroke::NONE,
+                        ));
+                    }
+                    // Boundary stroke around the region — drawn as straight
+                    // segments connecting consecutive boundary points.
+                    let pts: Vec<Pos2> = vr
+                        .boundary
+                        .iter()
+                        .map(|v| self.world_to_screen(rect, *v))
+                        .collect();
+                    for i in 0..pts.len() {
+                        painter
+                            .line_segment([pts[i], pts[(i + 1) % pts.len()]], stroke);
+                    }
+                }
+            }
+        }
 
         // Path source (if set) — green dot.
         if let Some(src) = self.path_src {

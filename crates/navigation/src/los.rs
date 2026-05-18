@@ -46,8 +46,16 @@ pub fn line_of_sight(
 
         // Find which edge of `cur_tri` the segment exits through.
         // The exit edge is the one whose endpoints straddle the line
-        // `from → to` and whose intersection parameter `t_seg ∈ (0, 1]`
+        // `from → to` and whose intersection parameter `t_seg ∈ [0, 1]`
         // is the largest (= furthest along the segment from `from`).
+        //
+        // We allow `t_seg = 0` so that on-edge sources work — when `from`
+        // happens to lie exactly on an edge of the current triangle
+        // (very common when the user clicks near a shared edge, or when
+        // visibility-region cursors land on triangulation vertices), that
+        // edge has t = 0 and is a valid exit if the ray points outward.
+        // For interior sources the max-t pick still selects the real
+        // exit (t > 0) over any on-edge artifact at t = 0.
         let mut best_edge: Option<(usize, Vertex, f64)> = None;
         for edge in 0..3 {
             let (va, vb) = (
@@ -57,7 +65,7 @@ pub fn line_of_sight(
             let pa = nav.vertex(va);
             let pb = nav.vertex(vb);
             if let Some((t_seg, hit)) = segment_segment_intersect(from, to, pa, pb) {
-                if t_seg <= 1e-12 {
+                if t_seg < -1e-9 {
                     continue;
                 }
                 if best_edge.map_or(true, |(_, _, t)| t_seg > t) {
