@@ -18,11 +18,11 @@
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
-use egui::{Color32, Pos2, Sense, Shape, Stroke, Vec2};
+use egui::{Color32, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
 
 use rsnav_bsp::Bsp;
-use rsnav_common::{Polygon as CommonPolygon, TriangleId, Vertex};
+use rsnav_common::{Aabb, Polygon as CommonPolygon, TriangleId, Vertex};
 use rsnav_navigation::{find_path, line_of_sight, nearest_point, LineOfSightResult, PathOptions};
 use rsnav_navmesh::{build_from_cdt, NavMesh};
 use rsnav_triangle::{
@@ -89,6 +89,66 @@ struct DemoApp {
     fixtures_dir: String,
     fixture_listing: Vec<PathBuf>,
     fixtures_scanned_from: Option<String>,
+
+    // Canvas view: world ↔ canvas-pixel transform. `request_fit = true`
+    // makes the next `canvas_panel` recompute fit from the current
+    // geometry — set this after Load/Create or when the user clicks
+    // "Fit view".
+    view: ViewTransform,
+    request_fit: bool,
+}
+
+/// Affine transform from world coords to canvas-local pixel coords.
+///
+/// Screen coords add `rect.min` on top — see [`DemoApp::world_to_screen`].
+#[derive(Copy, Clone, Debug)]
+struct ViewTransform {
+    /// World units per canvas pixel.
+    scale: f32,
+    /// Canvas-local pixel position of the world origin (0, 0).
+    offset: Vec2,
+}
+
+impl Default for ViewTransform {
+    fn default() -> Self {
+        Self { scale: 1.0, offset: Vec2::ZERO }
+    }
+}
+
+impl ViewTransform {
+    /// Compute a uniform-scale transform that maps `world` to fill
+    /// `canvas_size`, leaving `padding` pixels around all sides.
+    fn fit(world: Aabb, canvas_size: Vec2, padding: f32) -> Self {
+        let w = (world.max.x - world.min.x).max(1e-9);
+        let h = (world.max.y - world.min.y).max(1e-9);
+        let avail_w = (canvas_size.x - 2.0 * padding).max(1.0) as f64;
+        let avail_h = (canvas_size.y - 2.0 * padding).max(1.0) as f64;
+        // Uniform scale — keep the aspect ratio. The smaller of the two
+        // available-axis ratios wins.
+        let scale = ((avail_w / w).min(avail_h / h)) as f32;
+        let world_cx = ((world.min.x + world.max.x) * 0.5) as f32;
+        let world_cy = ((world.min.y + world.max.y) * 0.5) as f32;
+        let canvas_cx = canvas_size.x * 0.5;
+        let canvas_cy = canvas_size.y * 0.5;
+        Self {
+            scale,
+            offset: Vec2::new(canvas_cx - world_cx * scale, canvas_cy - world_cy * scale),
+        }
+    }
+
+    fn world_to_canvas(&self, v: Vertex) -> Pos2 {
+        Pos2::new(
+            (v.x as f32) * self.scale + self.offset.x,
+            (v.y as f32) * self.scale + self.offset.y,
+        )
+    }
+
+    fn canvas_to_world(&self, p: Pos2) -> Vertex {
+        Vertex::new(
+            ((p.x - self.offset.x) / self.scale) as f64,
+            ((p.y - self.offset.y) / self.scale) as f64,
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -128,6 +188,8 @@ impl Default for DemoApp {
             fixtures_dir: DEFAULT_FIXTURES_DIR.to_string(),
             fixture_listing: Vec::new(),
             fixtures_scanned_from: None,
+            view: ViewTransform::default(),
+            request_fit: false,
         }
     }
 }
@@ -244,6 +306,7 @@ impl DemoApp {
         new_app.fixtures_dir = fixtures_dir;
         new_app.fixture_listing = fixture_listing;
         new_app.fixtures_scanned_from = fixtures_scanned_from;
+        new_app.request_fit = true;
         new_app.status = Some(format!("loaded ← {}", path.display()));
         *self = new_app;
     }
@@ -385,6 +448,40 @@ impl DemoApp {
         self.drawing = None;
         self.path_src = None;
         self.last_path = None;
+        self.request_fit = true;
+    }
+
+    /// AABB of everything currently authored or loaded — perimeters,
+    /// holes, in-progress drawing, and the built navmesh. `None` if
+    /// nothing has been placed yet.
+    fn current_world_aabb(&self) -> Option<Aabb> {
+        let mut any = false;
+        let mut aabb = Aabb::EMPTY;
+        for p in &self.perimeters {
+            for v in &p.verts {
+                aabb.extend(*v);
+                any = true;
+            }
+        }
+        for h in &self.holes {
+            for v in &h.verts {
+                aabb.extend(*v);
+                any = true;
+            }
+        }
+        if let Some(d) = &self.drawing {
+            for v in &d.verts {
+                aabb.extend(*v);
+                any = true;
+            }
+        }
+        if let Some(nav) = &self.navmesh {
+            for v in &nav.vertices {
+                aabb.extend(*v);
+                any = true;
+            }
+        }
+        any.then_some(aabb)
     }
 
     fn compute_path_to(&mut self, goal: Vertex) {
@@ -587,9 +684,18 @@ impl DemoApp {
         });
 
         ui.add_space(8.0);
-        if ui.button("Reset everything").clicked() {
-            self.reset();
-        }
+        ui.horizontal(|ui| {
+            if ui
+                .button("Fit view")
+                .on_hover_text("Center & scale the canvas to fit all current geometry.")
+                .clicked()
+            {
+                self.request_fit = true;
+            }
+            if ui.button("Reset everything").clicked() {
+                self.reset();
+            }
+        });
 
         if let Some(s) = &self.status {
             ui.add_space(8.0);
@@ -609,10 +715,21 @@ impl DemoApp {
         // Background
         painter.rect_filled(rect, 0.0, Color32::from_gray(28));
 
+        // Recompute the world→canvas fit on demand. Triggered after Load
+        // and after Create, plus by the "Fit view" button.
+        if self.request_fit {
+            self.request_fit = false;
+            if let Some(world) = self.current_world_aabb() {
+                self.view = ViewTransform::fit(world, rect.size(), 16.0);
+            } else {
+                self.view = ViewTransform::default();
+            }
+        }
+
         // Update hover position (cursor in world coords).
         self.hover_canvas = response
             .hover_pos()
-            .map(|p| Vertex::new((p.x - rect.min.x) as f64, (p.y - rect.min.y) as f64));
+            .map(|p| self.screen_to_world(rect, p));
 
         // Mouse handlers depending on mode.
         if !self.in_exploration() {
@@ -627,12 +744,14 @@ impl DemoApp {
 
     // -- coordinate conversions ----------------------------------------
 
-    fn world_to_screen(rect: egui::Rect, v: Vertex) -> Pos2 {
-        Pos2::new(rect.min.x + v.x as f32, rect.min.y + v.y as f32)
+    fn world_to_screen(&self, rect: Rect, v: Vertex) -> Pos2 {
+        let local = self.view.world_to_canvas(v);
+        Pos2::new(rect.min.x + local.x, rect.min.y + local.y)
     }
 
-    fn screen_to_world(rect: egui::Rect, p: Pos2) -> Vertex {
-        Vertex::new((p.x - rect.min.x) as f64, (p.y - rect.min.y) as f64)
+    fn screen_to_world(&self, rect: Rect, p: Pos2) -> Vertex {
+        let local = Pos2::new(p.x - rect.min.x, p.y - rect.min.y);
+        self.view.canvas_to_world(local)
     }
 
     // -- authoring -----------------------------------------------------
@@ -643,7 +762,7 @@ impl DemoApp {
             return;
         }
         let Some(pos) = response.interact_pointer_pos() else { return };
-        let world = Self::screen_to_world(rect, pos);
+        let world = self.screen_to_world(rect, pos);
 
         if response.clicked() {
             if let Some(d) = &mut self.drawing {
@@ -678,8 +797,8 @@ impl DemoApp {
             if let (Some(last), Some(hover)) = (d.verts.last(), self.hover_canvas) {
                 painter.line_segment(
                     [
-                        Self::world_to_screen(rect, *last),
-                        Self::world_to_screen(rect, hover),
+                        self.world_to_screen(rect, *last),
+                        self.world_to_screen(rect, hover),
                     ],
                     Stroke::new(1.0, color.gamma_multiply(0.6)),
                 );
@@ -698,7 +817,7 @@ impl DemoApp {
         if verts.is_empty() {
             return;
         }
-        let pts: Vec<Pos2> = verts.iter().map(|v| Self::world_to_screen(rect, *v)).collect();
+        let pts: Vec<Pos2> = verts.iter().map(|v| self.world_to_screen(rect, *v)).collect();
         let stroke = Stroke::new(2.0, color);
         for w in pts.windows(2) {
             painter.line_segment([w[0], w[1]], stroke);
@@ -716,7 +835,7 @@ impl DemoApp {
     fn handle_exploration_mouse(&mut self, response: &egui::Response, rect: egui::Rect) {
         if response.secondary_clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
-                let world = Self::screen_to_world(rect, pos);
+                let world = self.screen_to_world(rect, pos);
                 let snapped = self
                     .bsp
                     .as_ref()
@@ -730,7 +849,7 @@ impl DemoApp {
         }
         if response.clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
-                let world = Self::screen_to_world(rect, pos);
+                let world = self.screen_to_world(rect, pos);
                 let snapped = self
                     .bsp
                     .as_ref()
@@ -758,9 +877,9 @@ impl DemoApp {
             let v1 = nav.vertex(tri.vertices[1]);
             let v2 = nav.vertex(tri.vertices[2]);
             let pts = [
-                Self::world_to_screen(rect, v0),
-                Self::world_to_screen(rect, v1),
-                Self::world_to_screen(rect, v2),
+                self.world_to_screen(rect, v0),
+                self.world_to_screen(rect, v1),
+                self.world_to_screen(rect, v2),
             ];
             let fill = region_color(tri.region, region_count).gamma_multiply(0.25);
             painter.add(Shape::convex_polygon(
@@ -775,8 +894,8 @@ impl DemoApp {
                         tri.vertices[(edge + 1) % 3],
                         tri.vertices[(edge + 2) % 3],
                     );
-                    let pa = Self::world_to_screen(rect, nav.vertex(a_id));
-                    let pb = Self::world_to_screen(rect, nav.vertex(b_id));
+                    let pa = self.world_to_screen(rect, nav.vertex(a_id));
+                    let pb = self.world_to_screen(rect, nav.vertex(b_id));
                     painter.line_segment([pa, pb], Stroke::new(2.0, Color32::from_rgb(220, 70, 70)));
                 }
             }
@@ -792,7 +911,7 @@ impl DemoApp {
         // Path source (if set) — green dot.
         if let Some(src) = self.path_src {
             painter.circle_filled(
-                Self::world_to_screen(rect, src),
+                self.world_to_screen(rect, src),
                 5.0,
                 Color32::from_rgb(80, 220, 80),
             );
@@ -802,7 +921,7 @@ impl DemoApp {
         if let Some(path) = &self.last_path {
             let pts: Vec<Pos2> = path
                 .iter()
-                .map(|v| Self::world_to_screen(rect, *v))
+                .map(|v| self.world_to_screen(rect, *v))
                 .collect();
             for w in pts.windows(2) {
                 painter.line_segment([w[0], w[1]], Stroke::new(3.0, Color32::from_rgb(80, 220, 80)));
@@ -817,7 +936,7 @@ impl DemoApp {
             if let Some(np) = nearest_point(nav, bsp, h) {
                 // Snap marker — pale cyan.
                 painter.circle_stroke(
-                    Self::world_to_screen(rect, np.point),
+                    self.world_to_screen(rect, np.point),
                     4.0,
                     Stroke::new(1.5, Color32::from_rgb(120, 200, 220)),
                 );
@@ -837,14 +956,14 @@ impl DemoApp {
                         };
                         painter.line_segment(
                             [
-                                Self::world_to_screen(rect, src),
-                                Self::world_to_screen(rect, end),
+                                self.world_to_screen(rect, src),
+                                self.world_to_screen(rect, end),
                             ],
                             Stroke::new(1.5, color),
                         );
                         if let LineOfSightResult::Blocked { point } = los {
                             painter.circle_filled(
-                                Self::world_to_screen(rect, point),
+                                self.world_to_screen(rect, point),
                                 3.5,
                                 color,
                             );
