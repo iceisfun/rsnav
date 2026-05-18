@@ -6,6 +6,7 @@
 //!
 //! Work in progress — see crate README for porting status.
 
+pub mod flip;
 pub mod io;
 pub mod mesh;
 pub mod predicates;
