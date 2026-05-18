@@ -935,8 +935,15 @@ impl DemoApp {
         let (Some(nav), Some(bsp)) = (&self.navmesh, &self.bsp) else { return };
 
         // Visibility overlay — drawn FIRST so other overlays sit on top.
-        // The region is star-shaped from the cursor, so we render it as a
-        // fan of translucent triangles. No triangulation needed.
+        //
+        // The region is star-shaped from the cursor, so the natural
+        // triangulation is a fan from the source through consecutive
+        // boundary points. We build it as a single egui `Mesh` (one
+        // vertex per source + boundary point, indices forming the fan)
+        // rather than N separate `convex_polygon` calls — that way the
+        // renderer sees each radial spoke as an *interior* edge between
+        // two indexed triangles and skips its anti-aliasing pass, so
+        // there's no visible spoke artifact from alpha-blended overlap.
         if self.show_visibility {
             if let Some(h) = self.hover_canvas {
                 if let Some(vr) = visibility_region(
@@ -946,29 +953,35 @@ impl DemoApp {
                     self.visibility_radius,
                     self.visibility_samples,
                 ) {
-                    let src_screen = self.world_to_screen(rect, vr.source);
                     let fill = Color32::from_rgba_unmultiplied(255, 230, 130, 36);
-                    let stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 220, 110, 130));
-                    let n = vr.boundary.len();
-                    for i in 0..n {
-                        let a = self.world_to_screen(rect, vr.boundary[i]);
-                        let b = self.world_to_screen(rect, vr.boundary[(i + 1) % n]);
-                        painter.add(Shape::convex_polygon(
-                            vec![src_screen, a, b],
-                            fill,
-                            Stroke::NONE,
-                        ));
+                    let stroke =
+                        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 220, 110, 160));
+
+                    let mut mesh = egui::epaint::Mesh::default();
+                    // Vertex 0 = source. Vertices 1..=N = boundary points.
+                    mesh.colored_vertex(self.world_to_screen(rect, vr.source), fill);
+                    for v in &vr.boundary {
+                        mesh.colored_vertex(self.world_to_screen(rect, *v), fill);
                     }
-                    // Boundary stroke around the region — drawn as straight
-                    // segments connecting consecutive boundary points.
+                    let n = vr.boundary.len() as u32;
+                    for i in 0..n {
+                        let a = 1 + i;
+                        let b = 1 + (i + 1) % n;
+                        mesh.add_triangle(0, a, b);
+                    }
+                    painter.add(Shape::Mesh(mesh));
+
+                    // Stroke the OUTER boundary as one closed polyline.
+                    // The fan triangulation has no exterior at the spokes,
+                    // so this only paints around the perimeter — no radial
+                    // lines.
                     let pts: Vec<Pos2> = vr
                         .boundary
                         .iter()
                         .map(|v| self.world_to_screen(rect, *v))
                         .collect();
                     for i in 0..pts.len() {
-                        painter
-                            .line_segment([pts[i], pts[(i + 1) % pts.len()]], stroke);
+                        painter.line_segment([pts[i], pts[(i + 1) % pts.len()]], stroke);
                     }
                 }
             }
