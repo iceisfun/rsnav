@@ -5,8 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Path-following helpers (lookahead, anti-shortcutting). Future work."
+description = "Path-following helpers (lookahead, anti-shortcutting)."
 
 [dependencies]
 rsnav-common.workspace = true
-rsnav-navigation.workspace = true
