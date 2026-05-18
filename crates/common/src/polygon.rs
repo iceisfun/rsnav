@@ -130,6 +130,67 @@ impl Polygon {
         inside
     }
 
+    /// A point guaranteed to lie strictly inside this simple polygon.
+    ///
+    /// Returns `None` for degenerate polygons (fewer than 3 vertices, all
+    /// vertices collinear, or — pathologically — no ear can be found).
+    /// For non-degenerate simple polygons this always succeeds.
+    ///
+    /// **Use this instead of the arithmetic centroid for hole seed points.**
+    /// The centroid of a *convex* polygon is always interior, but the
+    /// centroid of a *concave* polygon (e.g. C-shape, L-shape, U-shape)
+    /// often falls outside the polygon — which silently breaks any code
+    /// downstream that expects an interior point (e.g. `carve_holes` will
+    /// flood-fill the wrong region).
+    ///
+    /// Implementation: ear-finding. Locates a polygon vertex `V_i` whose
+    /// triangle `(V_{i-1}, V_i, V_{i+1})` is (a) oriented in the same
+    /// direction as the polygon as a whole and (b) contains no other
+    /// polygon vertex. The centroid of that ear-triangle is interior.
+    /// `O(n²)` worst case; `O(n)` once an ear is found (almost always
+    /// within the first few vertices).
+    pub fn interior_point(&self) -> Option<Vertex> {
+        let n = self.vertices.len();
+        if n < 3 {
+            return None;
+        }
+        let winding = self.winding();
+        if winding == Winding::Degenerate {
+            return None;
+        }
+        let ccw = winding == Winding::CounterClockwise;
+        for i in 0..n {
+            let a = self.vertices[(i + n - 1) % n];
+            let b = self.vertices[i];
+            let c = self.vertices[(i + 1) % n];
+            let cross = geom::orient2d(a, b, c);
+            let convex_here = if ccw { cross > 0.0 } else { cross < 0.0 };
+            if !convex_here {
+                continue;
+            }
+            // Reject if any OTHER vertex lies inside (or on) the ear.
+            let prev_idx = (i + n - 1) % n;
+            let next_idx = (i + 1) % n;
+            let mut clear = true;
+            for j in 0..n {
+                if j == prev_idx || j == i || j == next_idx {
+                    continue;
+                }
+                if point_in_tri_inclusive(a, b, c, self.vertices[j]) {
+                    clear = false;
+                    break;
+                }
+            }
+            if clear {
+                return Some(Vertex::new(
+                    (a.x + b.x + c.x) / 3.0,
+                    (a.y + b.y + c.y) / 3.0,
+                ));
+            }
+        }
+        None
+    }
+
     /// Removes vertices that are exactly collinear with their neighbours.
     /// Returns the number of vertices removed.
     pub fn remove_collinear(&mut self) -> usize {
@@ -162,6 +223,16 @@ impl From<Vec<Vertex>> for Polygon {
     fn from(vertices: Vec<Vertex>) -> Self {
         Self { vertices }
     }
+}
+
+#[inline]
+fn point_in_tri_inclusive(a: Vertex, b: Vertex, c: Vertex, p: Vertex) -> bool {
+    let d1 = geom::orient2d(a, b, p);
+    let d2 = geom::orient2d(b, c, p);
+    let d3 = geom::orient2d(c, a, p);
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(has_neg && has_pos)
 }
 
 /// An outer ring with zero or more interior holes.
@@ -282,5 +353,64 @@ mod tests {
         assert_eq!(p.area(), 16.0 - 4.0);
         assert!(p.contains(v(0.5, 0.5)));
         assert!(!p.contains(v(2.0, 2.0))); // inside the hole
+    }
+
+    #[test]
+    fn interior_point_for_convex_lands_inside() {
+        let p = unit_square_ccw();
+        let ip = p.interior_point().unwrap();
+        assert!(p.contains(ip), "interior_point {:?} not in polygon", ip);
+    }
+
+    #[test]
+    fn interior_point_for_concave_c_shape_lands_inside() {
+        // Classic C-shape — the kind of hole shape where the arithmetic
+        // centroid falls OUTSIDE the polygon. interior_point must still
+        // land inside.
+        //
+        //   ┌────────┐
+        //   │  ┌──┐  │
+        //   │  │  │  │   ← the C's interior is the U-shape around
+        //   │  │  │  │     the inner cutout
+        //   │  └──┘  │
+        //   │        │
+        //   └────────┘
+        //
+        // CCW around the boundary, going out around the cutout then back.
+        let p = Polygon::from_vertices([
+            v(0.0, 0.0),
+            v(10.0, 0.0),
+            v(10.0, 10.0),
+            v(7.0, 10.0),
+            v(7.0, 3.0),
+            v(3.0, 3.0),
+            v(3.0, 10.0),
+            v(0.0, 10.0),
+        ]);
+        // Sanity check: the *centroid* is outside the polygon — this is
+        // exactly the bug Polygon::interior_point fixes.
+        let n = p.vertices.len() as f64;
+        let cx = p.vertices.iter().map(|v| v.x).sum::<f64>() / n;
+        let cy = p.vertices.iter().map(|v| v.y).sum::<f64>() / n;
+        assert!(
+            !p.contains(Vertex::new(cx, cy)),
+            "test premise wrong: centroid IS inside this concave polygon"
+        );
+        // The fix.
+        let ip = p.interior_point().unwrap();
+        assert!(p.contains(ip), "interior_point {:?} not in C-shape", ip);
+    }
+
+    #[test]
+    fn interior_point_for_collinear_polygon_returns_none() {
+        let p = Polygon::from_vertices([v(0.0, 0.0), v(1.0, 0.0), v(2.0, 0.0)]);
+        assert!(p.interior_point().is_none());
+    }
+
+    #[test]
+    fn interior_point_works_for_cw_winding() {
+        let p = unit_square_cw();
+        let ip = p.interior_point().unwrap();
+        assert!(p.contains(ip));
     }
 }

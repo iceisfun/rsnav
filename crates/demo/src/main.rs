@@ -22,7 +22,7 @@ use egui::{Color32, Pos2, Sense, Shape, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
 
 use rsnav_bsp::Bsp;
-use rsnav_common::{TriangleId, Vertex};
+use rsnav_common::{Polygon as CommonPolygon, TriangleId, Vertex};
 use rsnav_navigation::{find_path, line_of_sight, nearest_point, LineOfSightResult, PathOptions};
 use rsnav_navmesh::{build_from_cdt, NavMesh};
 use rsnav_triangle::{
@@ -261,13 +261,17 @@ impl DemoApp {
             }
         }
 
-        // Hole seed points — use each hole polygon's centroid.
+        // Hole seed points — must be STRICTLY INSIDE each hole polygon.
+        // The arithmetic centroid is NOT safe for concave polygons (e.g. a
+        // C-shape's centroid falls outside the polygon), so use the
+        // ear-based interior-point finder instead. If a hole turns out to
+        // be degenerate we just skip it; carve_holes silently ignores
+        // missing seeds.
         for hole in &self.holes {
-            let cx: f64 = hole.verts.iter().map(|v| v.x).sum::<f64>() / hole.verts.len() as f64;
-            let cy: f64 = hole.verts.iter().map(|v| v.y).sum::<f64>() / hole.verts.len() as f64;
-            pslg.holes.push(PslgHole {
-                point: Vertex::new(cx, cy),
-            });
+            let cp = CommonPolygon::from_vertices(hole.verts.clone());
+            if let Some(seed) = cp.interior_point() {
+                pslg.holes.push(PslgHole { point: seed });
+            }
         }
 
         // Build pipeline.
