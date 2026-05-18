@@ -304,13 +304,14 @@ impl NavMesh {
             *target = Some((off, len));
         }
 
-        // META: required.
+        // META: required. Fixed 48 bytes per the spec
+        // (12 counts + 4 padding + 32 aabb).
         let (meta_off, meta_len) =
             meta_range.ok_or(LoadError::MissingRequiredSection("META"))?;
-        if meta_len < 40 {
+        if meta_len < 48 {
             return Err(LoadError::SectionLengthMismatch {
                 section: "META",
-                expected: 40,
+                expected: 48,
                 found: meta_len as u64,
             });
         }

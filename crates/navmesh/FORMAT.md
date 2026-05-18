@@ -80,7 +80,7 @@ makes the whole connected mesh one region). This is correct behavior for
 "raw" meshes that never went through `form_skeleton` + `carve_holes`, but
 will give wrong reachability results for navmeshes that did.
 
-### Section 1 — META (40 bytes, fixed)
+### Section 1 — META (48 bytes, fixed)
 
 | Offset | Size | Type | Field            | Notes                          |
 | -----: | ---: | :--- | :--------------- | :----------------------------- |
@@ -91,11 +91,10 @@ will give wrong reachability results for navmeshes that did.
 | `16`   | `8`  | f64  | `aabb.min.x`     |                                |
 | `24`   | `8`  | f64  | `aabb.min.y`     |                                |
 | `32`   | `8`  | f64  | `aabb.max.x`     |                                |
-| `40`   | `8`  | f64  | `aabb.max.y`     | (Section ends at offset 48.)   |
+| `40`   | `8`  | f64  | `aabb.max.y`     |                                |
 
-> Yes, "40 bytes, fixed" but the last field starts at offset 40 and ends
-> at 48. The section length in the table will be 48; the trailing `_x` /
-> `_y` of the max corner is part of the section.
+Total: 12 bytes of counts + 4 bytes padding + 32 bytes of AABB = 48
+bytes. The section table's `length` field for META must be exactly 48.
 
 ### Section 2 — VERTICES (`vertex_count × 16` bytes)
 
