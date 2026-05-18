@@ -8,6 +8,7 @@
 
 pub mod divconq;
 pub mod flip;
+pub mod holes;
 pub mod io;
 pub mod mesh;
 pub mod predicates;
@@ -16,6 +17,7 @@ pub mod segment;
 pub mod sort;
 
 pub use divconq::{delaunay, DivConqOptions};
+pub use holes::carve_holes;
 pub use mesh::{CdtMesh, Otri, Osub, VertexSlot, VertexType};
 pub use predicates::{incircle, orient2d};
 pub use pslg::{Pslg, PslgHole, PslgSegment, PslgVertex};

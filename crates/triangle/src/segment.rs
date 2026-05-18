@@ -644,7 +644,7 @@ mod tests {
         delaunay(&mut mesh, DivConqOptions::default());
         let tris_after_delaunay = mesh.live_triangle_count();
 
-        form_skeleton(&mut mesh, &pslg, Some(1));
+        form_skeleton(&mut mesh, &pslg, None);
 
         // form_skeleton may have added new vertices (for forced subseg splits)
         // and triangles (for flipped diagonals). Triangle count should still
