@@ -1,0 +1,11 @@
+[package]
+name = "rsnav-polygon-extract"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Extract polygon regions (with holes) from a 2D occupancy bitfield."
+
+[dependencies]
+rsnav-common.workspace = true

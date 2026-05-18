@@ -1,0 +1,12 @@
+[package]
+name = "rsnav-navmesh"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Navmesh construction, serialization (versioned binary), and adjacency."
+
+[dependencies]
+rsnav-common.workspace = true
+rsnav-triangle.workspace = true

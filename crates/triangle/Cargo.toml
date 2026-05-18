@@ -1,0 +1,11 @@
+[package]
+name = "rsnav-triangle"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Constrained Delaunay triangulation (Rust port of Shewchuk's Triangle 1.6, CDT subset)."
+
+[dependencies]
+rsnav-common.workspace = true

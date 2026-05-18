@@ -1,0 +1,8 @@
+[package]
+name = "rsnav-common"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared 2D geometry primitives (Vertex, Polygon, Triangle, Mesh) for rsnav2."

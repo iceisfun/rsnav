@@ -1,0 +1,12 @@
+[package]
+name = "rsnav-pathing"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Path-following helpers (lookahead, anti-shortcutting). Future work."
+
+[dependencies]
+rsnav-common.workspace = true
+rsnav-navigation.workspace = true

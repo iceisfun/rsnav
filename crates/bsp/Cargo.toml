@@ -1,0 +1,11 @@
+[package]
+name = "rsnav-bsp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Binary space partitioning over 2D polygon sets."
+
+[dependencies]
+rsnav-common.workspace = true

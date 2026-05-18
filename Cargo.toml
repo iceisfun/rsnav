@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/triangle",
+    "crates/polygon-extract",
+    "crates/navmesh",
+    "crates/bsp",
+    "crates/navigation",
+    "crates/pathing",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/iceisfun/rsnav2"
+
+[workspace.dependencies]
+rsnav-common = { path = "crates/common" }
+rsnav-triangle = { path = "crates/triangle" }
+rsnav-polygon-extract = { path = "crates/polygon-extract" }
+rsnav-navmesh = { path = "crates/navmesh" }
+rsnav-bsp = { path = "crates/bsp" }
+rsnav-navigation = { path = "crates/navigation" }
+rsnav-pathing = { path = "crates/pathing" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,12 @@
+[package]
+name = "rsnav-navigation"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Path search, funnel/string-pull, line-of-sight, visibility, nearest-point on a navmesh."
+
+[dependencies]
+rsnav-common.workspace = true
+rsnav-navmesh.workspace = true
