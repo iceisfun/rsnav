@@ -161,6 +161,98 @@ impl NavMesh {
         }
         any.then_some(aabb)
     }
+
+    // --- Random point sampling -------------------------------------------
+
+    /// Pick a uniformly area-distributed random point inside the
+    /// walkable area.
+    ///
+    /// `rng` must yield uniform `f64` in `[0, 1)`. Each call consumes
+    /// three values: one to choose a triangle (weighted by area, so the
+    /// result is uniform over surface area, not over triangles) and two
+    /// for a uniform barycentric point inside it. Returns `None` only
+    /// when the mesh has no triangles.
+    ///
+    /// `O(n)` in the triangle count per call (a linear walk over the
+    /// area CDF). Fine for spawn placement / enemy seeding; if you are
+    /// sampling in a hot loop over a very large mesh, precompute your
+    /// own cumulative-area table instead.
+    ///
+    /// ```
+    /// # use rsnav_navmesh::NavMesh;
+    /// # fn demo(nav: &NavMesh) {
+    /// // A splitmix64-style closure works fine as the rng source.
+    /// let mut state = 0x1234_5678_u64;
+    /// let mut unit = || {
+    ///     state = state.wrapping_add(0x9E3779B97F4A7C15);
+    ///     let mut z = state;
+    ///     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    ///     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    ///     (((z ^ (z >> 31)) >> 11) as f64) / ((1u64 << 53) as f64)
+    /// };
+    /// let spawn = nav.random_point(&mut unit);
+    /// # let _ = spawn;
+    /// # }
+    /// ```
+    pub fn random_point(&self, rng: impl FnMut() -> f64) -> Option<Vertex> {
+        self.random_point_filtered(None, rng)
+    }
+
+    /// Like [`random_point`](Self::random_point) but restricted to one
+    /// connected region — e.g. to spawn an enemy in the same room the
+    /// player is in, or deliberately in a different one. `None` if the
+    /// region has no triangles.
+    pub fn random_point_in_region(
+        &self,
+        region: u32,
+        rng: impl FnMut() -> f64,
+    ) -> Option<Vertex> {
+        self.random_point_filtered(Some(region), rng)
+    }
+
+    fn random_point_filtered(
+        &self,
+        region: Option<u32>,
+        mut rng: impl FnMut() -> f64,
+    ) -> Option<Vertex> {
+        let in_scope = |t: &NavTriangle| region.map_or(true, |r| t.region == r);
+
+        let total: f64 = self
+            .triangles
+            .iter()
+            .filter(|t| in_scope(t))
+            .map(|t| t.area)
+            .sum();
+        if total <= 0.0 {
+            return None;
+        }
+
+        // Area-weighted triangle pick: walk the CDF. `chosen` is updated
+        // every step so a floating-point overshoot still lands on the
+        // last in-scope triangle rather than falling through to None.
+        let mut pick = rng().clamp(0.0, 1.0) * total;
+        let mut chosen: Option<&NavTriangle> = None;
+        for t in self.triangles.iter().filter(|t| in_scope(t)) {
+            chosen = Some(t);
+            if pick < t.area {
+                break;
+            }
+            pick -= t.area;
+        }
+        let t = chosen?;
+
+        // Uniform barycentric point inside the chosen triangle.
+        let mut r1 = rng().clamp(0.0, 1.0);
+        let mut r2 = rng().clamp(0.0, 1.0);
+        if r1 + r2 > 1.0 {
+            r1 = 1.0 - r1;
+            r2 = 1.0 - r2;
+        }
+        let a = self.vertex(t.vertices[0]);
+        let b = self.vertex(t.vertices[1]);
+        let c = self.vertex(t.vertices[2]);
+        Some(a + (b - a) * r1 + (c - a) * r2)
+    }
 }
 
 #[cfg(test)]
@@ -256,5 +348,99 @@ mod tests {
         assert_eq!(nav.region_area(99), 0.0);
         assert!(nav.region_centroid(99).is_none());
         assert!(nav.region_bounds(99).is_none());
+    }
+
+    // --- random point sampling -------------------------------------------
+
+    /// splitmix64 → uniform f64 in [0, 1).
+    struct TestRng(u64);
+    impl TestRng {
+        fn unit(&mut self) -> f64 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            (((z ^ (z >> 31)) >> 11) as f64) / ((1u64 << 53) as f64)
+        }
+    }
+
+    /// True if `p` lies inside any triangle of the mesh (small epsilon
+    /// so points generated exactly on an edge still count).
+    fn point_in_mesh(nav: &NavMesh, p: Vertex) -> Option<u32> {
+        const EPS: f64 = 1e-7;
+        for t in &nav.triangles {
+            let a = nav.vertex(t.vertices[0]);
+            let b = nav.vertex(t.vertices[1]);
+            let c = nav.vertex(t.vertices[2]);
+            let d1 = (b - a).cross(p - a);
+            let d2 = (c - b).cross(p - b);
+            let d3 = (a - c).cross(p - c);
+            let has_neg = d1 < -EPS || d2 < -EPS || d3 < -EPS;
+            let has_pos = d1 > EPS || d2 > EPS || d3 > EPS;
+            if !(has_neg && has_pos) {
+                return Some(t.region);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn random_point_lands_inside_the_mesh() {
+        let nav = divided_rectangle();
+        let mut rng = TestRng(0xABCD_1234);
+        for _ in 0..400 {
+            let p = nav.random_point(|| rng.unit()).expect("non-empty mesh");
+            assert!(point_in_mesh(&nav, p).is_some(), "sample {p:?} off-mesh");
+        }
+    }
+
+    #[test]
+    fn random_point_in_region_stays_in_region() {
+        let nav = divided_rectangle();
+        let mut rng = TestRng(0x5555_AAAA);
+        for region in 0..2u32 {
+            for _ in 0..200 {
+                let p = nav
+                    .random_point_in_region(region, || rng.unit())
+                    .expect("non-empty region");
+                assert_eq!(
+                    point_in_mesh(&nav, p),
+                    Some(region),
+                    "sample {p:?} not in region {region}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn random_point_is_roughly_area_weighted() {
+        // The two regions have equal area (20 each); whole-mesh sampling
+        // should split close to 50/50. A broken weight (e.g. uniform
+        // over triangles) would still be near 50/50 here since the two
+        // regions have similar triangle counts — so this is only a
+        // coarse smoke check that neither region is starved.
+        let nav = divided_rectangle();
+        let mut rng = TestRng(0x0F0F_0F0F);
+        let mut counts = [0u32; 2];
+        let n = 2_000;
+        for _ in 0..n {
+            let p = nav.random_point(|| rng.unit()).unwrap();
+            if let Some(r) = point_in_mesh(&nav, p) {
+                counts[r as usize] += 1;
+            }
+        }
+        for (r, &c) in counts.iter().enumerate() {
+            assert!(
+                c as f64 > n as f64 * 0.30,
+                "region {r} starved: {c}/{n}",
+            );
+        }
+    }
+
+    #[test]
+    fn random_point_in_empty_region_is_none() {
+        let nav = divided_rectangle();
+        let mut rng = TestRng(1);
+        assert!(nav.random_point_in_region(99, || rng.unit()).is_none());
     }
 }
