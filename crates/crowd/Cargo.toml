@@ -1,0 +1,18 @@
+[package]
+name = "rsnav-crowd"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Multi-agent crowd simulation: per-agent corridors over a NavMesh + sampled velocity-obstacle local avoidance."
+
+[dependencies]
+rsnav-common.workspace = true
+rsnav-navmesh.workspace = true
+rsnav-bsp.workspace = true
+rsnav-navigation.workspace = true
+rsnav-dynamic.workspace = true
+
+[dev-dependencies]
+rsnav-polygon-extract.workspace = true
