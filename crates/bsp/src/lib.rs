@@ -236,6 +236,51 @@ impl Bsp {
             }
         }
     }
+
+    /// Visit every triangle whose axis-aligned bounds intersect `query`.
+    ///
+    /// This is a **broad-phase** query: it reports triangles whose
+    /// bounding box overlaps `query`, which is a superset of the
+    /// triangles whose actual area overlaps it (a thin triangle can have
+    /// a fat AABB). Callers that need exact triangle-vs-box overlap
+    /// should run a precise test inside `visit`.
+    ///
+    /// `visit` is called once per matching triangle, in unspecified
+    /// order. Average `O(log n + k)` for `k` reported triangles. Does
+    /// not touch the `NavMesh` — the per-triangle AABBs computed at
+    /// `build` time are enough.
+    ///
+    /// Useful for area-of-effect scans, render culling, "what's in this
+    /// box" selection, and similar range queries.
+    pub fn query_aabb(&self, query: Aabb, mut visit: impl FnMut(TriangleId)) {
+        if query.is_empty() {
+            return;
+        }
+        self.query_aabb_in(self.root, query, &mut visit);
+    }
+
+    fn query_aabb_in(&self, node: u32, query: Aabb, visit: &mut impl FnMut(TriangleId)) {
+        match &self.nodes[node as usize] {
+            BspNode::Internal { aabb, left, right } => {
+                if !aabb.intersects(&query) {
+                    return;
+                }
+                self.query_aabb_in(*left, query, visit);
+                self.query_aabb_in(*right, query, visit);
+            }
+            BspNode::Leaf { aabb, start, len } => {
+                if !aabb.intersects(&query) {
+                    return;
+                }
+                for i in *start..*start + *len {
+                    let tri_idx = self.triangle_indices[i as usize];
+                    if self.triangle_aabbs[tri_idx as usize].intersects(&query) {
+                        visit(TriangleId::new(tri_idx));
+                    }
+                }
+            }
+        }
+    }
 }
 
 // --- Geometry helpers ----------------------------------------------------
@@ -500,6 +545,79 @@ mod tests {
             }
         }
         best
+    }
+
+    /// Brute-force reference: triangle ids whose stored AABB intersects
+    /// `query`, sorted.
+    fn brute_force_query_aabb(nav: &NavMesh, query: Aabb) -> Vec<TriangleId> {
+        let mut out = Vec::new();
+        for (i, tri) in nav.triangles.iter().enumerate() {
+            let p0 = nav.vertex(tri.vertices[0]);
+            let p1 = nav.vertex(tri.vertices[1]);
+            let p2 = nav.vertex(tri.vertices[2]);
+            if Aabb::from_points([p0, p1, p2]).intersects(&query) {
+                out.push(TriangleId::new(i as u32));
+            }
+        }
+        out
+    }
+
+    fn collect_query(bsp: &Bsp, query: Aabb) -> Vec<TriangleId> {
+        let mut out = Vec::new();
+        bsp.query_aabb(query, |t| out.push(t));
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn query_aabb_whole_mesh_returns_every_triangle() {
+        let nav = build_square_with_hole();
+        let bsp = Bsp::build(&nav);
+        let everything = Aabb::from_points([Vertex::new(-10.0, -10.0), Vertex::new(10.0, 10.0)]);
+        let hits = collect_query(&bsp, everything);
+        assert_eq!(hits.len(), nav.triangle_count());
+    }
+
+    #[test]
+    fn query_aabb_matches_brute_force() {
+        let nav = build_square_with_hole();
+        let bsp = Bsp::build(&nav);
+        let queries = [
+            Aabb::from_points([Vertex::new(0.0, 0.0), Vertex::new(1.0, 1.0)]), // a corner
+            Aabb::from_points([Vertex::new(1.5, 1.5), Vertex::new(2.5, 2.5)]), // around the hole
+            Aabb::from_points([Vertex::new(3.0, 0.0), Vertex::new(4.0, 4.0)]), // a side strip
+            Aabb::from_point(Vertex::new(2.0, 0.5)),                          // degenerate point
+        ];
+        for q in queries {
+            let mut brute = brute_force_query_aabb(&nav, q);
+            brute.sort();
+            assert_eq!(collect_query(&bsp, q), brute, "mismatch for query {q:?}");
+        }
+    }
+
+    #[test]
+    fn query_aabb_outside_mesh_is_empty() {
+        let nav = build_square_with_hole();
+        let bsp = Bsp::build(&nav);
+        let far = Aabb::from_points([Vertex::new(100.0, 100.0), Vertex::new(101.0, 101.0)]);
+        assert!(collect_query(&bsp, far).is_empty());
+    }
+
+    #[test]
+    fn query_aabb_on_empty_mesh_is_safe() {
+        let nav = NavMesh {
+            vertices: Vec::new(),
+            triangles: Vec::new(),
+            aabb: rsnav_common::Aabb::EMPTY,
+            region_count: 0,
+        };
+        let bsp = Bsp::build(&nav);
+        let mut count = 0;
+        bsp.query_aabb(
+            Aabb::from_points([Vertex::new(0.0, 0.0), Vertex::new(1.0, 1.0)]),
+            |_| count += 1,
+        );
+        assert_eq!(count, 0);
     }
 
     #[test]
