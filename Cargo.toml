@@ -9,6 +9,8 @@ members = [
     "crates/navigation",
     "crates/pathing",
     "crates/dynamic",
+    "crates/crowd",
+    "crates/crowd-demo",
     "crates/demo",
     "crates/fixtures",
     "crates/rtsim",
@@ -29,6 +31,7 @@ rsnav-bsp = { path = "crates/bsp" }
 rsnav-navigation = { path = "crates/navigation" }
 rsnav-pathing = { path = "crates/pathing" }
 rsnav-dynamic = { path = "crates/dynamic" }
+rsnav-crowd = { path = "crates/crowd" }
 arc-swap = "1"
 
 [profile.release]

@@ -1,0 +1,22 @@
+[package]
+name = "rsnav-crowd-demo"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Testbed for rsnav-crowd: a fixed RTS world (town hall + mine + forest) and N wandering agents demonstrating sampled-VO local avoidance."
+
+[dependencies]
+rsnav-common.workspace = true
+rsnav-polygon-extract.workspace = true
+rsnav-navmesh.workspace = true
+rsnav-bsp.workspace = true
+rsnav-dynamic.workspace = true
+rsnav-crowd.workspace = true
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.29"
+
+[[bin]]
+name = "rsnav-crowd-demo"
+path = "src/main.rs"

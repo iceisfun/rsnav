@@ -1,0 +1,909 @@
+//! Multi-agent crowd simulation over an [`rsnav_dynamic::NavBuild`].
+//!
+//! `rsnav-crowd` is the Detour-Crowd analogue for this workspace: each
+//! [`Agent`] gets its own funnel-pulled path corridor through a shared
+//! navmesh, and a sampled velocity-obstacle solver picks a per-tick
+//! velocity that follows the corridor while side-stepping other agents.
+//!
+//! ## Quick start
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use rsnav_common::Vertex;
+//! use rsnav_crowd::{Agent, Crowd, CrowdConfig, Goal};
+//! use rsnav_dynamic::{build_navmesh_from_bitfield, BuildOptions};
+//! use rsnav_polygon_extract::Bitfield;
+//!
+//! let bf = Bitfield::new(16, 16, vec![true; 16 * 16]).unwrap();
+//! let nav = Arc::new(
+//!     build_navmesh_from_bitfield(&bf, &BuildOptions::default()).unwrap(),
+//! );
+//! let mut crowd = Crowd::new(nav, CrowdConfig::default());
+//! let id = crowd.add_agent(Agent::new(Vertex::new(2.0, 8.0), 0.3, 2.0));
+//! crowd.set_goal(
+//!     id,
+//!     Some(Goal { target: Vertex::new(14.0, 8.0), arrive_radius: 0.5 }),
+//! );
+//! for _ in 0..1_000 {
+//!     crowd.tick(1.0 / 60.0);
+//!     if crowd.agent(id).unwrap().goal.is_none() { break; }
+//! }
+//! ```
+//!
+//! ## Per-tick pipeline
+//!
+//! [`Crowd::tick`] runs four passes:
+//!
+//! 1. **Replan / arrive.** For each agent with a goal, check whether
+//!    the goal is reached (clear it) or whether a new path is needed
+//!    (path is empty, or `stuck` ≥ `stuck_ticks`). Replans go through
+//!    [`rsnav_navigation::find_path`] with `distance_from_wall` set to
+//!    the agent's `radius`, so each agent gets a corridor sized for
+//!    its body.
+//! 2. **Rebuild spatial hash.** A simple hash grid over all live
+//!    agents, sized to the configured `neighbor_radius`.
+//! 3. **Choose velocities.** For each agent: compute a preferred
+//!    velocity toward the next corridor corner; generate `vo_samples`
+//!    candidate velocities spread ±π around the preferred direction
+//!    (plus a zero-velocity "brake" sample); score each by alignment
+//!    minus a time-to-collision penalty against neighbors; pick the
+//!    winner.
+//! 4. **Integrate.** Advance positions, advance the corridor cursor
+//!    when within `arrive_eps` of the current corner, and update each
+//!    agent's `stuck` counter.
+//!
+//! ## Limitations (v0)
+//!
+//! - No formation / goal-slot logic — give every agent a unique goal
+//!   target if you don't want them stacking on a single point.
+//! - No priority bias yet; if two agents are perfectly head-on with
+//!   identical radii / speeds, supply a small positional offset (or
+//!   different goals) to break symmetry.
+//! - Avoidance does not consult the navmesh directly: it trusts the
+//!   path corridor for wall clearance. If avoidance briefly pushes an
+//!   agent off-corridor, the `stuck` counter triggers a replan.
+//! - Use [`Crowd::set_nav`] whenever the navmesh is hot-swapped
+//!   (e.g. after [`rsnav_dynamic::NavWorker::poll_swap`]); all paths
+//!   are invalidated and replanned on the next tick.
+
+#![forbid(unsafe_code)]
+#![warn(missing_debug_implementations)]
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use rsnav_common::Vertex;
+use rsnav_dynamic::NavBuild;
+use rsnav_navigation::{find_path, PathOptions};
+
+// =========================================================================
+// Public types
+// =========================================================================
+
+/// Opaque handle for an agent in a [`Crowd`].
+///
+/// Indices are stable across removals: removing an agent leaves a hole
+/// that the next [`Crowd::add_agent`] may reuse, but ids of other agents
+/// never shift.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AgentId(pub u32);
+
+/// A goal an agent is currently trying to reach.
+#[derive(Copy, Clone, Debug)]
+pub struct Goal {
+    /// World-space target point.
+    pub target: Vertex,
+    /// The agent's goal is cleared once `pos.distance(target) <= arrive_radius`.
+    pub arrive_radius: f64,
+}
+
+/// Snapshot of a single agent's externally visible state.
+///
+/// Internal fields (current path, cursor, stuck counter) are owned by
+/// the [`Crowd`] and not exposed.
+#[derive(Copy, Clone, Debug)]
+pub struct Agent {
+    pub pos: Vertex,
+    pub vel: Vertex,
+    /// Body radius. Drives both planning clearance and disc-disc avoidance.
+    pub radius: f64,
+    /// Maximum desired speed, in world-units per second.
+    pub max_speed: f64,
+    /// User-defined priority. Reserved for v1's chokepoint-yielding rule;
+    /// ignored by v0 avoidance scoring.
+    pub priority: f32,
+    /// Current goal, if any. `None` ⇒ the agent is idle and brakes.
+    pub goal: Option<Goal>,
+}
+
+impl Agent {
+    /// Construct an idle agent at `pos` with the given body radius and
+    /// max speed. Velocity is zero and there is no goal yet.
+    pub fn new(pos: Vertex, radius: f64, max_speed: f64) -> Self {
+        Self {
+            pos,
+            vel: Vertex::ZERO,
+            radius,
+            max_speed,
+            priority: 0.0,
+            goal: None,
+        }
+    }
+}
+
+/// Tunables for the per-tick solver.
+#[derive(Copy, Clone, Debug)]
+pub struct CrowdConfig {
+    /// Number of angular candidate velocities to test per agent per tick
+    /// (in addition to a zero-velocity "brake" sample). Spread evenly
+    /// over ±π around the preferred direction. Default `16`.
+    pub vo_samples: u32,
+    /// World-space radius for neighbor queries. Agents farther than this
+    /// from one another are ignored by avoidance. Default `6.0`.
+    pub neighbor_radius: f64,
+    /// Time-to-collision horizon. Candidates whose TTC against any
+    /// neighbor falls below this value are penalised, linearly more so
+    /// the closer the collision is to now. Default `1.5`s.
+    pub time_horizon: f64,
+    /// Replan trigger: if the agent has moved less than ~10% of its
+    /// expected per-tick distance for this many consecutive ticks, the
+    /// corridor is discarded and rebuilt. Default `60` (≈1 s at 60 Hz).
+    pub stuck_ticks: u32,
+    /// Weight applied to the alignment term (preferred-velocity dot
+    /// candidate, normalised). Default `1.0`.
+    pub align_weight: f64,
+    /// Weight applied to the time-to-collision penalty. Default `2.0`.
+    /// Heavier values make agents more cautious; lighter values let them
+    /// crowd more tightly but increase the chance of brushing contact.
+    pub avoid_weight: f64,
+    /// How close (in world units) the agent must come to the current
+    /// corridor corner before the cursor advances. Default `0.25`.
+    pub arrive_eps: f64,
+}
+
+impl Default for CrowdConfig {
+    fn default() -> Self {
+        Self {
+            vo_samples: 16,
+            neighbor_radius: 6.0,
+            time_horizon: 1.5,
+            stuck_ticks: 60,
+            align_weight: 1.0,
+            avoid_weight: 2.0,
+            arrive_eps: 0.25,
+        }
+    }
+}
+
+// =========================================================================
+// Internal slot
+// =========================================================================
+
+#[derive(Debug)]
+struct Slot {
+    agent: Agent,
+    /// Funnel-pulled corridor from current pos to goal. `path[0]` is the
+    /// start (snapshot at plan time) and `path.last()` is the goal.
+    path: Vec<Vertex>,
+    /// Index of the corner the agent is currently steering toward.
+    cursor: usize,
+    /// Consecutive ticks of near-zero progress while a goal is active.
+    stuck: u32,
+    /// Position recorded at the end of the previous tick, for `stuck`
+    /// detection.
+    last_pos: Vertex,
+    /// Set when `find_path` last returned `Err`. Suppresses further
+    /// replan attempts until the goal or nav is replaced.
+    plan_failed: bool,
+}
+
+impl Slot {
+    fn new(agent: Agent) -> Self {
+        let pos = agent.pos;
+        Self {
+            agent,
+            path: Vec::new(),
+            cursor: 0,
+            stuck: 0,
+            last_pos: pos,
+            plan_failed: false,
+        }
+    }
+
+    /// Drop the current corridor and reset planning state.
+    fn invalidate_path(&mut self) {
+        self.path.clear();
+        self.cursor = 0;
+        self.stuck = 0;
+        self.plan_failed = false;
+    }
+}
+
+// =========================================================================
+// Spatial hash (uniform grid)
+// =========================================================================
+
+#[derive(Debug)]
+struct SpatialHash {
+    cell: f64,
+    bins: HashMap<(i32, i32), Vec<usize>>,
+}
+
+impl SpatialHash {
+    fn new(cell: f64) -> Self {
+        Self {
+            cell: cell.max(0.01),
+            bins: HashMap::new(),
+        }
+    }
+
+    fn key(&self, p: Vertex) -> (i32, i32) {
+        (
+            (p.x / self.cell).floor() as i32,
+            (p.y / self.cell).floor() as i32,
+        )
+    }
+
+    fn clear(&mut self) {
+        for v in self.bins.values_mut() {
+            v.clear();
+        }
+    }
+
+    fn insert(&mut self, idx: usize, p: Vertex) {
+        let k = self.key(p);
+        self.bins.entry(k).or_default().push(idx);
+    }
+
+    fn for_neighbors<F: FnMut(usize)>(&self, p: Vertex, r: f64, mut f: F) {
+        let span = ((r / self.cell).ceil() as i32).max(0);
+        let (cx, cy) = self.key(p);
+        for dy in -span..=span {
+            for dx in -span..=span {
+                if let Some(v) = self.bins.get(&(cx + dx, cy + dy)) {
+                    for &i in v {
+                        f(i);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// =========================================================================
+// Crowd
+// =========================================================================
+
+/// The simulation owner.
+///
+/// Hosts the agent slab, a shared [`Arc<NavBuild>`] used for planning,
+/// and the per-tick spatial hash + velocity scratch buffer. See the
+/// [crate-level docs](crate) for the per-tick pipeline.
+#[derive(Debug)]
+pub struct Crowd {
+    nav: Arc<NavBuild>,
+    slots: Vec<Option<Slot>>,
+    config: CrowdConfig,
+    hash: SpatialHash,
+    next_vels: Vec<Vertex>,
+}
+
+impl Crowd {
+    /// Construct an empty crowd against the given navmesh build.
+    pub fn new(nav: Arc<NavBuild>, config: CrowdConfig) -> Self {
+        let hash = SpatialHash::new(config.neighbor_radius.max(1.0));
+        Self {
+            nav,
+            slots: Vec::new(),
+            config,
+            hash,
+            next_vels: Vec::new(),
+        }
+    }
+
+    pub fn config(&self) -> &CrowdConfig {
+        &self.config
+    }
+
+    /// Borrow the current navmesh build.
+    pub fn nav(&self) -> &NavBuild {
+        &self.nav
+    }
+
+    /// Swap to a freshly-published navmesh (e.g. after a `NavWorker`
+    /// `poll_swap`). Paths whose remaining corridor and goal are still
+    /// on the new mesh are kept; only the ones that have actually been
+    /// invalidated are cleared and will replan on the next
+    /// [`Crowd::tick`].
+    ///
+    /// This avoids a global replan storm when a mesh regeneration is
+    /// cosmetic (e.g. terrain visualisation changed but the walkable
+    /// region is the same) or strictly additive (a wall was removed —
+    /// existing corridors are still valid; agents simply won't take
+    /// advantage of the new shortcut until their next natural replan).
+    pub fn set_nav(&mut self, nav: Arc<NavBuild>) {
+        self.nav = nav.clone();
+        for slot in self.slots.iter_mut().flatten() {
+            if slot.path.is_empty() {
+                continue;
+            }
+            // Goal off-mesh? Drop the path; the FSM-side reassignment
+            // (or a fresh replan) will pick a reachable goal.
+            let goal_valid = match slot.agent.goal {
+                None => false,
+                Some(g) => nav.bsp.locate(&nav.navmesh, g.target).is_some(),
+            };
+            if !goal_valid {
+                slot.invalidate_path();
+                continue;
+            }
+            // Remaining corridor waypoints must still locate inside the
+            // new mesh. Already-traversed prefix is irrelevant.
+            let mut path_valid = true;
+            for p in slot.path.iter().skip(slot.cursor) {
+                if nav.bsp.locate(&nav.navmesh, *p).is_none() {
+                    path_valid = false;
+                    break;
+                }
+            }
+            if !path_valid {
+                slot.invalidate_path();
+            }
+        }
+    }
+
+    /// Insert a new agent and return its handle.
+    pub fn add_agent(&mut self, agent: Agent) -> AgentId {
+        for (i, s) in self.slots.iter_mut().enumerate() {
+            if s.is_none() {
+                *s = Some(Slot::new(agent));
+                return AgentId(i as u32);
+            }
+        }
+        let id = self.slots.len() as u32;
+        self.slots.push(Some(Slot::new(agent)));
+        AgentId(id)
+    }
+
+    /// Remove an agent, returning its last snapshot. Returns `None` if
+    /// the id is already gone or out of range.
+    pub fn remove_agent(&mut self, id: AgentId) -> Option<Agent> {
+        let slot = self.slots.get_mut(id.0 as usize)?;
+        slot.take().map(|s| s.agent)
+    }
+
+    /// Borrow an agent's externally visible state.
+    pub fn agent(&self, id: AgentId) -> Option<&Agent> {
+        self.slots.get(id.0 as usize)?.as_ref().map(|s| &s.agent)
+    }
+
+    /// Iterate over every live agent.
+    pub fn agents(&self) -> impl Iterator<Item = (AgentId, &Agent)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.as_ref().map(|s| (AgentId(i as u32), &s.agent)))
+    }
+
+    /// Number of live (non-removed) agents.
+    pub fn agent_count(&self) -> usize {
+        self.slots.iter().filter(|s| s.is_some()).count()
+    }
+
+    /// Read-only access to an agent's current corridor (start →
+    /// funnel-pulled corners → goal). Returns an empty slice if no path
+    /// is currently planned. Useful for debug rendering.
+    pub fn path(&self, id: AgentId) -> &[Vertex] {
+        match self.slots.get(id.0 as usize).and_then(|s| s.as_ref()) {
+            Some(s) => &s.path,
+            None => &[],
+        }
+    }
+
+    /// Index into [`Crowd::path`] of the corner the agent is currently
+    /// steering toward. Combined with [`Agent::pos`], this lets a
+    /// renderer draw the *remaining* corridor — i.e. a polyline that
+    /// begins at the agent and never includes the already-traversed
+    /// leg from the original start point.
+    pub fn path_cursor(&self, id: AgentId) -> Option<usize> {
+        self.slots
+            .get(id.0 as usize)
+            .and_then(|s| s.as_ref())
+            .map(|s| s.cursor)
+    }
+
+    /// `true` when the agent's last replan attempt returned an error
+    /// (start or goal off-mesh, or no portal wide enough for its
+    /// radius). Callers can use this to release a claimed slot and
+    /// pick a different one rather than waiting on an unreachable
+    /// destination.
+    pub fn plan_failed(&self, id: AgentId) -> bool {
+        self.slots
+            .get(id.0 as usize)
+            .and_then(|s| s.as_ref())
+            .map(|s| s.plan_failed)
+            .unwrap_or(false)
+    }
+
+    // ---- mutators ---------------------------------------------------------
+
+    /// Assign or clear the agent's goal. Always invalidates the path.
+    pub fn set_goal(&mut self, id: AgentId, goal: Option<Goal>) {
+        if let Some(Some(slot)) = self.slots.get_mut(id.0 as usize) {
+            slot.agent.goal = goal;
+            slot.invalidate_path();
+            if goal.is_none() {
+                slot.agent.vel = Vertex::ZERO;
+            }
+        }
+    }
+
+    /// Teleport the agent to `pos`. Invalidates the path.
+    pub fn set_pos(&mut self, id: AgentId, pos: Vertex) {
+        if let Some(Some(slot)) = self.slots.get_mut(id.0 as usize) {
+            slot.agent.pos = pos;
+            slot.last_pos = pos;
+            slot.invalidate_path();
+        }
+    }
+
+    /// Change the agent's body radius. Invalidates the path because the
+    /// planner uses radius as wall clearance.
+    pub fn set_radius(&mut self, id: AgentId, radius: f64) {
+        if let Some(Some(slot)) = self.slots.get_mut(id.0 as usize) {
+            slot.agent.radius = radius;
+            slot.invalidate_path();
+        }
+    }
+
+    /// Change the agent's max speed. Cheap; does not invalidate the path.
+    pub fn set_max_speed(&mut self, id: AgentId, max_speed: f64) {
+        if let Some(Some(slot)) = self.slots.get_mut(id.0 as usize) {
+            slot.agent.max_speed = max_speed;
+        }
+    }
+
+    /// Set the agent's priority. v0 ignores this; reserved for v1.
+    pub fn set_priority(&mut self, id: AgentId, priority: f32) {
+        if let Some(Some(slot)) = self.slots.get_mut(id.0 as usize) {
+            slot.agent.priority = priority;
+        }
+    }
+
+    // ---- main tick --------------------------------------------------------
+
+    /// Advance the simulation by `dt` seconds.
+    pub fn tick(&mut self, dt: f64) {
+        self.replan_and_arrive();
+        self.rebuild_hash();
+        self.choose_all_velocities();
+        self.integrate(dt);
+    }
+
+    fn replan_and_arrive(&mut self) {
+        let nav = self.nav.clone();
+        for slot_opt in self.slots.iter_mut() {
+            let Some(slot) = slot_opt else {
+                continue;
+            };
+
+            // Defensive snap: if avoidance or a navmesh swap left the
+            // agent off-mesh, pull it to the nearest mesh point so
+            // planning can succeed. Without this, find_path returns
+            // StartOutsideMesh and the agent latches in place.
+            if nav.bsp.locate(&nav.navmesh, slot.agent.pos).is_none() {
+                if let Some(n) = nav.bsp.nearest(&nav.navmesh, slot.agent.pos) {
+                    slot.agent.pos = n.point;
+                    slot.last_pos = n.point;
+                    // Old path is now misleading; force a rebuild.
+                    slot.path.clear();
+                    slot.cursor = 0;
+                }
+            }
+
+            let Some(goal) = slot.agent.goal else {
+                slot.path.clear();
+                slot.cursor = 0;
+                slot.agent.vel = Vertex::ZERO;
+                continue;
+            };
+            if slot.agent.pos.distance(goal.target) <= goal.arrive_radius {
+                slot.agent.goal = None;
+                slot.path.clear();
+                slot.cursor = 0;
+                slot.agent.vel = Vertex::ZERO;
+                continue;
+            }
+
+            // Replan when: we have no path yet, or we've been stuck long
+            // enough. `plan_failed` does NOT latch — after `stuck_ticks`
+            // ticks of no progress we always retry, in case the world
+            // (or our position) has changed in our favor.
+            let needs_replan =
+                slot.path.is_empty() || slot.stuck >= self.config.stuck_ticks;
+            if needs_replan {
+                let opts = PathOptions {
+                    distance_from_wall: slot.agent.radius,
+                };
+                match find_path(&nav.navmesh, &nav.bsp, slot.agent.pos, goal.target, &opts) {
+                    Ok(p) => {
+                        slot.path = p.points;
+                        slot.cursor = if slot.path.len() >= 2 { 1 } else { 0 };
+                        slot.stuck = 0;
+                        slot.plan_failed = false;
+                    }
+                    Err(_) => {
+                        slot.plan_failed = true;
+                        slot.path.clear();
+                        slot.cursor = 0;
+                        slot.stuck = 0; // reset so we wait another window before retrying
+                    }
+                }
+            }
+        }
+    }
+
+    fn rebuild_hash(&mut self) {
+        self.hash.clear();
+        for (i, slot_opt) in self.slots.iter().enumerate() {
+            if let Some(slot) = slot_opt {
+                self.hash.insert(i, slot.agent.pos);
+            }
+        }
+    }
+
+    fn choose_all_velocities(&mut self) {
+        let n = self.slots.len();
+        self.next_vels.clear();
+        self.next_vels.resize(n, Vertex::ZERO);
+        for i in 0..n {
+            if let Some(slot) = self.slots.get(i).and_then(|s| s.as_ref()) {
+                self.next_vels[i] = self.choose_velocity(i, slot);
+            }
+        }
+    }
+
+    fn integrate(&mut self, dt: f64) {
+        let arrive_eps = self.config.arrive_eps;
+        let nav = self.nav.clone();
+        for (i, slot_opt) in self.slots.iter_mut().enumerate() {
+            let Some(slot) = slot_opt else {
+                continue;
+            };
+            let v = self.next_vels[i];
+            slot.agent.vel = v;
+            let proposed = slot.agent.pos + v * dt;
+
+            // Clamp to the navmesh: if avoidance would push the agent
+            // off-mesh, snap to the nearest valid point. This keeps the
+            // invariant "agents are always on (or on the boundary of)
+            // the navmesh" and stops them from getting visually trapped
+            // outside buildings.
+            slot.agent.pos = match nav.bsp.locate(&nav.navmesh, proposed) {
+                Some(_) => proposed,
+                None => nav
+                    .bsp
+                    .nearest(&nav.navmesh, proposed)
+                    .map(|n| n.point)
+                    .unwrap_or(slot.agent.pos),
+            };
+
+            while slot.cursor < slot.path.len() {
+                let target = slot.path[slot.cursor];
+                if slot.agent.pos.distance(target) <= arrive_eps {
+                    slot.cursor += 1;
+                } else {
+                    break;
+                }
+            }
+
+            let moved = slot.agent.pos.distance(slot.last_pos);
+            let expected = slot.agent.max_speed * dt * 0.1;
+            if slot.agent.goal.is_some() && moved < expected {
+                slot.stuck = slot.stuck.saturating_add(1);
+            } else {
+                slot.stuck = 0;
+            }
+            slot.last_pos = slot.agent.pos;
+        }
+    }
+
+    // ---- per-agent velocity choice ---------------------------------------
+
+    fn choose_velocity(&self, idx: usize, slot: &Slot) -> Vertex {
+        if slot.agent.goal.is_none() || slot.plan_failed {
+            return Vertex::ZERO;
+        }
+        let v_pref = self.preferred_velocity(slot);
+        if v_pref.length_sq() < 1e-12 {
+            return Vertex::ZERO;
+        }
+        let max_speed = slot.agent.max_speed.max(1e-6);
+        let pref_norm_sq = max_speed * max_speed;
+
+        let mut best = v_pref;
+        let mut best_score = f64::NEG_INFINITY;
+
+        let mut consider = |v: Vertex,
+                            avoid_w: f64,
+                            align_w: f64,
+                            ttc_penalty: &dyn Fn(Vertex) -> f64| {
+            let align = v.dot(v_pref) / pref_norm_sq;
+            let pen = ttc_penalty(v);
+            let score = align_w * align - avoid_w * pen;
+            if score > best_score {
+                best_score = score;
+                best = v;
+            }
+        };
+
+        let penalty = |v: Vertex| self.collision_penalty(idx, slot, v);
+        let avoid_w = self.config.avoid_weight;
+        let align_w = self.config.align_weight;
+
+        // Zero-velocity (brake) sample.
+        consider(Vertex::ZERO, avoid_w, align_w, &penalty);
+
+        let n = self.config.vo_samples.max(2) as usize;
+        let half = n / 2;
+        let pref_dir_len = v_pref.length();
+        let inv = 1.0 / pref_dir_len;
+        let cos0 = v_pref.x * inv;
+        let sin0 = v_pref.y * inv;
+        let max_angle = std::f64::consts::PI;
+
+        for k in 0..=half {
+            let frac = if half == 0 { 0.0 } else { k as f64 / half as f64 };
+            let theta = max_angle * frac;
+            let (sin_t, cos_t) = theta.sin_cos();
+            let cx_p = cos0 * cos_t - sin0 * sin_t;
+            let cy_p = sin0 * cos_t + cos0 * sin_t;
+            consider(
+                Vertex::new(cx_p * max_speed, cy_p * max_speed),
+                avoid_w,
+                align_w,
+                &penalty,
+            );
+            if k > 0 && k < half {
+                let cx_m = cos0 * cos_t + sin0 * sin_t;
+                let cy_m = sin0 * cos_t - cos0 * sin_t;
+                consider(
+                    Vertex::new(cx_m * max_speed, cy_m * max_speed),
+                    avoid_w,
+                    align_w,
+                    &penalty,
+                );
+            }
+        }
+
+        best
+    }
+
+    fn preferred_velocity(&self, slot: &Slot) -> Vertex {
+        let Some(goal) = slot.agent.goal else {
+            return Vertex::ZERO;
+        };
+        let target = if slot.cursor < slot.path.len() {
+            slot.path[slot.cursor]
+        } else {
+            goal.target
+        };
+        let dir = (target - slot.agent.pos).normalize_or_zero();
+        dir * slot.agent.max_speed
+    }
+
+    /// Compute a [0, 1] collision penalty for trying velocity `v` from
+    /// agent `idx`. Worst (largest) penalty across all neighbors in
+    /// `neighbor_radius` is returned. Penalty of 1.0 ⇒ already
+    /// overlapping; 0.0 ⇒ no collision predicted within `time_horizon`.
+    fn collision_penalty(&self, idx: usize, slot: &Slot, v: Vertex) -> f64 {
+        let me_pos = slot.agent.pos;
+        let me_r = slot.agent.radius;
+        let horizon = self.config.time_horizon.max(1e-6);
+        let search = self.config.neighbor_radius + me_r;
+
+        let mut worst: f64 = 0.0;
+        self.hash.for_neighbors(me_pos, search, |j| {
+            if j == idx {
+                return;
+            }
+            let Some(Some(other)) = self.slots.get(j) else {
+                return;
+            };
+            // Frame where j is stationary: I'm at d = me - j moving at
+            // v - vel_j. Collision when |d + (v - vel_j) * t| <= r_sum.
+            let d = me_pos - other.agent.pos;
+            let v_rel = v - other.agent.vel;
+            let r = me_r + other.agent.radius;
+            let c = d.dot(d) - r * r;
+            if c <= 0.0 {
+                worst = 1.0;
+                return;
+            }
+            let a = v_rel.dot(v_rel);
+            if a <= 1e-12 {
+                return;
+            }
+            let b = 2.0 * d.dot(v_rel);
+            let disc = b * b - 4.0 * a * c;
+            if disc < 0.0 {
+                return;
+            }
+            let t = (-b - disc.sqrt()) / (2.0 * a);
+            if t > 0.0 && t < horizon {
+                let pen = 1.0 - t / horizon;
+                if pen > worst {
+                    worst = pen;
+                }
+            }
+        });
+        worst
+    }
+}
+
+// =========================================================================
+// Tests
+// =========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rsnav_dynamic::{build_navmesh_from_bitfield, BuildOptions};
+    use rsnav_polygon_extract::Bitfield;
+
+    fn open_arena(w: u32, h: u32) -> Arc<NavBuild> {
+        let data = vec![true; (w as usize) * (h as usize)];
+        let bf = Bitfield::new(w, h, data).expect("dims match data");
+        Arc::new(
+            build_navmesh_from_bitfield(&bf, &BuildOptions::default())
+                .expect("walkable arena builds"),
+        )
+    }
+
+    #[test]
+    fn single_agent_walks_to_goal_on_open_arena() {
+        let nav = open_arena(20, 20);
+        let mut crowd = Crowd::new(nav, CrowdConfig::default());
+        let id = crowd.add_agent(Agent::new(Vertex::new(2.0, 10.0), 0.3, 2.0));
+        crowd.set_goal(
+            id,
+            Some(Goal {
+                target: Vertex::new(18.0, 10.0),
+                arrive_radius: 0.5,
+            }),
+        );
+        for _ in 0..1_200 {
+            crowd.tick(1.0 / 60.0);
+            if crowd.agent(id).unwrap().goal.is_none() {
+                break;
+            }
+        }
+        let a = crowd.agent(id).unwrap();
+        assert!(a.goal.is_none(), "agent didn't arrive; ended at {:?}", a.pos);
+    }
+
+    #[test]
+    fn two_agents_head_on_pass_without_collision() {
+        let nav = open_arena(24, 10);
+        let mut crowd = Crowd::new(nav, CrowdConfig::default());
+        // Small y-offset to break perfect head-on symmetry.
+        let a = crowd.add_agent(Agent::new(Vertex::new(3.0, 5.05), 0.4, 1.5));
+        let b = crowd.add_agent(Agent::new(Vertex::new(21.0, 4.95), 0.4, 1.5));
+        crowd.set_goal(
+            a,
+            Some(Goal {
+                target: Vertex::new(21.0, 5.0),
+                arrive_radius: 0.6,
+            }),
+        );
+        crowd.set_goal(
+            b,
+            Some(Goal {
+                target: Vertex::new(3.0, 5.0),
+                arrive_radius: 0.6,
+            }),
+        );
+
+        let sum_r = 0.8;
+        let mut min_dist = f64::INFINITY;
+        let mut steps = 0;
+        for _ in 0..1_500 {
+            crowd.tick(1.0 / 60.0);
+            let pa = crowd.agent(a).unwrap();
+            let pb = crowd.agent(b).unwrap();
+            let d = pa.pos.distance(pb.pos);
+            if d < min_dist {
+                min_dist = d;
+            }
+            steps += 1;
+            if pa.goal.is_none() && pb.goal.is_none() {
+                break;
+            }
+        }
+
+        // No appreciable disc overlap during the encounter.
+        assert!(
+            min_dist >= sum_r - 0.05,
+            "agents collided: min_dist={:.3} sum_r={:.3} (after {} ticks)",
+            min_dist,
+            sum_r,
+            steps,
+        );
+        assert!(
+            crowd.agent(a).unwrap().goal.is_none(),
+            "agent A didn't reach its goal (pos={:?})",
+            crowd.agent(a).unwrap().pos,
+        );
+        assert!(
+            crowd.agent(b).unwrap().goal.is_none(),
+            "agent B didn't reach its goal (pos={:?})",
+            crowd.agent(b).unwrap().pos,
+        );
+    }
+
+    #[test]
+    fn idle_agent_stays_put() {
+        let nav = open_arena(8, 8);
+        let mut crowd = Crowd::new(nav, CrowdConfig::default());
+        let id = crowd.add_agent(Agent::new(Vertex::new(4.0, 4.0), 0.3, 2.0));
+        let start = crowd.agent(id).unwrap().pos;
+        for _ in 0..120 {
+            crowd.tick(1.0 / 60.0);
+        }
+        let end = crowd.agent(id).unwrap().pos;
+        assert!(start.approx_eq(end, 1e-9), "idle agent drifted: {:?}", end);
+    }
+
+    #[test]
+    fn set_nav_keeps_still_valid_paths() {
+        // Swapping to an identical-topology build should NOT invalidate
+        // a corridor whose waypoints and goal still locate on the mesh.
+        let nav = open_arena(12, 12);
+        let mut crowd = Crowd::new(nav, CrowdConfig::default());
+        let id = crowd.add_agent(Agent::new(Vertex::new(2.0, 6.0), 0.3, 2.0));
+        crowd.set_goal(
+            id,
+            Some(Goal {
+                target: Vertex::new(10.0, 6.0),
+                arrive_radius: 0.5,
+            }),
+        );
+        crowd.tick(1.0 / 60.0);
+        let path_len_before = crowd.path(id).len();
+        assert!(path_len_before >= 2);
+
+        crowd.set_nav(open_arena(12, 12));
+        assert_eq!(
+            crowd.path(id).len(),
+            path_len_before,
+            "identical mesh swap should preserve the corridor",
+        );
+    }
+
+    #[test]
+    fn set_nav_clears_paths_whose_goal_left_the_mesh() {
+        // Swapping to a build where the goal is outside the new mesh
+        // bounds should clear the path so the agent replans (and the
+        // demo can pick a fresh goal).
+        let nav = open_arena(20, 20);
+        let mut crowd = Crowd::new(nav, CrowdConfig::default());
+        let id = crowd.add_agent(Agent::new(Vertex::new(2.0, 10.0), 0.3, 2.0));
+        crowd.set_goal(
+            id,
+            Some(Goal {
+                target: Vertex::new(18.0, 10.0),
+                arrive_radius: 0.5,
+            }),
+        );
+        crowd.tick(1.0 / 60.0);
+        assert!(!crowd.path(id).is_empty());
+
+        // Shrink the world to 8×8: the previous goal at (18, 10) is now
+        // well outside.
+        crowd.set_nav(open_arena(8, 8));
+        assert!(
+            crowd.path(id).is_empty(),
+            "path with off-mesh goal should be invalidated",
+        );
+    }
+}
