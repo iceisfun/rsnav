@@ -32,6 +32,7 @@
 //! (`polygon-extract → CDT → NavMesh → BSP`). v1 will swap in a
 //! cavity-remesh strategy behind the same public API.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -106,6 +107,111 @@ impl core::fmt::Display for BuildError {
 }
 
 impl std::error::Error for BuildError {}
+
+// =========================================================================
+// Telemetry: typed events + counters.
+// =========================================================================
+
+/// Typed observability events emitted by [`NavWorker`].
+///
+/// Events are dispatched synchronously on the worker thread between
+/// builds, so listener implementations should be cheap. If you need to
+/// do heavyweight work (network I/O, file writes, expensive formatting)
+/// push the event into a channel and consume it from your own thread.
+#[derive(Copy, Clone, Debug)]
+pub enum NavEvent<'a> {
+    /// A new rebuild is about to start.
+    BuildStarted { generation: u64 },
+    /// A rebuild finished successfully and was published.
+    BuildCompleted {
+        generation: u64,
+        build_ms: f64,
+        triangles: usize,
+        regions: u32,
+    },
+    /// A rebuild failed; the previous published build (if any) is kept.
+    BuildFailed {
+        generation: u64,
+        error: &'a BuildError,
+    },
+}
+
+/// Callback interface for worker telemetry. Implement this on any
+/// type, or pass a closure — there's a blanket impl below.
+///
+/// `Send + Sync` because the listener is stored as an `Arc<dyn NavListener>`
+/// and invoked from the worker thread; `'static` because the worker
+/// thread outlives the calling scope.
+pub trait NavListener: Send + Sync + 'static {
+    fn on_event(&self, event: &NavEvent<'_>);
+}
+
+/// Blanket impl so any `Fn(&NavEvent<'_>)` closure can be used directly
+/// as a listener:
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use rsnav_dynamic::{NavWorker, NavListener, NavEvent, BuildOptions};
+///
+/// let listener: Arc<dyn NavListener> = Arc::new(|ev: &NavEvent<'_>| {
+///     eprintln!("nav event: {:?}", ev);
+/// });
+/// let _worker = NavWorker::spawn_with_listener(BuildOptions::default(), listener);
+/// ```
+impl<F> NavListener for F
+where
+    F: Fn(&NavEvent<'_>) + Send + Sync + 'static,
+{
+    fn on_event(&self, event: &NavEvent<'_>) {
+        (self)(event)
+    }
+}
+
+/// A snapshot of running worker counters, returned by
+/// [`NavWorker::stats`]. Plain `Copy` struct so callers can read it
+/// any number of times without worrying about consistency.
+///
+/// All counters are monotonic from worker start. The caller derives
+/// rates / averages itself (e.g. `total_build_ms / builds_completed`).
+#[derive(Copy, Clone, Debug, Default)]
+pub struct NavStats {
+    /// Total snapshots handed to [`NavWorker::submit_snapshot`].
+    pub snapshots_submitted: u64,
+    /// Snapshots silently dropped because a newer snapshot arrived
+    /// before the worker started building this one.
+    pub snapshots_coalesced: u64,
+    /// Builds that completed successfully.
+    pub builds_completed: u64,
+    /// Builds that failed (extract / segment-insertion / empty mesh).
+    pub builds_failed: u64,
+    /// Generation of the most recent completed build (0 if none).
+    pub last_completed_generation: u64,
+    /// Most recent successful build time, in milliseconds.
+    pub last_build_ms: f64,
+    /// Highest successful build time observed this session, in
+    /// milliseconds.
+    pub max_build_ms: f64,
+    /// Sum of all successful build times, in milliseconds. Divide by
+    /// `builds_completed` for the running average.
+    pub total_build_ms: f64,
+}
+
+#[derive(Debug, Default)]
+struct StatsInner {
+    snapshots_submitted: AtomicU64,
+    snapshots_coalesced: AtomicU64,
+    builds_completed: AtomicU64,
+    builds_failed: AtomicU64,
+    last_completed_generation: AtomicU64,
+    timing: Mutex<TimingStats>,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+struct TimingStats {
+    last_build_ms: f64,
+    max_build_ms: f64,
+    total_build_ms: f64,
+}
 
 // =========================================================================
 // One-shot pipeline (also used by NavWorker internally).
@@ -207,28 +313,50 @@ pub struct NavWorker {
     tx: Sender<Cmd>,
     shared: Arc<ArcSwapOption<NavBuild>>,
     last_error: Arc<Mutex<Option<String>>>,
+    stats: Arc<StatsInner>,
     snapshot: Option<Arc<NavBuild>>,
     snapshot_gen: u64,
     handle: Option<JoinHandle<()>>,
 }
 
 impl NavWorker {
-    /// Spawn the worker. The returned handle owns the thread and joins
-    /// it on `shutdown()` (or Drop).
+    /// Spawn the worker without a telemetry listener. Equivalent to
+    /// `spawn_with_listener(opts, None)` but lets callers avoid
+    /// constructing an `Arc<dyn NavListener>` they don't need.
     pub fn spawn(opts: BuildOptions) -> Self {
+        Self::spawn_inner(opts, None)
+    }
+
+    /// Spawn the worker with a telemetry listener. The listener
+    /// receives [`NavEvent`]s synchronously on the worker thread; keep
+    /// handlers cheap (push to a channel for any heavy work).
+    ///
+    /// Pass either a struct that implements [`NavListener`] wrapped in
+    /// `Arc`, or `Arc::new(|ev| { ... })` for a closure.
+    pub fn spawn_with_listener(
+        opts: BuildOptions,
+        listener: Arc<dyn NavListener>,
+    ) -> Self {
+        Self::spawn_inner(opts, Some(listener))
+    }
+
+    fn spawn_inner(opts: BuildOptions, listener: Option<Arc<dyn NavListener>>) -> Self {
         let shared = Arc::new(ArcSwapOption::empty());
         let last_error = Arc::new(Mutex::new(None));
+        let stats = Arc::new(StatsInner::default());
         let (tx, rx) = channel::<Cmd>();
         let shared_w = shared.clone();
         let err_w = last_error.clone();
+        let stats_w = stats.clone();
         let handle = thread::Builder::new()
             .name("rsnav-dynamic-worker".into())
-            .spawn(move || run_worker(rx, shared_w, err_w, opts))
+            .spawn(move || run_worker(rx, shared_w, err_w, stats_w, listener, opts))
             .expect("spawning worker thread");
         Self {
             tx,
             shared,
             last_error,
+            stats,
             snapshot: None,
             snapshot_gen: 0,
             handle: Some(handle),
@@ -239,9 +367,32 @@ impl NavWorker {
     /// snapshot is still queued, the worker silently coalesces and only
     /// builds against the newest one.
     pub fn submit_snapshot(&self, bitfield: Arc<Bitfield>) {
+        self.stats
+            .snapshots_submitted
+            .fetch_add(1, Ordering::Relaxed);
         // send can only fail if the worker thread is gone — which means
         // the caller is already in shutdown, so dropping is fine.
         let _ = self.tx.send(Cmd::Rebuild(bitfield));
+    }
+
+    /// A snapshot of the worker's running counters. Cheap (takes one
+    /// short mutex lock for the timing fields). Safe to call every
+    /// frame.
+    pub fn stats(&self) -> NavStats {
+        let timing = *self.stats.timing.lock().expect("stats timing mutex");
+        NavStats {
+            snapshots_submitted: self.stats.snapshots_submitted.load(Ordering::Relaxed),
+            snapshots_coalesced: self.stats.snapshots_coalesced.load(Ordering::Relaxed),
+            builds_completed: self.stats.builds_completed.load(Ordering::Relaxed),
+            builds_failed: self.stats.builds_failed.load(Ordering::Relaxed),
+            last_completed_generation: self
+                .stats
+                .last_completed_generation
+                .load(Ordering::Relaxed),
+            last_build_ms: timing.last_build_ms,
+            max_build_ms: timing.max_build_ms,
+            total_build_ms: timing.total_build_ms,
+        }
     }
 
     /// Call once per frame, before any system reads `current()`. If the
@@ -300,8 +451,16 @@ fn run_worker(
     rx: Receiver<Cmd>,
     shared: Arc<ArcSwapOption<NavBuild>>,
     last_error: Arc<Mutex<Option<String>>>,
+    stats: Arc<StatsInner>,
+    listener: Option<Arc<dyn NavListener>>,
     opts: BuildOptions,
 ) {
+    let dispatch = |event: &NavEvent<'_>| {
+        if let Some(l) = listener.as_ref() {
+            l.on_event(event);
+        }
+    };
+
     let mut generation: u64 = 0;
     loop {
         // Block until we get at least one snapshot.
@@ -315,24 +474,65 @@ fn run_worker(
         };
 
         // Drain anything queued behind it — only build against the newest.
+        let mut coalesced: u64 = 0;
         loop {
             match rx.try_recv() {
-                Ok(Cmd::Rebuild(bf)) => latest = bf,
+                Ok(Cmd::Rebuild(bf)) => {
+                    coalesced += 1;
+                    latest = bf;
+                }
                 Ok(Cmd::Shutdown) => return,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
             }
         }
+        if coalesced > 0 {
+            stats
+                .snapshots_coalesced
+                .fetch_add(coalesced, Ordering::Relaxed);
+        }
 
         generation += 1;
+        dispatch(&NavEvent::BuildStarted { generation });
+
         match build_navmesh_from_bitfield(&latest, &opts) {
             Ok(mut build) => {
                 build.generation = generation;
+                // Pull the fields we want for the completion event
+                // before moving `build` into the Arc.
+                let build_ms = build.build_ms;
+                let triangles = build.navmesh.triangle_count();
+                let regions = build.navmesh.region_count;
                 shared.store(Some(Arc::new(build)));
                 *last_error.lock().expect("worker error mutex") = None;
+
+                stats.builds_completed.fetch_add(1, Ordering::Relaxed);
+                stats
+                    .last_completed_generation
+                    .store(generation, Ordering::Relaxed);
+                {
+                    let mut t = stats.timing.lock().expect("stats timing mutex");
+                    t.last_build_ms = build_ms;
+                    if build_ms > t.max_build_ms {
+                        t.max_build_ms = build_ms;
+                    }
+                    t.total_build_ms += build_ms;
+                }
+
+                dispatch(&NavEvent::BuildCompleted {
+                    generation,
+                    build_ms,
+                    triangles,
+                    regions,
+                });
             }
             Err(e) => {
                 *last_error.lock().expect("worker error mutex") = Some(format!("{e}"));
+                stats.builds_failed.fetch_add(1, Ordering::Relaxed);
+                dispatch(&NavEvent::BuildFailed {
+                    generation,
+                    error: &e,
+                });
                 // Keep the previous published build (if any) intact.
             }
         }
@@ -426,5 +626,182 @@ mod tests {
         let worker = NavWorker::spawn(BuildOptions::default());
         worker.submit_snapshot(Arc::new(solid_bitfield(8, 8)));
         worker.shutdown(); // shouldn't hang
+    }
+
+    // ---- telemetry --------------------------------------------------
+
+    /// Collector listener that records every event it receives.
+    #[derive(Default)]
+    struct Collector {
+        events: Mutex<Vec<String>>,
+    }
+    impl Collector {
+        fn snapshot(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+    impl NavListener for Collector {
+        fn on_event(&self, ev: &NavEvent<'_>) {
+            let s = match ev {
+                NavEvent::BuildStarted { generation } => format!("started:{generation}"),
+                NavEvent::BuildCompleted {
+                    generation,
+                    triangles,
+                    regions,
+                    ..
+                } => format!("completed:{generation}:tris={triangles}:regs={regions}"),
+                NavEvent::BuildFailed { generation, error } => {
+                    format!("failed:{generation}:{error}")
+                }
+            };
+            self.events.lock().unwrap().push(s);
+        }
+    }
+
+    fn wait_until<F: FnMut() -> bool>(mut cond: F, label: &str) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while !cond() {
+            if Instant::now() > deadline {
+                panic!("timeout waiting for: {label}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn listener_receives_started_and_completed_for_a_build() {
+        let listener = Arc::new(Collector::default());
+        let worker = NavWorker::spawn_with_listener(
+            BuildOptions::default(),
+            listener.clone() as Arc<dyn NavListener>,
+        );
+        worker.submit_snapshot(Arc::new(solid_bitfield(8, 8)));
+
+        wait_until(
+            || {
+                listener
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.starts_with("completed:"))
+            },
+            "completion event",
+        );
+
+        let evs = listener.snapshot();
+        assert!(
+            evs.iter().any(|e| e == "started:1"),
+            "expected started:1, got {evs:?}"
+        );
+        assert!(
+            evs.iter()
+                .any(|e| e.starts_with("completed:1:tris=") && e.contains(":regs=1")),
+            "expected completed:1 with tris/regs, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn listener_receives_failed_for_bad_input() {
+        let listener = Arc::new(Collector::default());
+        let worker = NavWorker::spawn_with_listener(
+            BuildOptions::default(),
+            listener.clone() as Arc<dyn NavListener>,
+        );
+        worker.submit_snapshot(Arc::new(Bitfield::empty(8, 8)));
+
+        wait_until(
+            || {
+                listener
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.starts_with("failed:"))
+            },
+            "failure event",
+        );
+
+        let evs = listener.snapshot();
+        assert!(
+            evs.iter()
+                .any(|e| e.starts_with("failed:1:") && e.contains("no walkable")),
+            "expected failed:1 with no-walkable message, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn closure_can_be_used_as_listener() {
+        // Demonstrates the blanket Fn impl + Arc-coercion ergonomics.
+        let n = Arc::new(AtomicU64::new(0));
+        let n_l = n.clone();
+        let listener: Arc<dyn NavListener> = Arc::new(move |ev: &NavEvent<'_>| {
+            if matches!(ev, NavEvent::BuildCompleted { .. }) {
+                n_l.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let worker = NavWorker::spawn_with_listener(BuildOptions::default(), listener);
+        worker.submit_snapshot(Arc::new(solid_bitfield(8, 8)));
+        wait_until(|| n.load(Ordering::Relaxed) >= 1, "one completion");
+    }
+
+    #[test]
+    fn stats_track_completions_and_max_build_ms() {
+        let worker = NavWorker::spawn(BuildOptions::default());
+        worker.submit_snapshot(Arc::new(solid_bitfield(8, 8)));
+        wait_until(
+            || worker.stats().builds_completed >= 1,
+            "first build complete",
+        );
+        let s = worker.stats();
+        assert!(s.snapshots_submitted >= 1);
+        assert_eq!(s.builds_completed, 1);
+        assert_eq!(s.builds_failed, 0);
+        assert_eq!(s.last_completed_generation, 1);
+        assert!(s.last_build_ms >= 0.0);
+        assert!(s.max_build_ms >= s.last_build_ms);
+        assert!(s.total_build_ms >= s.last_build_ms);
+    }
+
+    #[test]
+    fn stats_track_failures() {
+        let worker = NavWorker::spawn(BuildOptions::default());
+        worker.submit_snapshot(Arc::new(Bitfield::empty(8, 8)));
+        wait_until(|| worker.stats().builds_failed >= 1, "first build failure");
+        let s = worker.stats();
+        assert_eq!(s.builds_failed, 1);
+        assert_eq!(s.builds_completed, 0);
+        assert_eq!(s.last_completed_generation, 0);
+    }
+
+    #[test]
+    fn stats_track_coalescing() {
+        let worker = NavWorker::spawn(BuildOptions::default());
+        for _ in 0..10 {
+            worker.submit_snapshot(Arc::new(solid_bitfield(8, 8)));
+        }
+        // Let the worker chew through whatever it can.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let s = worker.stats();
+        assert_eq!(
+            s.snapshots_submitted, 10,
+            "all 10 submissions should count"
+        );
+        // builds_completed + snapshots_coalesced should account for
+        // every submission. (Plus possibly 1 still queued; account for
+        // it by allowing >= 9.)
+        let accounted = s.builds_completed + s.snapshots_coalesced;
+        assert!(
+            accounted >= 9,
+            "accounted={} (completed={} coalesced={}) should cover at least 9 of 10",
+            accounted,
+            s.builds_completed,
+            s.snapshots_coalesced,
+        );
+        assert!(
+            s.snapshots_coalesced >= 1,
+            "expected at least one coalesced drop, got {}",
+            s.snapshots_coalesced,
+        );
     }
 }

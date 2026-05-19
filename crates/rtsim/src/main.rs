@@ -10,7 +10,8 @@
 //! the world (math-up). Egui draws with Y growing downward, so we flip
 //! Y in [`RtsimApp::world_to_screen`].
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use eframe::egui;
@@ -18,7 +19,7 @@ use egui::{Color32, Pos2, Rect, Sense, Stroke};
 
 use rsnav_bsp::Bsp;
 use rsnav_common::Vertex;
-use rsnav_dynamic::{BuildOptions, NavBuild, NavWorker};
+use rsnav_dynamic::{BuildOptions, NavBuild, NavEvent, NavListener, NavWorker};
 use rsnav_navigation::{find_path, PathOptions};
 use rsnav_navmesh::NavMesh;
 use rsnav_polygon_extract::Bitfield;
@@ -30,6 +31,8 @@ const N_FOREST_BLOBS: usize = 6;
 const FOREST_RADIUS: i32 = 9;
 const AGENT_SPEED: f64 = 12.0; // world units / sec
 const WAYPOINT_EPS: f64 = 0.25;
+/// How many recent telemetry events to display in the HUD.
+const EVENT_LOG_CAP: usize = 12;
 
 fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
@@ -43,6 +46,79 @@ fn main() -> eframe::Result<()> {
         opts,
         Box::new(|_cc| Ok(Box::new(RtsimApp::new()))),
     )
+}
+
+// =========================================================================
+// Telemetry: a NavListener that pushes owned events into a ring buffer
+// so the side panel can show recent worker activity.
+// =========================================================================
+
+#[derive(Clone, Debug)]
+enum OwnedNavEvent {
+    BuildStarted {
+        generation: u64,
+    },
+    BuildCompleted {
+        generation: u64,
+        build_ms: f64,
+        triangles: usize,
+        regions: u32,
+    },
+    BuildFailed {
+        generation: u64,
+        error: String,
+    },
+}
+
+struct EventLog {
+    /// (time the listener received the event, owned event).
+    events: Mutex<VecDeque<(Instant, OwnedNavEvent)>>,
+}
+
+impl EventLog {
+    fn new() -> Self {
+        Self {
+            events: Mutex::new(VecDeque::with_capacity(EVENT_LOG_CAP)),
+        }
+    }
+    fn snapshot(&self) -> Vec<(Instant, OwnedNavEvent)> {
+        self.events
+            .lock()
+            .expect("event log")
+            .iter()
+            .cloned()
+            .collect()
+    }
+}
+
+impl NavListener for EventLog {
+    fn on_event(&self, ev: &NavEvent<'_>) {
+        let owned = match ev {
+            NavEvent::BuildStarted { generation } => OwnedNavEvent::BuildStarted {
+                generation: *generation,
+            },
+            NavEvent::BuildCompleted {
+                generation,
+                build_ms,
+                triangles,
+                regions,
+            } => OwnedNavEvent::BuildCompleted {
+                generation: *generation,
+                build_ms: *build_ms,
+                triangles: *triangles,
+                regions: *regions,
+            },
+            NavEvent::BuildFailed { generation, error } => OwnedNavEvent::BuildFailed {
+                generation: *generation,
+                error: format!("{error}"),
+            },
+        };
+        let mut guard = self.events.lock().expect("event log");
+        if guard.len() >= EVENT_LOG_CAP {
+            guard.pop_front();
+        }
+        guard.push_back((Instant::now(), owned));
+    }
 }
 
 // =========================================================================
@@ -148,6 +224,11 @@ struct RtsimApp {
     cell_h: u32,
 
     worker: NavWorker,
+    /// Shared with the worker via `spawn_with_listener`; the side panel
+    /// drains a copy each frame for the HUD.
+    event_log: Arc<EventLog>,
+    /// Wall-clock at app start. Event log times shown relative to it.
+    app_started: Instant,
     /// Set when the user has just edited the grid; cleared after we
     /// submit a snapshot to the worker.
     dirty: bool,
@@ -176,11 +257,18 @@ struct RtsimApp {
 impl RtsimApp {
     fn new() -> Self {
         let cells = vec![Cell::Walkable; (GRID_W * GRID_H) as usize];
+        let event_log = Arc::new(EventLog::new());
+        let worker = NavWorker::spawn_with_listener(
+            BuildOptions::default(),
+            event_log.clone() as Arc<dyn NavListener>,
+        );
         let mut app = Self {
             cells,
             cell_w: GRID_W,
             cell_h: GRID_H,
-            worker: NavWorker::spawn(BuildOptions::default()),
+            worker,
+            event_log,
+            app_started: Instant::now(),
             dirty: false,
             last_submit: Instant::now() - std::time::Duration::from_secs(1),
             submit_min_interval: std::time::Duration::from_millis(60),
@@ -634,7 +722,7 @@ impl RtsimApp {
 
         ui.add_space(8.0);
         ui.separator();
-        ui.heading("Worker");
+        ui.heading("Current build");
         match &self.current_build {
             Some(b) => {
                 ui.label(format!("gen   : {}", b.generation));
@@ -648,6 +736,72 @@ impl RtsimApp {
         }
         if let Some(e) = self.worker.last_error() {
             ui.colored_label(Color32::from_rgb(255, 120, 120), format!("last error: {e}"));
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.heading("Worker stats");
+        let s = self.worker.stats();
+        let in_flight = s
+            .snapshots_submitted
+            .saturating_sub(s.builds_completed + s.builds_failed + s.snapshots_coalesced);
+        let avg_ms = if s.builds_completed > 0 {
+            s.total_build_ms / s.builds_completed as f64
+        } else {
+            0.0
+        };
+        ui.label(format!("submitted    : {}", s.snapshots_submitted));
+        ui.label(format!("coalesced    : {}", s.snapshots_coalesced));
+        ui.label(format!("in flight    : {in_flight}"));
+        ui.label(format!("completed    : {}", s.builds_completed));
+        if s.builds_failed > 0 {
+            ui.colored_label(
+                Color32::from_rgb(255, 120, 120),
+                format!("failed       : {}", s.builds_failed),
+            );
+        } else {
+            ui.label(format!("failed       : {}", s.builds_failed));
+        }
+        ui.label(format!(
+            "build ms     : {:.2} avg / {:.2} max / {:.2} last",
+            avg_ms, s.max_build_ms, s.last_build_ms
+        ));
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.heading("Recent events");
+        let events = self.event_log.snapshot();
+        if events.is_empty() {
+            ui.label("(no events yet)");
+        } else {
+            for (when, ev) in events.iter().rev() {
+                let t = when.saturating_duration_since(self.app_started).as_secs_f64();
+                let (color, text) = match ev {
+                    OwnedNavEvent::BuildStarted { generation } => (
+                        Color32::from_gray(180),
+                        format!("[{t:>6.2}s] start gen {generation}"),
+                    ),
+                    OwnedNavEvent::BuildCompleted {
+                        generation,
+                        build_ms,
+                        triangles,
+                        regions,
+                    } => (
+                        Color32::from_rgb(150, 230, 160),
+                        format!(
+                            "[{t:>6.2}s] done  gen {generation}: {build_ms:.2}ms  {triangles}t  {regions}r"
+                        ),
+                    ),
+                    OwnedNavEvent::BuildFailed { generation, error } => (
+                        Color32::from_rgb(255, 130, 130),
+                        format!("[{t:>6.2}s] FAIL  gen {generation}: {error}"),
+                    ),
+                };
+                ui.colored_label(
+                    color,
+                    egui::RichText::new(text).monospace().size(11.0),
+                );
+            }
         }
 
         ui.add_space(8.0);
