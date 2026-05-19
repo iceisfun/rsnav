@@ -56,9 +56,10 @@
 //!
 //! - No formation / goal-slot logic — give every agent a unique goal
 //!   target if you don't want them stacking on a single point.
-//! - No priority bias yet; if two agents are perfectly head-on with
-//!   identical radii / speeds, supply a small positional offset (or
-//!   different goals) to break symmetry.
+//! - Two agents that are *perfectly* head-on with identical radii,
+//!   speeds, and [`priority`](Agent::priority) can fail to pick a side;
+//!   supply a small positional offset, different goals, or different
+//!   priorities to break the symmetry.
 //! - Avoidance does not consult the navmesh directly: it trusts the
 //!   path corridor for wall clearance. If avoidance briefly pushes an
 //!   agent off-corridor, the `stuck` counter triggers a replan.
@@ -109,8 +110,13 @@ pub struct Agent {
     pub radius: f64,
     /// Maximum desired speed, in world-units per second.
     pub max_speed: f64,
-    /// User-defined priority. Reserved for v1's chokepoint-yielding rule;
-    /// ignored by v0 avoidance scoring.
+    /// User-defined right-of-way. Higher-priority agents hold their line
+    /// while lower-priority neighbors yield: in the collision penalty,
+    /// the predicted-collision term is scaled by `2^((other - me)/2)`,
+    /// clamped so the gap maps into a `[0.25, 4.0]` factor. A crowd that
+    /// leaves every `priority` at the default `0.0` is unaffected. (A
+    /// hard, already-overlapping contact is never discounted — even a
+    /// top-priority agent still separates from one.)
     pub priority: f32,
     /// Current goal, if any. `None` ⇒ the agent is idle and brakes.
     pub goal: Option<Goal>,
@@ -463,7 +469,8 @@ impl Crowd {
         }
     }
 
-    /// Set the agent's priority. v0 ignores this; reserved for v1.
+    /// Set the agent's right-of-way. See [`Agent::priority`]. Cheap;
+    /// does not invalidate the path.
     pub fn set_priority(&mut self, id: AgentId, priority: f32) {
         if let Some(Some(slot)) = self.slots.get_mut(id.0 as usize) {
             slot.agent.priority = priority;
@@ -731,7 +738,11 @@ impl Crowd {
             }
             let t = (-b - disc.sqrt()) / (2.0 * a);
             if t > 0.0 && t < horizon {
-                let pen = 1.0 - t / horizon;
+                // Predicted (not yet overlapping) collision: scale by
+                // relative priority so a lower-priority agent yields
+                // harder and a higher-priority one holds its line.
+                let pen = (1.0 - t / horizon)
+                    * priority_factor(slot.agent.priority, other.agent.priority);
                 if pen > worst {
                     worst = pen;
                 }
@@ -739,6 +750,20 @@ impl Crowd {
         });
         worst
     }
+}
+
+/// Per-neighbor avoidance scaling derived from the two agents'
+/// [`Agent::priority`] values.
+///
+/// `diff = other - me`. At `diff == 0` the factor is exactly `1.0`, so
+/// a crowd that never touches `priority` is unaffected. A neighbor that
+/// outranks me (`diff > 0`) pushes the factor above 1 — I yield harder;
+/// a neighbor I outrank (`diff < 0`) pulls it below 1 — I hold my line
+/// and expect them to step aside. The gap is clamped to ±4, bounding
+/// the factor to `[0.25, 4.0]`.
+fn priority_factor(me: f32, other: f32) -> f64 {
+    let diff = (other - me).clamp(-4.0, 4.0) as f64;
+    2.0_f64.powf(diff * 0.5)
 }
 
 // =========================================================================
@@ -904,6 +929,72 @@ mod tests {
         assert!(
             crowd.path(id).is_empty(),
             "path with off-mesh goal should be invalidated",
+        );
+    }
+
+    #[test]
+    fn priority_factor_is_neutral_at_equal_priority() {
+        assert!((priority_factor(0.0, 0.0) - 1.0).abs() < 1e-12);
+        assert!((priority_factor(2.5, 2.5) - 1.0).abs() < 1e-12);
+        // A neighbor that outranks me ⇒ I yield harder ⇒ factor > 1.
+        assert!(priority_factor(0.0, 2.0) > 1.0);
+        // A neighbor I outrank ⇒ I hold ⇒ factor < 1.
+        assert!(priority_factor(2.0, 0.0) < 1.0);
+        // Clamped to [0.25, 4.0].
+        assert!(priority_factor(0.0, 100.0) <= 4.0 + 1e-9);
+        assert!(priority_factor(100.0, 0.0) >= 0.25 - 1e-9);
+    }
+
+    #[test]
+    fn higher_priority_agent_yields_less() {
+        // Head-on pass with a tiny y-offset to fix which side each takes.
+        // The high-priority agent should hold a straighter line; the
+        // low-priority one does most of the avoiding and so travels a
+        // longer total path.
+        let nav = open_arena(28, 10);
+        let mut crowd = Crowd::new(nav, CrowdConfig::default());
+
+        let mut hi = Agent::new(Vertex::new(4.0, 5.05), 0.4, 1.6);
+        hi.priority = 3.0;
+        let mut lo = Agent::new(Vertex::new(24.0, 4.95), 0.4, 1.6);
+        lo.priority = 0.0;
+        let hi = crowd.add_agent(hi);
+        let lo = crowd.add_agent(lo);
+        crowd.set_goal(
+            hi,
+            Some(Goal { target: Vertex::new(24.0, 5.0), arrive_radius: 0.6 }),
+        );
+        crowd.set_goal(
+            lo,
+            Some(Goal { target: Vertex::new(4.0, 5.0), arrive_radius: 0.6 }),
+        );
+
+        let mut prev_hi = crowd.agent(hi).unwrap().pos;
+        let mut prev_lo = crowd.agent(lo).unwrap().pos;
+        let mut dist_hi = 0.0;
+        let mut dist_lo = 0.0;
+        let mut min_dist = f64::INFINITY;
+        for _ in 0..2_000 {
+            crowd.tick(1.0 / 60.0);
+            let a = crowd.agent(hi).unwrap();
+            let b = crowd.agent(lo).unwrap();
+            dist_hi += a.pos.distance(prev_hi);
+            dist_lo += b.pos.distance(prev_lo);
+            prev_hi = a.pos;
+            prev_lo = b.pos;
+            min_dist = min_dist.min(a.pos.distance(b.pos));
+            if a.goal.is_none() && b.goal.is_none() {
+                break;
+            }
+        }
+
+        assert!(min_dist >= 0.8 - 0.05, "agents collided: min_dist={min_dist:.3}");
+        assert!(crowd.agent(hi).unwrap().goal.is_none(), "hi didn't arrive");
+        assert!(crowd.agent(lo).unwrap().goal.is_none(), "lo didn't arrive");
+        assert!(
+            dist_lo > dist_hi,
+            "low-priority agent should travel farther (it yields more): \
+             lo={dist_lo:.2} hi={dist_hi:.2}",
         );
     }
 }
