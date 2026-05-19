@@ -1,6 +1,6 @@
 # rsnav2
 
-> A Rust constrained-Delaunay triangulator (port of Jonathan Shewchuk's *Triangle*) plus the runtime pieces you actually need to ship navigation: a navmesh binary format, A* + funnel path search with wall-clearance, a BVH for fast point queries, and an authoring/probing demo.
+> A Rust constrained-Delaunay triangulator (port of Jonathan Shewchuk's *Triangle*) plus the runtime pieces you actually need to ship navigation: a navmesh binary format, A* + funnel path search with wall-clearance, a BVH for fast point queries, a background worker for dynamic obstacles, a multi-agent crowd with local avoidance, and authoring/probing demos.
 
 This is a **pure-Rust** reimplementation — no FFI, no C dependencies.
 Built around a CDT port faithful enough that the included `A.poly` round-trips
@@ -64,6 +64,22 @@ and publishes results lock-free:
   └──────────────────────┘                     └──────────────────────────────────┘
 ```
 
+For multi-agent simulation, `rsnav-crowd` sits on top of `Arc<NavBuild>`:
+each agent owns a funnel-pulled corridor through the shared navmesh and a
+sampled velocity-obstacle solver picks per-tick velocities that follow
+the corridor while side-stepping other agents.
+
+```
+   Arc<NavBuild>  ──▶  Crowd ──▶ tick(dt)
+                       │ ├── replan / arrive   (find_path per agent, radius-aware)
+                       │ ├── rebuild hash      (spatial grid of agent positions)
+                       │ ├── choose velocities (sampled-VO: align minus TTC penalty)
+                       │ └── integrate         (advance + snap to mesh)
+                       │
+                       └── set_nav(Arc<NavBuild>)   ◀── only invalidates corridors
+                                                       that the new mesh broke
+```
+
 ## Quick start
 
 ### Interactive demo
@@ -91,6 +107,14 @@ cargo run -p rsnav-rtsim --release
 
 RTS-style harness: a 128×128 cell bitfield is the ground truth; mouse tools paint walls, clear them, or harvest forest cells one at a time. A background `NavWorker` (from `rsnav-dynamic`) keeps the navmesh in sync by re-running the full pipeline on each bitfield snapshot, coalescing rapid changes so it never falls behind. ~10 agents path between random walkable points and re-plan after every navmesh swap, demonstrating that game systems can keep operating while the mesh churns. The side panel surfaces live worker stats (submitted / coalesced / in-flight / completed / build_ms) and a scrolling event log via the typed `NavListener` API.
 
+### Multi-agent crowd testbed
+
+```
+cargo run -p rsnav-crowd-demo --release
+```
+
+Small RTS world (town hall + mine + forest blob) on a 96×64 bitfield with a mix of peon roles: **mine peons** loop `mine ring slot → harvest → hall slot → deposit → repeat`, **forest peons** loop `nearest tree → harvest from its walkable neighbor → hall slot → deposit → repeat` (each harvest flips one tree cell back to walkable and the navmesh follows), and a few **wanderers** path to random walkable points to keep the avoidance solver under load. Forest blobs respawn when fully chewed. Side panel has per-role spawn buttons, mine/hall slot usage, forest cells remaining, eviction counter, and the standard `NavWorker` stats. The peon FSM and slot-reservation logic live entirely in the demo — `rsnav-crowd` itself ships only the per-agent crowd primitive.
+
 ### Programmatic use
 
 Each crate ships a runnable example (`cargo run -p <crate> --example <name>`):
@@ -105,6 +129,7 @@ Each crate ships a runnable example (`cargo run -p <crate> --example <name>`):
 | `rsnav-navigation` | `visibility_region` | Star-shaped visibility polygon from a point (sampled). |
 | `rsnav-pathing` | `follow_path` | Simulated agent walking a polyline with lookahead + anti-shortcut. |
 | `rsnav-dynamic` | `live_worker` | Spawn a `NavWorker`, place + demolish an obstacle, print telemetry events. |
+| `rsnav-crowd` | `two_agents_pass` | Two agents head-on on an open arena; print per-tick positions and verify the sampled-VO never overlapped them. |
 
 ## Crates
 
@@ -118,9 +143,11 @@ Each crate ships a runnable example (`cargo run -p <crate> --example <name>`):
 | `rsnav-navigation` | A* across triangle adjacency, Simple Stupid Funnel string-pull, triangle-walk line-of-sight, nearest-point. `distance_from_wall` rejects narrow portals and pulls portal endpoints inward at wall vertices. |
 | `rsnav-pathing` | `PathFollower`: lookahead + monotone arc-progress projection + anti-shortcut bias at corners. No navmesh dependency — operates on any polyline. |
 | `rsnav-dynamic` | `NavWorker`: background-thread navmesh updates driven by `Bitfield` snapshots, with lock-free `poll_swap` for game loops. Typed `NavListener` events (`BuildStarted` / `Completed` / `Failed`) and a polling `NavStats` accessor for HUDs and ops dashboards. Coalesces rapid submissions — only the newest snapshot is built. |
+| `rsnav-crowd` | Multi-agent crowd primitive: per-agent funnel-pulled corridor + sampled velocity-obstacle local avoidance with per-agent radius. `Crowd::set_nav` keeps still-valid paths across navmesh swaps instead of replanning the whole population. Snaps agents back to the mesh if avoidance pushes them off. No FSM, no formation logic, no slot reservation — those live in user code. |
 | `rsnav-demo` | egui authoring + probing app (the *Quick start* demo above). |
 | `rsnav-fixtures` | CLI runner for `.json` PSLG fixtures (the *Batch-run* tool above). |
 | `rsnav-rtsim` | RTS-style dynamic-obstacles testbed (the *Dynamic-obstacles* app above). |
+| `rsnav-crowd-demo` | Multi-agent peon-economy testbed (the *Multi-agent crowd* app above). |
 
 ## File format
 
@@ -130,7 +157,7 @@ Required sections: `META`, `VERTICES`, `TRIANGLES`. Optional (recomputed if abse
 
 ## Status
 
-Working and tested (124 tests pass workspace-wide):
+Working and tested (~150 tests pass workspace-wide):
 
 - ✅ CDT round-trip against `triangle.c` reference (`A.poly` → 29 triangles, byte-exact)
 - ✅ 200-point random Delaunay stress passes the empty-circumcircle test

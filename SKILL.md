@@ -50,9 +50,14 @@ crates/
   dynamic/         rsnav-dynamic         background-thread navmesh worker
                                          (Bitfield -> NavMesh) + typed
                                          telemetry events + stats counters
+  crowd/           rsnav-crowd           multi-agent crowd primitive
+                                         (per-agent corridor + sampled-VO
+                                         local avoidance + spatial hash)
   demo/            rsnav-demo            egui authoring + probing app
   fixtures/        rsnav-fixtures        CLI runner for JSON fixtures
   rtsim/           rsnav-rtsim           RTS-style dynamic-obstacles testbed
+  crowd-demo/      rsnav-crowd-demo      multi-agent peon-economy testbed
+                                         (FSM + slot reservation + forest)
 ```
 
 Every library crate ships a runnable example in `crates/<name>/examples/`.
@@ -181,6 +186,38 @@ Dynamic obstacles + telemetry, `rsnav_dynamic`:
 | `NavEvent<'a>::{BuildStarted, BuildCompleted, BuildFailed}` | Typed events emitted by the worker. `BuildFailed` borrows the `&BuildError`; listeners that want to retain events must convert to an owned form themselves. |
 | `NavListener` trait | `fn on_event(&self, event: &NavEvent<'_>)`. Send + Sync + 'static. Blanket impl for `Fn(&NavEvent<'_>)` closures — pass `Arc::new(|ev: &NavEvent<'_>\| { ... }) as Arc<dyn NavListener>`. Invoked synchronously on the worker thread; keep handlers cheap. |
 | `build_navmesh_from_bitfield(&Bitfield, &BuildOptions) -> Result<NavBuild, BuildError>` | Synchronous one-shot pipeline. Same routine the worker calls internally; useful for tests, batch jobs, or any caller that doesn't want a thread. |
+
+Multi-agent crowds, `rsnav_crowd`:
+
+| Type / fn | Notes |
+| --- | --- |
+| `Agent { pos, vel, radius, max_speed, priority, goal }` + `Agent::new(pos, radius, max_speed)` | Plain `Copy` snapshot of one agent's externally visible state. `priority` is reserved for v1's chokepoint-yielding rule and ignored by v0 avoidance. `goal == None` ⇒ agent idles and brakes. |
+| `AgentId(u32)` | Opaque handle, stable across removals (the slab reuses freed indices for new agents but does not shift other ids). |
+| `Goal { target, arrive_radius }` | Agent's goal is cleared automatically once `pos.distance(target) <= arrive_radius`. |
+| `CrowdConfig` | Defaults: `vo_samples = 16`, `neighbor_radius = 6.0`, `time_horizon = 1.5 s`, `stuck_ticks = 60`, `align_weight = 1.0`, `avoid_weight = 2.0`, `arrive_eps = 0.25`. Lower `avoid_weight` for denser crowds, raise it for more cautious agents. |
+| `Crowd::new(Arc<NavBuild>, CrowdConfig)` | Builds an empty crowd. The `Arc<NavBuild>` is what every replan uses; swap it later with `set_nav`. |
+| `Crowd::add_agent(Agent) -> AgentId` / `remove_agent(id)` / `agent(id)` / `agents()` / `agent_count()` / `path(id)` / `path_cursor(id)` / `plan_failed(id)` | Read/iteration surface. `path` returns the funnel-pulled corridor `[planned_start, c1, …, goal]`; `path_cursor` is the index of the corner the agent is currently steering toward (use `path[cursor..]` plus `agent.pos` to render the remaining leg). |
+| `Crowd::set_goal(id, Option<Goal>)` / `set_pos(id, Vertex)` / `set_radius(id, f64)` / `set_max_speed(id, f64)` / `set_priority(id, f32)` | Mutators. `set_goal`, `set_pos`, and `set_radius` invalidate the path (radius drives planning clearance via `PathOptions::distance_from_wall`). |
+| `Crowd::set_nav(Arc<NavBuild>)` | Swap to a freshly-published build. Paths whose remaining waypoints and goal still locate on the new mesh are **kept** — only those broken by the swap are cleared. Designed for the typical `NavWorker::poll_swap` flow where most mesh regenerations are additive or topologically identical. |
+| `Crowd::tick(dt: f64)` | One simulation step. Four passes: (1) replan / arrive, (2) rebuild spatial hash, (3) per-agent sampled-VO velocity choice, (4) integrate + snap-to-mesh + advance corridor cursor + update stuck counter. |
+
+The per-tick pipeline is described in detail in `crates/crowd/src/lib.rs`
+crate docs. Key behaviors worth knowing without reading them:
+
+- **Per-agent radius drives planning AND avoidance.** Planning calls
+  `find_path` with `distance_from_wall = radius`; avoidance treats each
+  agent as a disc of its own radius. Different radii in the same crowd
+  work as expected — a wider ballista plans through wider corridors and
+  gets a bigger personal-space bubble.
+- **Snap-to-mesh is automatic.** After integrating, if avoidance would
+  carry an agent off-mesh, `Bsp::nearest` snaps it back. Agents will
+  never permanently slip outside a building or into a wall — at worst
+  they pin against the boundary for a tick or two while their stuck
+  counter ticks up toward a replan.
+- **`plan_failed` does NOT latch.** After `stuck_ticks` ticks of no
+  progress the planner is retried. This is what lets a peon whose
+  approach cell was briefly off-mesh recover automatically without the
+  caller polling.
 
 ---
 
@@ -437,6 +474,49 @@ listener needs to own state (event ring buffer, atomic counters, channel
 sender). `rtsim` does this for the in-app event log — see
 `crates/rtsim/src/main.rs` (`EventLog`).
 
+### 10. Multi-agent crowd loop
+
+```rust
+use std::sync::Arc;
+use rsnav_common::Vertex;
+use rsnav_crowd::{Agent, Crowd, CrowdConfig, Goal};
+use rsnav_dynamic::{build_navmesh_from_bitfield, BuildOptions};
+use rsnav_polygon_extract::Bitfield;
+
+let bf = Bitfield::new(32, 16, vec![true; 32 * 16]).expect("dims");
+let nav = Arc::new(
+    build_navmesh_from_bitfield(&bf, &BuildOptions::default()).expect("walkable"),
+);
+let mut crowd = Crowd::new(nav, CrowdConfig::default());
+
+let a = crowd.add_agent(Agent::new(Vertex::new( 4.0, 8.0), /*r*/ 0.4, /*v_max*/ 2.0));
+let b = crowd.add_agent(Agent::new(Vertex::new(28.0, 8.0), 0.4, 2.0));
+crowd.set_goal(a, Some(Goal { target: Vertex::new(28.0, 8.0), arrive_radius: 0.5 }));
+crowd.set_goal(b, Some(Goal { target: Vertex::new( 4.0, 8.0), arrive_radius: 0.5 }));
+
+let dt = 1.0 / 60.0;
+for _ in 0..600 {
+    crowd.tick(dt);
+    // Optional: read each agent's state for rendering / metrics.
+    for (id, agent) in crowd.agents() {
+        let _ = (id, agent.pos, agent.vel, agent.goal.is_some());
+    }
+    // ...optionally hand-off to the NavWorker flow:
+    //   if worker.poll_swap() { crowd.set_nav(worker.current().unwrap()); }
+}
+```
+
+Integration with the worker is the same one-line `crowd.set_nav(...)`
+after `poll_swap` — `Crowd::set_nav` only invalidates the corridors the
+new mesh actually breaks, so you can call it on every swap without
+fearing a replan storm.
+
+`rsnav-crowd` ships only the per-agent simulation primitive. Anything
+above it (FSM, formations, goal-slot reservation, role-aware spawning,
+priority bias for chokepoints, resource gathering loops) is application
+concern — `rsnav-crowd-demo` shows one full implementation of that
+layer on top of the primitive.
+
 ---
 
 ## Gotchas and idioms
@@ -527,6 +607,32 @@ sender). `rtsim` does this for the in-app event log — see
   system reads the navmesh, to guarantee every system sees the same
   build all frame.
 
+- **Sampled-VO is not formally collision-free.** `rsnav-crowd` uses a
+  Detour-Crowd-style sampled velocity-obstacle solver, not ORCA. It
+  scores 1 brake + N angular candidate velocities (default 16) by
+  `align_weight · alignment − avoid_weight · TTC_penalty` and picks the
+  winner. In practice this produces clean lane-forming, side-stepping,
+  and head-on resolution; in adversarial cases (dense chokepoints with
+  many agents trying to go opposite directions, every drop-off slot
+  contested simultaneously) agents can brush each other or stall
+  briefly waiting for a slot to free up. Both are v0 limitations.
+
+- **`Crowd::set_nav` validates instead of nuking.** It checks whether
+  each agent's remaining corridor (`path[cursor..]`) and goal still
+  locate on the new build. Paths that survive are kept; only the
+  broken ones are cleared and rebuilt on the next tick. This means
+  for a cosmetic mesh swap (e.g. visual recolour) you can call
+  `set_nav` every frame at no cost; for a destructive swap (a wall
+  dropped on top of an active corridor) the agent replans on the
+  next tick automatically.
+
+- **Slot reservation / FSMs live in user code.** `rsnav-crowd` doesn't
+  know about resources, drop-off rings, formation goals, or who-can-take-
+  whose-slot. The demo (`crates/crowd-demo/src/main.rs`) implements one
+  full version of that layer — `ResourceMgr`, `PeonStep`, mine + hall
+  rings, forest cells, opportunistic slot stealing — that's a useful
+  reference but **not** a generic library. Bring your own.
+
 ---
 
 ## Demo and CLI
@@ -546,6 +652,17 @@ sender). `rtsim` does this for the in-app event log — see
   shows `NavStats` counters and a scrolling recent-events log via the
   typed `NavListener` API — useful for seeing the coalescing /
   in-flight / build-ms cadence interactively.
+- `cargo run -p rsnav-crowd-demo --release` — peon-economy testbed for
+  the `rsnav-crowd` flow. 96×64 cell bitfield with a town hall + mine
+  + (depleting / respawning) forest blob. Three agent roles: **mine
+  peons** (`mine ring slot → harvest → hall ring slot → deposit`),
+  **forest peons** (`nearest tree's walkable neighbor → harvest, cell
+  flips walkable → hall slot → deposit`), and **wanderers** (random
+  walkable goals). Side panel: per-role spawn buttons, mine / hall
+  slot usage, forest cells remaining, eviction counter, `NavStats` +
+  event log. The peon FSM, ring-slot reservation, and opportunistic
+  slot stealing live in the demo's `main.rs` and are not part of the
+  `rsnav-crowd` library.
 
 ---
 
@@ -561,6 +678,7 @@ sender). `rtsim` does this for the in-app event log — see
 | `rsnav-navigation` | `visibility_region` | 180-sample sweep from a room with a pillar. |
 | `rsnav-pathing` | `follow_path` | L-shape walk with anti-shortcut on/off. |
 | `rsnav-dynamic` | `live_worker` | Spawn a `NavWorker` with a printing `NavListener`, place a building, demolish it; print stats at the end. |
+| `rsnav-crowd` | `two_agents_pass` | Two agents head-on on an open arena; print positions every 30 ticks and a final summary verifying the discs never overlapped. |
 
 All run as `cargo run -p <crate> --example <name>`.
 
@@ -579,6 +697,11 @@ All run as `cargo run -p <crate> --example <name>`.
   pathing + queries.
 - `crates/bsp/src/lib.rs` — BVH index.
 - `crates/pathing/src/lib.rs` — steering follower.
+- `crates/crowd/src/lib.rs` — `Agent` / `Crowd` / `CrowdConfig`,
+  spatial hash, sampled-VO solver, replan + integrate passes.
+- `crates/crowd-demo/src/main.rs` — a worked example of the
+  application layer (FSM, ring slots, forest harvest, slot stealing)
+  on top of `rsnav-crowd`.
 
 Tests in each file cover the canonical use shape end-to-end and are
 small enough to read top-to-bottom.
