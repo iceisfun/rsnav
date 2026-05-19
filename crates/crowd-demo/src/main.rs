@@ -64,6 +64,11 @@ const RADIUS_MIN: f64 = 0.30;
 const RADIUS_MAX: f64 = 0.45;
 const SPEED_DEFAULT: f64 = 8.0;
 const ARRIVE_RADIUS: f64 = 0.5;
+/// When every slot at a building is taken, a peon waits this far out
+/// (world units, measured from the building center) instead of piling
+/// against the wall — far enough to clear the slot-ring congestion,
+/// close enough to dash in the moment a slot frees.
+const STAGING_RADIUS: f64 = 11.0;
 
 /// How long a peon harvests at a mine slot before it gets cargo.
 const MINE_HARVEST_SECS: f64 = 1.0;
@@ -224,10 +229,13 @@ enum PeonStep {
     Wander,
     /// Idle peons need to claim a resource slot and begin a cycle.
     Idle,
+    /// Every resource slot was taken — heading to / idling at a staging
+    /// point near the resource, retrying the claim from there.
+    WaitingResourceSlot { started: Instant },
     GoingToResource { slot: ResourceSlot, started: Instant },
     Harvesting { slot: ResourceSlot, until: Instant },
-    /// Resource consumed, but no hall drop-off slot was free. Stand
-    /// still and retry until one frees up.
+    /// Carrying cargo but every hall drop-off was taken — heading to /
+    /// idling at a staging point near the hall, retrying from there.
     WaitingHallSlot { started: Instant },
     GoingToHall { slot: usize, started: Instant },
     Depositing { slot: usize, until: Instant },
@@ -273,6 +281,19 @@ impl ResourceMgr {
 
     fn forest_count(&self) -> usize {
         self.forest_cells.iter().filter(|s| s.is_some()).count()
+    }
+
+    /// Mean position of all remaining forest cells — used as the
+    /// staging anchor for forest peons that can't claim a tree.
+    /// `None` once the forest is fully harvested.
+    fn forest_centroid(&self) -> Option<Vertex> {
+        let mut acc = Vertex::ZERO;
+        let mut n = 0u32;
+        for s in self.forest_cells.iter().flatten() {
+            acc = acc + Vertex::new(s.col as f64 + 0.5, s.row as f64 + 0.5);
+            n += 1;
+        }
+        (n > 0).then(|| acc * (1.0 / n as f64))
     }
 
     fn add_forest(&mut self, col: u32, row: u32) {
@@ -740,13 +761,10 @@ impl CrowdDemoApp {
             // Timeout safety: anything but Idle / Wander that's been
             // running too long releases its slot and resets.
             let timed_out = match self.peons[i].step {
-                PeonStep::GoingToResource { started, .. } => {
-                    now.saturating_duration_since(started).as_secs_f64() > STEP_TIMEOUT_SECS
-                }
-                PeonStep::WaitingHallSlot { started } => {
-                    now.saturating_duration_since(started).as_secs_f64() > STEP_TIMEOUT_SECS
-                }
-                PeonStep::GoingToHall { started, .. } => {
+                PeonStep::GoingToResource { started, .. }
+                | PeonStep::WaitingResourceSlot { started }
+                | PeonStep::WaitingHallSlot { started }
+                | PeonStep::GoingToHall { started, .. } => {
                     now.saturating_duration_since(started).as_secs_f64() > STEP_TIMEOUT_SECS
                 }
                 _ => false,
@@ -823,24 +841,31 @@ impl CrowdDemoApp {
         match self.peons[i].step.clone() {
             PeonStep::Wander => {} // unreachable for worker peons
             PeonStep::Idle => {
-                let claimed = match role {
-                    PeonRole::MinePeon => self
-                        .resources
-                        .claim_nearest_mine(pos, id)
-                        .map(|(idx, p)| (ResourceSlot::Mine(idx), p)),
-                    PeonRole::ForestPeon => self
-                        .resources
-                        .claim_nearest_forest(pos, id, nav)
-                        .map(|(idx, p)| (ResourceSlot::Forest(idx), p)),
-                    PeonRole::Wanderer => None,
-                };
-                if let Some((slot, target)) = claimed {
-                    self.crowd.set_goal(
-                        id,
-                        Some(Goal { target, arrive_radius: ARRIVE_RADIUS }),
-                    );
-                    self.peons[i].step = PeonStep::GoingToResource { slot, started: now };
+                if !self.try_claim_resource(i, pos, now, nav) {
+                    // Every resource slot is taken — go wait at a
+                    // staging point near the resource rather than
+                    // loitering at the hall exit.
+                    if let Some(center) = self.resource_staging_center(role) {
+                        let stage = self.staging_point(center, pos);
+                        self.crowd.set_goal(
+                            id,
+                            Some(Goal {
+                                target: stage,
+                                arrive_radius: ARRIVE_RADIUS * 2.0,
+                            }),
+                        );
+                        self.peons[i].step =
+                            PeonStep::WaitingResourceSlot { started: now };
+                    }
+                    // else: forest fully depleted (no centroid) — stay
+                    // Idle; the blob respawns within a frame or two.
                 }
+            }
+            PeonStep::WaitingResourceSlot { .. } => {
+                // Retry from the staging point; on success the helper
+                // redirects us into GoingToResource, otherwise we keep
+                // heading to / idling at the staging point.
+                let _ = self.try_claim_resource(i, pos, now, nav);
             }
             PeonStep::GoingToResource { slot, .. } => {
                 if !has_goal {
@@ -873,7 +898,17 @@ impl CrowdDemoApp {
                 }
             }
             PeonStep::WaitingHallSlot { .. } => {
-                self.try_claim_hall(i, pos, now);
+                // Retry the hall claim only; on success head straight
+                // in. Otherwise keep heading to / idling at the staging
+                // point set when we entered this state — don't re-stage
+                // every tick.
+                if let Some((idx, target)) = self.resources.claim_nearest_hall(pos, id) {
+                    self.crowd.set_goal(
+                        id,
+                        Some(Goal { target, arrive_radius: ARRIVE_RADIUS }),
+                    );
+                    self.peons[i].step = PeonStep::GoingToHall { slot: idx, started: now };
+                }
             }
             PeonStep::GoingToHall { slot, .. } => {
                 if !has_goal {
@@ -903,9 +938,87 @@ impl CrowdDemoApp {
             );
             self.peons[i].step = PeonStep::GoingToHall { slot: idx, started: now };
         } else {
-            // No drop-off free yet; wait in place.
-            self.crowd.set_goal(id, None);
+            // Every drop-off is taken — stage at a low-contention point
+            // near the hall and retry from there, instead of piling
+            // against the wall.
+            let stage = self.staging_point(rect_center(HALL_RECT), pos);
+            self.crowd.set_goal(
+                id,
+                Some(Goal {
+                    target: stage,
+                    arrive_radius: ARRIVE_RADIUS * 2.0,
+                }),
+            );
             self.peons[i].step = PeonStep::WaitingHallSlot { started: now };
+        }
+    }
+
+    /// Attempt to claim this peon's resource slot (mine or forest by
+    /// role). On success sets the goal + `GoingToResource` and returns
+    /// `true`; on failure leaves the peon's step untouched.
+    fn try_claim_resource(
+        &mut self,
+        i: usize,
+        pos: Vertex,
+        now: Instant,
+        nav: &NavBuild,
+    ) -> bool {
+        let id = self.peons[i].id;
+        let claimed = match self.peons[i].role {
+            PeonRole::MinePeon => self
+                .resources
+                .claim_nearest_mine(pos, id)
+                .map(|(idx, p)| (ResourceSlot::Mine(idx), p)),
+            PeonRole::ForestPeon => self
+                .resources
+                .claim_nearest_forest(pos, id, nav)
+                .map(|(idx, p)| (ResourceSlot::Forest(idx), p)),
+            PeonRole::Wanderer => None,
+        };
+        if let Some((slot, target)) = claimed {
+            self.crowd.set_goal(
+                id,
+                Some(Goal { target, arrive_radius: ARRIVE_RADIUS }),
+            );
+            self.peons[i].step = PeonStep::GoingToResource { slot, started: now };
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The anchor a peon of `role` stages near when it can't claim a
+    /// resource slot. `None` for wanderers, and for forest peons while
+    /// the forest is fully depleted.
+    fn resource_staging_center(&self, role: PeonRole) -> Option<Vertex> {
+        match role {
+            PeonRole::MinePeon => Some(rect_center(MINE_RECT)),
+            PeonRole::ForestPeon => self.resources.forest_centroid(),
+            PeonRole::Wanderer => None,
+        }
+    }
+
+    /// A waiting spot `STAGING_RADIUS` out from `center`, in the
+    /// direction of `from` — radially outward from the (roughly convex)
+    /// building, so it keeps line-of-sight to the slots and peons
+    /// arriving from different sides naturally fan out. Snapped onto
+    /// the navmesh when the raw point lands off it.
+    fn staging_point(&self, center: Vertex, from: Vertex) -> Vertex {
+        let dir = (from - center).normalize_or_zero();
+        let dir = if dir.length_sq() < 0.5 {
+            Vertex::new(1.0, 0.0)
+        } else {
+            dir
+        };
+        let candidate = center + dir * STAGING_RADIUS;
+        match &self.current_build {
+            Some(b) if b.bsp.locate(&b.navmesh, candidate).is_some() => candidate,
+            Some(b) => b
+                .bsp
+                .nearest(&b.navmesh, candidate)
+                .map(|n| n.point)
+                .unwrap_or(candidate),
+            None => candidate,
         }
     }
 
@@ -1063,19 +1176,17 @@ impl CrowdDemoApp {
 
     fn maybe_respawn_forest(&mut self) {
         if self.resources.forest_count() > 0 { return; }
-        let hall_cx = (HALL_RECT.0 as f64 + HALL_RECT.2 as f64) * 0.5 + 0.5;
-        let hall_cy = (HALL_RECT.1 as f64 + HALL_RECT.3 as f64) * 0.5 + 0.5;
-        let mine_cx = (MINE_RECT.0 as f64 + MINE_RECT.2 as f64) * 0.5 + 0.5;
-        let mine_cy = (MINE_RECT.1 as f64 + MINE_RECT.3 as f64) * 0.5 + 0.5;
+        let hall = rect_center(HALL_RECT);
+        let mine = rect_center(MINE_RECT);
         for _ in 0..64 {
             let angle = self.rng.unit_f64() * std::f64::consts::TAU;
             let dist = MIN_FOREST_DIST + (MAX_FOREST_DIST - MIN_FOREST_DIST) * self.rng.unit_f64();
-            let cx = (hall_cx + angle.cos() * dist).round() as i32;
-            let cy = (hall_cy + angle.sin() * dist).round() as i32;
+            let cx = (hall.x + angle.cos() * dist).round() as i32;
+            let cy = (hall.y + angle.sin() * dist).round() as i32;
             if cx < 0 || cy < 0 { continue; }
             if cx as u32 >= GRID_W || cy as u32 >= GRID_H { continue; }
-            let dx = cx as f64 - mine_cx;
-            let dy = cy as f64 - mine_cy;
+            let dx = cx as f64 - mine.x;
+            let dy = cy as f64 - mine.y;
             if (dx * dx + dy * dy).sqrt() < MINE_KEEPOUT { continue; }
             let placed = self.paint_forest_blob_at(cx, cy, FOREST_BLOB_RADIUS);
             if placed > 0 {
@@ -1506,6 +1617,15 @@ impl CrowdDemoApp {
 // =========================================================================
 // World painting (free fns)
 // =========================================================================
+
+/// World-space center of an inclusive cell rect.
+fn rect_center(rect: (u32, u32, u32, u32)) -> Vertex {
+    let (c0, r0, c1, r1) = rect;
+    Vertex::new(
+        (c0 as f64 + c1 as f64) * 0.5 + 0.5,
+        (r0 as f64 + r1 as f64) * 0.5 + 0.5,
+    )
+}
 
 fn paint_buildings(cells: &mut [Cell]) {
     paint_rect(cells, HALL_RECT, Cell::Hall);
