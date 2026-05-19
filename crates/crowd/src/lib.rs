@@ -75,7 +75,7 @@ use std::sync::Arc;
 
 use rsnav_common::Vertex;
 use rsnav_dynamic::NavBuild;
-use rsnav_navigation::{find_path, PathOptions};
+use rsnav_navigation::{find_path, path_clear, PathOptions};
 
 // =========================================================================
 // Public types
@@ -325,42 +325,36 @@ impl Crowd {
     }
 
     /// Swap to a freshly-published navmesh (e.g. after a `NavWorker`
-    /// `poll_swap`). Paths whose remaining corridor and goal are still
-    /// on the new mesh are kept; only the ones that have actually been
-    /// invalidated are cleared and will replan on the next
-    /// [`Crowd::tick`].
+    /// `poll_swap`). Each agent's *remaining route* — from where it is
+    /// now, through every corridor corner it has yet to reach — is
+    /// revalidated against the new mesh with segment line-of-sight
+    /// ([`rsnav_navigation::path_clear`]). Routes that are still clear
+    /// are kept; only the ones an obstacle has actually broken are
+    /// cleared, to be replanned on the next [`Crowd::tick`].
     ///
-    /// This avoids a global replan storm when a mesh regeneration is
-    /// cosmetic (e.g. terrain visualisation changed but the walkable
-    /// region is the same) or strictly additive (a wall was removed —
-    /// existing corridors are still valid; agents simply won't take
-    /// advantage of the new shortcut until their next natural replan).
+    /// Segment validation (not a corner-only on-mesh test) matters: a
+    /// building or forest can spawn *between* two still-on-mesh corners
+    /// and block the straight leg between them — a corner check would
+    /// miss it and the agent would walk through the new obstacle.
+    ///
+    /// Keeping still-valid routes avoids a global replan storm when a
+    /// mesh regeneration is cosmetic or strictly additive (a wall was
+    /// removed — existing corridors stay valid; agents just won't take
+    /// the new shortcut until their next natural replan).
     pub fn set_nav(&mut self, nav: Arc<NavBuild>) {
         self.nav = nav.clone();
         for slot in self.slots.iter_mut().flatten() {
             if slot.path.is_empty() {
                 continue;
             }
-            // Goal off-mesh? Drop the path; the FSM-side reassignment
-            // (or a fresh replan) will pick a reachable goal.
-            let goal_valid = match slot.agent.goal {
-                None => false,
-                Some(g) => nav.bsp.locate(&nav.navmesh, g.target).is_some(),
-            };
-            if !goal_valid {
-                slot.invalidate_path();
-                continue;
-            }
-            // Remaining corridor waypoints must still locate inside the
-            // new mesh. Already-traversed prefix is irrelevant.
-            let mut path_valid = true;
-            for p in slot.path.iter().skip(slot.cursor) {
-                if nav.bsp.locate(&nav.navmesh, *p).is_none() {
-                    path_valid = false;
-                    break;
-                }
-            }
-            if !path_valid {
+            // Revalidate [agent.pos, remaining corners..]. The corners
+            // already traversed are irrelevant; the agent's current
+            // position is the true start of what's left to walk.
+            let start = slot.cursor.min(slot.path.len());
+            let mut route = Vec::with_capacity(slot.path.len() - start + 1);
+            route.push(slot.agent.pos);
+            route.extend_from_slice(&slot.path[start..]);
+            if !path_clear(&nav.navmesh, &nav.bsp, &route) {
                 slot.invalidate_path();
             }
         }
@@ -873,6 +867,22 @@ mod tests {
         )
     }
 
+    /// Open arena with one unwalkable rectangle (inclusive cell rect).
+    fn arena_with_block(w: u32, h: u32, block: (u32, u32, u32, u32)) -> Arc<NavBuild> {
+        let (c0, r0, c1, r1) = block;
+        let mut data = vec![true; (w as usize) * (h as usize)];
+        for row in r0..=r1 {
+            for col in c0..=c1 {
+                data[(row * w + col) as usize] = false;
+            }
+        }
+        let bf = Bitfield::new(w, h, data).expect("dims match data");
+        Arc::new(
+            build_navmesh_from_bitfield(&bf, &BuildOptions::default())
+                .expect("arena with a block builds"),
+        )
+    }
+
     #[test]
     fn single_agent_walks_to_goal_on_open_arena() {
         let nav = open_arena(20, 20);
@@ -1039,6 +1049,34 @@ mod tests {
         assert!(
             crowd.path(id).is_empty(),
             "path with off-mesh goal should be invalidated",
+        );
+    }
+
+    #[test]
+    fn set_nav_invalidates_path_blocked_mid_segment() {
+        // The hard case: a new obstacle lands *between* two corridor
+        // corners that both still locate on-mesh. A corner-only check
+        // would keep the path and walk the agent through the obstacle;
+        // segment line-of-sight must catch it.
+        let nav = open_arena(20, 8);
+        let mut crowd = Crowd::new(nav, CrowdConfig::default());
+        let id = crowd.add_agent(Agent::new(Vertex::new(2.0, 4.0), 0.3, 2.0));
+        crowd.set_goal(
+            id,
+            Some(Goal {
+                target: Vertex::new(18.0, 4.0),
+                arrive_radius: 0.5,
+            }),
+        );
+        crowd.tick(1.0 / 60.0);
+        assert!(!crowd.path(id).is_empty(), "path should be planned");
+
+        // Block cols 9..=11, rows 2..=5 — straddles the straight leg
+        // from (2, 4) to (18, 4); both endpoints stay walkable.
+        crowd.set_nav(arena_with_block(20, 8, (9, 2, 11, 5)));
+        assert!(
+            crowd.path(id).is_empty(),
+            "path crossing the freshly-spawned block should be invalidated",
         );
     }
 

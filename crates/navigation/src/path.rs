@@ -6,6 +6,7 @@ use rsnav_navmesh::NavMesh;
 
 use crate::astar::{astar, AstarError};
 use crate::funnel::funnel;
+use crate::los::{line_of_sight, LineOfSightResult};
 use crate::wall::WallInfo;
 
 /// Options that tune `find_path`.
@@ -73,6 +74,39 @@ pub fn find_path(
     let points = funnel(nav, &walls, &triangles, start, goal, opts.distance_from_wall);
 
     Ok(PathResult { points, triangles })
+}
+
+// --- Path revalidation ---------------------------------------------------
+
+/// Check that every segment of the polyline `points` can be walked on
+/// the current mesh — no segment crosses a constrained edge or leaves
+/// the mesh.
+///
+/// This is the cheap way to revalidate a previously-planned path after
+/// the navmesh changes (a building went up, a forest spawned). A
+/// corner-only on-mesh test is *not* enough: a new obstacle can land
+/// between two corners that both still locate fine, leaving the
+/// straight leg between them blocked. `path_clear` walks each segment
+/// with [`line_of_sight`], so it catches that case.
+///
+/// Pass only the part of the route the agent has yet to traverse —
+/// typically `[agent_pos, remaining_corners..]`. A `false` result
+/// means: replan. Returns `true` for an empty or single-point slice
+/// (nothing to walk).
+pub fn path_clear(nav: &NavMesh, bsp: &Bsp, points: &[Vertex]) -> bool {
+    for seg in points.windows(2) {
+        let (a, b) = (seg[0], seg[1]);
+        let Some(start_tri) = bsp.locate(nav, a) else {
+            return false; // segment starts off the mesh
+        };
+        if !matches!(
+            line_of_sight(nav, start_tri, a, b),
+            LineOfSightResult::Clear,
+        ) {
+            return false;
+        }
+    }
+    true
 }
 
 // --- Nearest-point convenience -------------------------------------------
@@ -368,5 +402,47 @@ mod tests {
         let np = nearest_point(&nav, &bsp, Vertex::new(-1.0, 0.5)).unwrap();
         assert!((np.point.x - 0.0).abs() < 1e-9);
         assert!((np.distance - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn path_clear_accepts_open_routes_and_rejects_blocked() {
+        let (nav, bsp) = build_square_with_hole_navmesh();
+
+        // Straight leg through the open bottom band — clear.
+        assert!(path_clear(
+            &nav,
+            &bsp,
+            &[Vertex::new(0.5, 0.5), Vertex::new(3.5, 0.5)],
+        ));
+
+        // Multi-segment route that detours around the hole — clear.
+        assert!(path_clear(
+            &nav,
+            &bsp,
+            &[
+                Vertex::new(0.5, 2.0),
+                Vertex::new(0.5, 0.5),
+                Vertex::new(3.5, 0.5),
+                Vertex::new(3.5, 2.0),
+            ],
+        ));
+
+        // Straight leg across the central hole — blocked.
+        assert!(!path_clear(
+            &nav,
+            &bsp,
+            &[Vertex::new(0.5, 2.0), Vertex::new(3.5, 2.0)],
+        ));
+
+        // A leg whose far end leaves the mesh — blocked.
+        assert!(!path_clear(
+            &nav,
+            &bsp,
+            &[Vertex::new(0.5, 0.5), Vertex::new(-1.0, 0.5)],
+        ));
+
+        // Nothing to walk — trivially clear.
+        assert!(path_clear(&nav, &bsp, &[]));
+        assert!(path_clear(&nav, &bsp, &[Vertex::new(0.5, 0.5)]));
     }
 }

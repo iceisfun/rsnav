@@ -152,6 +152,7 @@ Pathing + queries, `rsnav_navigation`:
 | `PathResult { points: Vec<Vertex>, triangles: Vec<TriangleId> }` | Polyline includes `start` and `goal`; `triangles` is the A* corridor. |
 | `PathError::{StartOutsideMesh, GoalOutsideMesh, Unreachable}` | `Unreachable` covers both "different region" and "every connecting portal too narrow". |
 | `line_of_sight(&nav, start_tri, from, to) -> LineOfSightResult` | Walks the segment triangle-by-triangle. `start_tri` must contain `from`. Returns `Clear`, `Blocked { point }`, or `SourceOutsideMesh`. |
+| `path_clear(&nav, &bsp, &[Vertex]) -> bool` | Segment-by-segment line-of-sight check over a polyline — `true` if every leg can be walked on the current mesh. The cheap way to revalidate a planned path after the navmesh changed: pass `[agent_pos, remaining_corners..]`; `false` ⇒ replan. Catches a new obstacle that landed *between* two still-on-mesh corners, which a corner-only test misses. |
 | `nearest_point(&nav, &bsp, p) -> Option<NearestPoint>` | Convenience wrapper over `Bsp::nearest`. |
 | `visibility_region(&nav, &bsp, source, max_radius, samples) -> Option<VisibilityRegion>` | Ray-cast `samples` directions (clamped ≥ 8; 180 is a good default). Boundary is in CCW angular order; draw as a fan from `source`. |
 
@@ -202,7 +203,7 @@ Multi-agent crowds, `rsnav_crowd`:
 | `Crowd::new(Arc<NavBuild>, CrowdConfig)` | Builds an empty crowd. The `Arc<NavBuild>` is what every replan uses; swap it later with `set_nav`. |
 | `Crowd::add_agent(Agent) -> AgentId` / `remove_agent(id)` / `agent(id)` / `agents()` / `agent_count()` / `path(id)` / `path_cursor(id)` / `plan_failed(id)` | Read/iteration surface. `path` returns the funnel-pulled corridor `[planned_start, c1, …, goal]`; `path_cursor` is the index of the corner the agent is currently steering toward (use `path[cursor..]` plus `agent.pos` to render the remaining leg). |
 | `Crowd::set_goal(id, Option<Goal>)` / `set_pos(id, Vertex)` / `set_radius(id, f64)` / `set_max_speed(id, f64)` / `set_priority(id, f32)` | Mutators. `set_goal`, `set_pos`, and `set_radius` invalidate the path (radius drives planning clearance via `PathOptions::distance_from_wall`). |
-| `Crowd::set_nav(Arc<NavBuild>)` | Swap to a freshly-published build. Paths whose remaining waypoints and goal still locate on the new mesh are **kept** — only those broken by the swap are cleared. Designed for the typical `NavWorker::poll_swap` flow where most mesh regenerations are additive or topologically identical. |
+| `Crowd::set_nav(Arc<NavBuild>)` | Swap to a freshly-published build. Each agent's remaining route (`[agent.pos, remaining corners..]`) is revalidated with segment line-of-sight (`path_clear`); routes still clear are **kept**, only genuinely-broken ones are cleared. Catches an obstacle that spawned *between* two corners. Designed for the typical `NavWorker::poll_swap` flow. |
 | `Crowd::tick(dt: f64)` | One simulation step. Four passes: (1) replan / arrive, (2) rebuild spatial hash, (3) per-agent sampled-VO velocity choice, (4) integrate + snap-to-mesh + advance corridor cursor + update stuck counter. |
 
 The per-tick pipeline is described in detail in `crates/crowd/src/lib.rs`
@@ -625,14 +626,16 @@ layer on top of the primitive.
   neutral default. A hard, already-overlapping contact is never
   discounted regardless of priority.
 
-- **`Crowd::set_nav` validates instead of nuking.** It checks whether
-  each agent's remaining corridor (`path[cursor..]`) and goal still
-  locate on the new build. Paths that survive are kept; only the
-  broken ones are cleared and rebuilt on the next tick. This means
-  for a cosmetic mesh swap (e.g. visual recolour) you can call
-  `set_nav` every frame at no cost; for a destructive swap (a wall
-  dropped on top of an active corridor) the agent replans on the
-  next tick automatically.
+- **`Crowd::set_nav` validates instead of nuking.** It revalidates
+  each agent's remaining route — `[agent.pos, remaining corners..]` —
+  with segment line-of-sight (`path_clear`), not a corner-only on-mesh
+  test. Routes still clear are kept; only genuinely-broken ones are
+  cleared and rebuilt on the next tick. The segment check is what
+  catches a building or forest that spawned *between* two corners that
+  both still locate fine — a corner-only test would keep that path and
+  walk the agent straight through the new obstacle. So a cosmetic mesh
+  swap costs nothing, and a destructive one replans only the affected
+  agents on the next tick.
 
 - **Slot reservation / FSMs live in user code.** `rsnav-crowd` doesn't
   know about resources, drop-off rings, formation goals, or who-can-take-
