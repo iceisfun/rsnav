@@ -533,7 +533,7 @@ mod tests {
     #[test]
     fn read_inline_poly() {
         let dir = std::env::temp_dir();
-        let path = dir.join("rsnav2-poly-test.poly");
+        let path = dir.join("rsnav-poly-test.poly");
         std::fs::write(&path, poly_string()).unwrap();
         let p = read_poly(&path).unwrap();
         assert_eq!(p.vertices.len(), 4);
@@ -563,7 +563,7 @@ mod tests {
 0
 ";
         let dir = std::env::temp_dir();
-        let path = dir.join("rsnav2-zb-poly-test.poly");
+        let path = dir.join("rsnav-zb-poly-test.poly");
         std::fs::write(&path, txt).unwrap();
         let p = read_poly(&path).unwrap();
         assert_eq!(p.vertices.len(), 4);
@@ -599,7 +599,7 @@ mod tests {
         let s = format_node(&pslg, WriteOptions::default());
         // Re-read it.
         let dir = std::env::temp_dir();
-        let path = dir.join("rsnav2-node-rt.node");
+        let path = dir.join("rsnav-node-rt.node");
         std::fs::write(&path, &s).unwrap();
         let back = read_node(&path).unwrap();
         assert_eq!(back.vertices, pslg.vertices);
@@ -626,7 +626,7 @@ mod tests {
         };
         let s = format_poly(&pslg, WriteOptions::default());
         let dir = std::env::temp_dir();
-        let path = dir.join("rsnav2-poly-rt.poly");
+        let path = dir.join("rsnav-poly-rt.poly");
         std::fs::write(&path, &s).unwrap();
         let back = read_poly(&path).unwrap();
         assert_eq!(back, pslg);

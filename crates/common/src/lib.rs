@@ -1,4 +1,4 @@
-//! Shared 2D geometry primitives for the rsnav2 workspace.
+//! Shared 2D geometry primitives for the rsnav workspace.
 //!
 //! All coordinates are `f64`. Indices into vertex/triangle/polygon arrays are `u32`,
 //! exposed as the [`VertexId`], [`TriangleId`], and [`PolygonId`] newtypes.

@@ -1,4 +1,4 @@
-# rsnav2 — Skill Reference
+# rsnav — Skill Reference
 
 Pure-Rust 2D navigation stack: constrained Delaunay triangulator (Shewchuk
 *Triangle* port) plus a navmesh runtime — A* + funnel pathing, BVH point
@@ -14,7 +14,7 @@ the pitfalls you can't infer from signatures.
 
 ## When to reach for this stack
 
-Use rsnav2 when you need any of:
+Use rsnav when you need any of:
 
 - A constrained Delaunay triangulation of a planar straight-line graph
   (PSLG) — outer ring(s), holes, internal walls.

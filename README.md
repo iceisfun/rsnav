@@ -1,4 +1,4 @@
-# rsnav2
+# rsnav
 
 > A Rust constrained-Delaunay triangulator (port of Jonathan Shewchuk's *Triangle*) plus the runtime pieces you actually need to ship navigation: a navmesh binary format, A* + funnel path search with wall-clearance, a BVH for fast point queries, a background worker for dynamic obstacles, a multi-agent crowd with local avoidance, and authoring/probing demos.
 

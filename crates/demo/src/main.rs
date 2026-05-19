@@ -51,7 +51,7 @@ fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 750.0])
-            .with_title("rsnav2 — navmesh demo"),
+            .with_title("rsnav — navmesh demo"),
         ..Default::default()
     };
     eframe::run_native(
@@ -524,7 +524,7 @@ impl eframe::App for DemoApp {
 
 impl DemoApp {
     fn tool_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("rsnav2 demo");
+        ui.heading("rsnav demo");
         ui.separator();
 
         if !self.in_exploration() {

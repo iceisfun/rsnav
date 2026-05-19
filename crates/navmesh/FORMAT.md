@@ -1,4 +1,4 @@
-# rsnav2 navmesh binary format
+# rsnav navmesh binary format
 
 **Version:** 1
 **Endianness:** little-endian, always
