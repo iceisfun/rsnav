@@ -54,6 +54,8 @@ const FOREST_BLOB_RADIUS: i32 = 6;
 const MIN_FOREST_DIST: f64 = 16.0;
 const MAX_FOREST_DIST: f64 = 36.0;
 const MINE_KEEPOUT: f64 = 10.0; // min distance between a new blob center and the mine
+/// Chance that a forest respawn drops a *second* blob as well.
+const SECOND_FOREST_CHANCE: f64 = 0.15;
 
 /// Per-role initial spawn counts.
 const N_WANDERERS_INITIAL: usize = 3;
@@ -82,8 +84,12 @@ const STAGING_DIST_WEIGHT: f64 = 0.06;
 
 /// How long a peon harvests at a mine slot before it gets cargo.
 const MINE_HARVEST_SECS: f64 = 1.0;
-/// How long a peon harvests at a forest cell before the cell falls.
+/// Harvest-seconds that must accumulate before a forest cell falls.
 const FOREST_HARVEST_SECS: f64 = 0.6;
+/// Up to this many peons can chop the same tree at once. Harvest
+/// progress accumulates from every active chopper, so a full crew of
+/// three fells a tree three times faster than a lone peon.
+const MAX_FOREST_HARVESTERS: usize = 3;
 /// How long a peon takes to drop cargo at the hall.
 const DEPOSIT_SECS: f64 = 0.3;
 /// Safety: if a peon spends more than this in a single FSM step, release
@@ -268,7 +274,13 @@ struct RingSlot {
 struct ForestSlot {
     col: u32,
     row: u32,
-    owner: Option<AgentId>,
+    /// Peons that have claimed this tree (capped at
+    /// `MAX_FOREST_HARVESTERS`). Includes peons still walking to it;
+    /// `progress` only advances from the ones in the `Harvesting` step.
+    harvesters: Vec<AgentId>,
+    /// Accumulated harvest time in seconds; the tree falls at
+    /// `FOREST_HARVEST_SECS`. Advances by `active-choppers * dt`.
+    progress: f64,
 }
 
 #[derive(Debug)]
@@ -307,7 +319,12 @@ impl ResourceMgr {
     }
 
     fn add_forest(&mut self, col: u32, row: u32) {
-        self.forest_cells.push(Some(ForestSlot { col, row, owner: None }));
+        self.forest_cells.push(Some(ForestSlot {
+            col,
+            row,
+            harvesters: Vec::new(),
+            progress: 0.0,
+        }));
     }
 
     fn claim_nearest_mine(&mut self, from: Vertex, agent: AgentId) -> Option<(usize, Vertex)> {
@@ -326,9 +343,10 @@ impl ResourceMgr {
         if let Some(s) = self.hall_slots.get_mut(idx) { s.owner = None; }
     }
 
-    /// Find the closest unowned forest cell that currently has a
-    /// walkable cardinal neighbor on the navmesh; the returned position
-    /// is that *approach cell*, not the tree itself.
+    /// Find the closest forest cell that still has chopper capacity
+    /// (`harvesters.len() < MAX_FOREST_HARVESTERS`) and a walkable
+    /// cardinal neighbor on the navmesh; the returned position is that
+    /// *approach cell*, not the tree itself.
     ///
     /// Interior forest cells (surrounded by other forest cells) are
     /// skipped — they become claimable only after a perimeter neighbor
@@ -342,7 +360,12 @@ impl ResourceMgr {
         let mut best: Option<(usize, Vertex, f64)> = None;
         for (i, slot_opt) in self.forest_cells.iter().enumerate() {
             let Some(s) = slot_opt else { continue; };
-            if s.owner.is_some() { continue; }
+            if s.harvesters.len() >= MAX_FOREST_HARVESTERS {
+                continue;
+            }
+            if s.harvesters.contains(&agent) {
+                continue;
+            }
             let Some(approach) = closest_walkable_neighbor(s.col, s.row, nav, from)
             else { continue; };
             let d2 = (approach - from).length_sq();
@@ -352,15 +375,15 @@ impl ResourceMgr {
         }
         let (i, approach, _) = best?;
         if let Some(s) = self.forest_cells[i].as_mut() {
-            s.owner = Some(agent);
+            s.harvesters.push(agent);
             return Some((i, approach));
         }
         None
     }
 
-    fn release_forest(&mut self, idx: usize) {
+    fn release_forest(&mut self, idx: usize, agent: AgentId) {
         if let Some(Some(s)) = self.forest_cells.get_mut(idx) {
-            s.owner = None;
+            s.harvesters.retain(|&a| a != agent);
         }
     }
 
@@ -382,7 +405,7 @@ impl ResourceMgr {
         }
         for slot_opt in self.forest_cells.iter_mut() {
             if let Some(s) = slot_opt {
-                if s.owner == Some(agent) { s.owner = None; }
+                s.harvesters.retain(|&a| a != agent);
             }
         }
     }
@@ -531,55 +554,6 @@ fn find_better_ring_slot(
     }
     let (i, _, evicted) = best?;
     Some((i, ring[i].pos, evicted))
-}
-
-/// Same algorithm as [`find_better_ring_slot`] but for the sparse
-/// forest list (with `None` holes for already-harvested cells).
-///
-/// Distances compare *approach cells* (the walkable neighbor a peon
-/// would actually stand on) rather than the tree centers. A candidate
-/// tree with no walkable neighbor is skipped entirely; my own current
-/// claim's approach is recomputed fresh against the live navmesh so
-/// rebalancing tracks blob-shape changes between frames.
-fn find_better_forest_slot(
-    cells: &[Option<ForestSlot>],
-    me_pos: Vertex,
-    cur_idx: usize,
-    me_id: AgentId,
-    pos_of: &std::collections::HashMap<AgentId, Vertex>,
-    in_transit_of: &std::collections::HashMap<AgentId, bool>,
-    nav: &NavBuild,
-) -> Option<(usize, Vertex, Option<AgentId>)> {
-    let cur_cell = cells.get(cur_idx).and_then(|x| x.as_ref())?;
-    let cur_approach = closest_walkable_neighbor(cur_cell.col, cur_cell.row, nav, me_pos)?;
-    let cur_d = (cur_approach - me_pos).length();
-    let mut best: Option<(usize, Vertex, f64, Option<AgentId>)> = None;
-    for (i, slot_opt) in cells.iter().enumerate() {
-        if i == cur_idx { continue; }
-        let Some(s) = slot_opt else { continue; };
-        let Some(approach) = closest_walkable_neighbor(s.col, s.row, nav, me_pos)
-        else { continue; };
-        let d = (approach - me_pos).length();
-        if d + REBALANCE_HYST >= cur_d { continue; }
-        let evict = match s.owner {
-            None => None,
-            Some(o) if o == me_id => continue,
-            Some(o) => {
-                if !*in_transit_of.get(&o).unwrap_or(&false) { continue; }
-                let Some(owner_pos) = pos_of.get(&o).copied() else { continue; };
-                let Some(owner_approach) =
-                    closest_walkable_neighbor(s.col, s.row, nav, owner_pos)
-                else { continue; };
-                let owner_d = (owner_approach - owner_pos).length();
-                if d + REBALANCE_HYST < owner_d { Some(o) } else { continue }
-            }
-        };
-        if best.map_or(true, |(_, _, bd, _)| d < bd) {
-            best = Some((i, approach, d, evict));
-        }
-    }
-    let (i, approach, _, evicted) = best?;
-    Some((i, approach, evicted))
 }
 
 // =========================================================================
@@ -752,12 +726,39 @@ impl CrowdDemoApp {
 
     // -- Peon FSM ---------------------------------------------------------
 
-    fn tick_peons(&mut self, now: Instant) {
+    fn tick_peons(&mut self, now: Instant, dt: f64) {
         let Some(build) = self.current_build.clone() else { return; };
         let nav = &build.navmesh;
         let bsp = &build.bsp;
 
+        // Shared forest harvest: every peon actively in the Harvesting
+        // step on a tree adds `dt` to that tree's progress, so three
+        // choppers fell it three times faster. Cells that reach the
+        // threshold are consumed here; their harvesters notice next.
+        let mut chop: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+        for peon in &self.peons {
+            if let PeonStep::Harvesting { slot: ResourceSlot::Forest(idx), .. } = peon.step {
+                *chop.entry(idx).or_default() += 1;
+            }
+        }
+        for (idx, count) in chop {
+            if let Some(Some(cell)) = self.resources.forest_cells.get_mut(idx) {
+                cell.progress += count as f64 * dt;
+            }
+        }
         let mut harvested_forest: Vec<(u32, u32)> = Vec::new();
+        for idx in 0..self.resources.forest_cells.len() {
+            let done = matches!(
+                self.resources.forest_cells.get(idx),
+                Some(Some(c)) if c.progress >= FOREST_HARVEST_SECS,
+            );
+            if done {
+                if let Some((col, row)) = self.resources.consume_forest(idx) {
+                    harvested_forest.push((col, row));
+                }
+            }
+        }
+
         let n = self.peons.len();
         for i in 0..n {
             // Snapshot the agent's state before mutating crowd / resources.
@@ -802,15 +803,7 @@ impl CrowdDemoApp {
                     }
                 }
                 PeonRole::MinePeon | PeonRole::ForestPeon => {
-                    self.advance_worker_peon(
-                        i,
-                        pos,
-                        has_goal,
-                        plan_failed,
-                        now,
-                        &mut harvested_forest,
-                        &build,
-                    );
+                    self.advance_worker_peon(i, pos, has_goal, plan_failed, now, &build);
                 }
             }
         }
@@ -833,7 +826,6 @@ impl CrowdDemoApp {
         has_goal: bool,
         plan_failed: bool,
         now: Instant,
-        harvested_forest: &mut Vec<(u32, u32)>,
         nav: &NavBuild,
     ) {
         let role = self.peons[i].role;
@@ -879,34 +871,43 @@ impl CrowdDemoApp {
             }
             PeonStep::GoingToResource { slot, .. } => {
                 if !has_goal {
-                    let dur = match slot {
-                        ResourceSlot::Mine(_) => MINE_HARVEST_SECS,
-                        ResourceSlot::Forest(_) => FOREST_HARVEST_SECS,
+                    // Mine harvest is a fixed per-peon timer; forest
+                    // harvest is shared (cell progress), so `until` is
+                    // unused there — parked at `now`.
+                    let until = match slot {
+                        ResourceSlot::Mine(_) => {
+                            now + Duration::from_secs_f64(MINE_HARVEST_SECS)
+                        }
+                        ResourceSlot::Forest(_) => now,
                     };
-                    self.peons[i].step = PeonStep::Harvesting {
-                        slot,
-                        until: now + Duration::from_secs_f64(dur),
-                    };
+                    self.peons[i].step = PeonStep::Harvesting { slot, until };
                     // Stand still while harvesting (crowd already has
                     // no goal; explicit None makes intent obvious).
                     self.crowd.set_goal(id, None);
                 }
             }
-            PeonStep::Harvesting { slot, until } => {
-                if now >= until {
-                    match slot {
-                        ResourceSlot::Mine(idx) => {
-                            self.resources.release_mine(idx);
-                        }
-                        ResourceSlot::Forest(idx) => {
-                            if let Some((col, row)) = self.resources.consume_forest(idx) {
-                                harvested_forest.push((col, row));
-                            }
-                        }
+            PeonStep::Harvesting { slot, until } => match slot {
+                ResourceSlot::Mine(idx) => {
+                    if now >= until {
+                        self.resources.release_mine(idx);
+                        self.try_claim_hall(i, pos, now);
                     }
-                    self.try_claim_hall(i, pos, now);
                 }
-            }
+                ResourceSlot::Forest(idx) => {
+                    // Shared harvest: tick_peons advances the cell's
+                    // progress and consumes it when full. We're done
+                    // the moment our tree is gone.
+                    let cell_gone = self
+                        .resources
+                        .forest_cells
+                        .get(idx)
+                        .map_or(true, |c| c.is_none());
+                    if cell_gone {
+                        self.resources.release_forest(idx, id);
+                        self.try_claim_hall(i, pos, now);
+                    }
+                }
+            },
             PeonStep::WaitingHallSlot { .. } => {
                 // Retry the hall claim only; on success head straight
                 // in. Otherwise keep heading to / idling at the staging
@@ -1069,15 +1070,14 @@ impl CrowdDemoApp {
 
     /// Release whatever slot (if any) the peon currently owns.
     fn release_current_slot(&mut self, i: usize) {
+        let id = self.peons[i].id;
         match self.peons[i].step.clone() {
-            PeonStep::GoingToResource { slot, .. } => match slot {
-                ResourceSlot::Mine(idx) => self.resources.release_mine(idx),
-                ResourceSlot::Forest(idx) => self.resources.release_forest(idx),
-            },
-            PeonStep::Harvesting { slot, .. } => match slot {
-                ResourceSlot::Mine(idx) => self.resources.release_mine(idx),
-                ResourceSlot::Forest(idx) => self.resources.release_forest(idx),
-            },
+            PeonStep::GoingToResource { slot, .. } | PeonStep::Harvesting { slot, .. } => {
+                match slot {
+                    ResourceSlot::Mine(idx) => self.resources.release_mine(idx),
+                    ResourceSlot::Forest(idx) => self.resources.release_forest(idx, id),
+                }
+            }
             PeonStep::GoingToHall { slot, .. } => self.resources.release_hall(slot),
             PeonStep::Depositing { slot, .. } => self.resources.release_hall(slot),
             _ => {}
@@ -1093,7 +1093,6 @@ impl CrowdDemoApp {
     /// and reset the evicted peon so its FSM re-claims fresh next tick.
     fn rebalance_slots(&mut self, now: Instant) {
         use std::collections::HashMap;
-        let Some(build) = self.current_build.clone() else { return; };
         let pos_of: HashMap<AgentId, Vertex> = self
             .peons
             .iter()
@@ -1118,58 +1117,34 @@ impl CrowdDemoApp {
             let Some(me_pos) = pos_of.get(&me_id).copied() else { continue; };
 
             match self.peons[i].step.clone() {
-                PeonStep::GoingToResource { slot, started } => {
-                    let swap = match slot {
-                        ResourceSlot::Mine(cur_idx) => find_better_ring_slot(
-                            &self.resources.mine_slots,
-                            me_pos,
-                            cur_idx,
-                            me_id,
-                            &pos_of,
-                            &in_transit_of,
-                        )
-                        .map(|(idx, pos, ev)| (ResourceSlot::Mine(idx), pos, ev)),
-                        ResourceSlot::Forest(cur_idx) => find_better_forest_slot(
-                            &self.resources.forest_cells,
-                            me_pos,
-                            cur_idx,
-                            me_id,
-                            &pos_of,
-                            &in_transit_of,
-                            &build,
-                        )
-                        .map(|(idx, pos, ev)| (ResourceSlot::Forest(idx), pos, ev)),
-                    };
-                    if let Some((new_slot, new_pos, evicted)) = swap {
-                        // Release my old claim.
-                        match slot {
-                            ResourceSlot::Mine(idx) => self.resources.release_mine(idx),
-                            ResourceSlot::Forest(idx) => self.resources.release_forest(idx),
-                        }
-                        // Evict and reset the previous owner.
+                PeonStep::GoingToResource { slot: ResourceSlot::Mine(cur_idx), started } => {
+                    if let Some((new_idx, new_pos, evicted)) = find_better_ring_slot(
+                        &self.resources.mine_slots,
+                        me_pos,
+                        cur_idx,
+                        me_id,
+                        &pos_of,
+                        &in_transit_of,
+                    ) {
+                        self.resources.release_mine(cur_idx);
                         if let Some(eid) = evicted {
                             self.evict_to_idle(eid);
                             self.eviction_count = self.eviction_count.saturating_add(1);
                         }
-                        // Claim new (we already know it's free or just freed).
-                        match new_slot {
-                            ResourceSlot::Mine(idx) => {
-                                self.resources.mine_slots[idx].owner = Some(me_id);
-                            }
-                            ResourceSlot::Forest(idx) => {
-                                if let Some(Some(s)) = self.resources.forest_cells.get_mut(idx) {
-                                    s.owner = Some(me_id);
-                                }
-                            }
-                        }
+                        self.resources.mine_slots[new_idx].owner = Some(me_id);
                         self.crowd.set_goal(
                             me_id,
                             Some(Goal { target: new_pos, arrive_radius: ARRIVE_RADIUS }),
                         );
-                        self.peons[i].step =
-                            PeonStep::GoingToResource { slot: new_slot, started };
+                        self.peons[i].step = PeonStep::GoingToResource {
+                            slot: ResourceSlot::Mine(new_idx),
+                            started,
+                        };
                     }
                 }
+                // Forest cells are plentiful and shared (up to
+                // MAX_FOREST_HARVESTERS choppers each) — no rebalancing.
+                PeonStep::GoingToResource { slot: ResourceSlot::Forest(_), .. } => {}
                 PeonStep::GoingToHall { slot: cur_idx, started } => {
                     let swap = find_better_ring_slot(
                         &self.resources.hall_slots,
@@ -1220,25 +1195,46 @@ impl CrowdDemoApp {
     // -- Forest respawn ---------------------------------------------------
 
     fn maybe_respawn_forest(&mut self) {
-        if self.resources.forest_count() > 0 { return; }
+        if self.resources.forest_count() > 0 {
+            return;
+        }
+        if self.spawn_one_forest_blob() {
+            self.dirty = true;
+            // Occasionally drop a second blob in the same respawn.
+            if self.rng.unit_f64() < SECOND_FOREST_CHANCE {
+                self.spawn_one_forest_blob();
+            }
+        }
+    }
+
+    /// Sample a blob center within `MIN_FOREST_DIST..MAX_FOREST_DIST`
+    /// of the town hall (and clear of the mine) and paint it. Returns
+    /// `true` once a blob with at least one new cell lands.
+    fn spawn_one_forest_blob(&mut self) -> bool {
         let hall = rect_center(HALL_RECT);
         let mine = rect_center(MINE_RECT);
         for _ in 0..64 {
             let angle = self.rng.unit_f64() * std::f64::consts::TAU;
-            let dist = MIN_FOREST_DIST + (MAX_FOREST_DIST - MIN_FOREST_DIST) * self.rng.unit_f64();
+            let dist =
+                MIN_FOREST_DIST + (MAX_FOREST_DIST - MIN_FOREST_DIST) * self.rng.unit_f64();
             let cx = (hall.x + angle.cos() * dist).round() as i32;
             let cy = (hall.y + angle.sin() * dist).round() as i32;
-            if cx < 0 || cy < 0 { continue; }
-            if cx as u32 >= GRID_W || cy as u32 >= GRID_H { continue; }
+            if cx < 0 || cy < 0 {
+                continue;
+            }
+            if cx as u32 >= GRID_W || cy as u32 >= GRID_H {
+                continue;
+            }
             let dx = cx as f64 - mine.x;
             let dy = cy as f64 - mine.y;
-            if (dx * dx + dy * dy).sqrt() < MINE_KEEPOUT { continue; }
-            let placed = self.paint_forest_blob_at(cx, cy, FOREST_BLOB_RADIUS);
-            if placed > 0 {
-                self.dirty = true;
-                return;
+            if (dx * dx + dy * dy).sqrt() < MINE_KEEPOUT {
+                continue;
+            }
+            if self.paint_forest_blob_at(cx, cy, FOREST_BLOB_RADIUS) > 0 {
+                return true;
             }
         }
+        false
     }
 
     fn paint_forest_blob_at(&mut self, cx: i32, cy: i32, radius: i32) -> usize {
@@ -1382,12 +1378,17 @@ impl CrowdDemoApp {
                     } else {
                         Color32::from_rgba_unmultiplied(200, 220, 200, 50)
                     };
+                    // Stroke the triangle so the full triangulation —
+                    // including interior subdivision edges — is visible
+                    // and you can watch it re-mesh as the world changes.
                     painter.add(egui::Shape::convex_polygon(
                         vec![pa, pb, pc],
                         fill,
-                        Stroke::NONE,
+                        Stroke::new(0.5, Color32::from_rgba_unmultiplied(40, 50, 55, 130)),
                     ));
                 }
+                // Constraint / boundary edges over the wireframe, in a
+                // darker, thicker tone so walls read clearly.
                 for tri in &nav.triangles {
                     for edge in 0..3 {
                         if tri.edge_markers[edge] == 0 { continue; }
@@ -1728,7 +1729,7 @@ impl eframe::App for CrowdDemoApp {
         if dt > 0.1 { dt = 0.1; }
 
         self.rebalance_slots(now);
-        self.tick_peons(now);
+        self.tick_peons(now, dt);
         self.maybe_respawn_forest();
         self.maybe_submit();
         self.crowd.tick(dt);
