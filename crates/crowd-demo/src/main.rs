@@ -69,6 +69,16 @@ const ARRIVE_RADIUS: f64 = 0.5;
 /// against the wall — far enough to clear the slot-ring congestion,
 /// close enough to dash in the moment a slot frees.
 const STAGING_RADIUS: f64 = 11.0;
+/// How many candidate loiter points to evaluate around the staging
+/// ring; the least-congested one wins.
+const STAGING_CANDIDATES: usize = 12;
+/// Agents within this radius of a candidate count toward its
+/// contention score.
+const STAGING_OCCUPANCY_RADIUS: f64 = 4.5;
+/// Per-world-unit penalty added to a candidate's contention score, so
+/// a peon won't trek across the map for a marginally quieter spot.
+/// At `0.06`, an extra ~17 units of walk costs as much as one agent.
+const STAGING_DIST_WEIGHT: f64 = 0.06;
 
 /// How long a peon harvests at a mine slot before it gets cargo.
 const MINE_HARVEST_SECS: f64 = 1.0;
@@ -998,28 +1008,63 @@ impl CrowdDemoApp {
         }
     }
 
-    /// A waiting spot `STAGING_RADIUS` out from `center`, in the
-    /// direction of `from` — radially outward from the (roughly convex)
-    /// building, so it keeps line-of-sight to the slots and peons
-    /// arriving from different sides naturally fan out. Snapped onto
-    /// the navmesh when the raw point lands off it.
+    /// A waiting spot on a `STAGING_RADIUS` ring around `center`.
+    ///
+    /// Rather than aiming straight down the approach line (which is
+    /// exactly the busy inbound/outbound lane), this evaluates
+    /// `STAGING_CANDIDATES` points spread all the way around the
+    /// building and picks the one with the lowest contention score:
+    /// `agents-nearby + STAGING_DIST_WEIGHT * walk-distance`. So peons
+    /// fan out to the *quiet* sides of the building and the choice
+    /// self-balances as the crowd shifts. Each candidate is snapped
+    /// onto the navmesh.
     fn staging_point(&self, center: Vertex, from: Vertex) -> Vertex {
-        let dir = (from - center).normalize_or_zero();
-        let dir = if dir.length_sq() < 0.5 {
-            Vertex::new(1.0, 0.0)
-        } else {
-            dir
+        let Some(build) = &self.current_build else {
+            // No navmesh yet — fall back to a simple radial point.
+            let dir = (from - center).normalize_or_zero();
+            let dir = if dir.length_sq() < 0.5 {
+                Vertex::new(1.0, 0.0)
+            } else {
+                dir
+            };
+            return center + dir * STAGING_RADIUS;
         };
-        let candidate = center + dir * STAGING_RADIUS;
-        match &self.current_build {
-            Some(b) if b.bsp.locate(&b.navmesh, candidate).is_some() => candidate,
-            Some(b) => b
-                .bsp
-                .nearest(&b.navmesh, candidate)
-                .map(|n| n.point)
-                .unwrap_or(candidate),
-            None => candidate,
+
+        let mut best: Option<(Vertex, f64)> = None;
+        for k in 0..STAGING_CANDIDATES {
+            let theta = std::f64::consts::TAU * (k as f64) / (STAGING_CANDIDATES as f64);
+            let (sin, cos) = theta.sin_cos();
+            let raw = center + Vertex::new(cos * STAGING_RADIUS, sin * STAGING_RADIUS);
+            // Snap onto the navmesh.
+            let pt = if build.bsp.locate(&build.navmesh, raw).is_some() {
+                raw
+            } else {
+                match build.bsp.nearest(&build.navmesh, raw) {
+                    Some(n) => n.point,
+                    None => continue,
+                }
+            };
+            let occ = self.occupancy_near(pt, STAGING_OCCUPANCY_RADIUS);
+            let score = occ as f64 + STAGING_DIST_WEIGHT * pt.distance(from);
+            if best.map_or(true, |(_, bs)| score < bs) {
+                best = Some((pt, score));
+            }
         }
+        best.map(|(p, _)| p).unwrap_or(from)
+    }
+
+    /// Count the agents whose position lies within `radius` of `p` —
+    /// the contention proxy for staging-point selection.
+    fn occupancy_near(&self, p: Vertex, radius: f64) -> usize {
+        let r2 = radius * radius;
+        self.peons
+            .iter()
+            .filter(|peon| {
+                self.crowd
+                    .agent(peon.id)
+                    .is_some_and(|a| (a.pos - p).length_sq() <= r2)
+            })
+            .count()
     }
 
     /// Release whatever slot (if any) the peon currently owns.
