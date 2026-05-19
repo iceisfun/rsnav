@@ -44,6 +44,20 @@ impl NavTriangle {
     }
 }
 
+/// One edge on the boundary of the walkable region — an edge with no
+/// triangle on the far side. Yielded by [`NavMesh::boundary_edges`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BoundaryEdge {
+    /// The triangle that owns this edge.
+    pub triangle: TriangleId,
+    /// Edge endpoints in CCW order around `triangle`, so the walkable
+    /// interior is on the left of the directed segment `from -> to`.
+    pub from: VertexId,
+    pub to: VertexId,
+    /// PSLG constraint marker carried by the edge — `0` if unmarked.
+    pub marker: i32,
+}
+
 /// A loaded or freshly-built navmesh.
 ///
 /// `vertices` and `triangles` are flat parallel arrays indexed by
@@ -208,6 +222,36 @@ impl NavMesh {
         rng: impl FnMut() -> f64,
     ) -> Option<Vertex> {
         self.random_point_filtered(Some(region), rng)
+    }
+
+    // --- Boundary edges ---------------------------------------------------
+
+    /// Iterate every edge on the boundary of the walkable region — the
+    /// outer rim plus every hole rim. Each boundary edge has exactly one
+    /// triangle, so it is yielded exactly once.
+    ///
+    /// Useful for rendering the playable-area outline, exporting the
+    /// mesh back to a PSLG, or debug overlays.
+    ///
+    /// Interior walls that keep a walkable triangle on *both* sides
+    /// (possible only in hand-authored meshes with region-splitting
+    /// segments) are *not* boundary edges; query those per-triangle via
+    /// [`NavTriangle::is_edge_constrained`].
+    pub fn boundary_edges(&self) -> impl Iterator<Item = BoundaryEdge> + '_ {
+        self.triangles.iter().enumerate().flat_map(|(ti, t)| {
+            (0..3).filter_map(move |e| {
+                if !t.is_edge_boundary(e) {
+                    return None;
+                }
+                let (from, to) = t.edge_vertices(e);
+                Some(BoundaryEdge {
+                    triangle: TriangleId::new(ti as u32),
+                    from,
+                    to,
+                    marker: t.edge_markers[e],
+                })
+            })
+        })
     }
 
     fn random_point_filtered(
@@ -442,5 +486,42 @@ mod tests {
         let nav = divided_rectangle();
         let mut rng = TestRng(1);
         assert!(nav.random_point_in_region(99, || rng.unit()).is_none());
+    }
+
+    // --- boundary edges --------------------------------------------------
+
+    #[test]
+    fn boundary_edges_trace_the_outer_rim() {
+        let nav = divided_rectangle();
+        let edges: Vec<_> = nav.boundary_edges().collect();
+
+        // The 10x4 rectangle's perimeter — the interior wall at x = 5
+        // keeps a triangle on both sides, so it is NOT a boundary edge.
+        let perimeter: f64 = edges
+            .iter()
+            .map(|e| nav.vertex(e.from).distance(nav.vertex(e.to)))
+            .sum();
+        assert!(
+            (perimeter - 28.0).abs() < 1e-9,
+            "boundary perimeter {perimeter}, expected 28.0",
+        );
+        assert!(edges.len() >= 4);
+
+        for e in &edges {
+            // Outer-ring segments were all marker 1.
+            assert_eq!(e.marker, 1);
+            // No boundary edge should sit on the x = 5 wall line.
+            let a = nav.vertex(e.from);
+            let b = nav.vertex(e.to);
+            assert!(
+                !(a.x == 5.0 && b.x == 5.0),
+                "interior wall edge leaked into boundary_edges",
+            );
+            // Walkable interior is on the left of from -> to: the owning
+            // triangle's centroid must be left of the directed edge.
+            let c = nav.triangle(e.triangle).centroid;
+            let cross = (b - a).cross(c - a);
+            assert!(cross > 0.0, "edge {a:?}->{b:?} has interior on the right");
+        }
     }
 }

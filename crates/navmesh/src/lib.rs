@@ -12,4 +12,4 @@ pub mod navmesh;
 
 pub use binary::{LoadError, SaveError, FORMAT_VERSION, MAGIC};
 pub use build::build_from_cdt;
-pub use navmesh::{NavMesh, NavTriangle};
+pub use navmesh::{BoundaryEdge, NavMesh, NavTriangle};
