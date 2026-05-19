@@ -80,6 +80,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "as-raw-xcb-connection"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1653,6 +1662,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsnav-dynamic"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "rsnav-bsp",
+ "rsnav-common",
+ "rsnav-navmesh",
+ "rsnav-polygon-extract",
+ "rsnav-triangle",
+]
+
+[[package]]
 name = "rsnav-fixtures"
 version = "0.1.0"
 dependencies = [
@@ -1694,6 +1715,20 @@ name = "rsnav-polygon-extract"
 version = "0.1.0"
 dependencies = [
  "rsnav-common",
+]
+
+[[package]]
+name = "rsnav-rtsim"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "egui",
+ "rsnav-bsp",
+ "rsnav-common",
+ "rsnav-dynamic",
+ "rsnav-navigation",
+ "rsnav-navmesh",
+ "rsnav-polygon-extract",
 ]
 
 [[package]]

@@ -1,0 +1,16 @@
+[package]
+name = "rsnav-dynamic"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dynamic navmesh updates: a worker thread that turns Bitfield snapshots into NavMesh + Bsp, with lock-free swap-in for game loops."
+
+[dependencies]
+rsnav-common.workspace = true
+rsnav-triangle.workspace = true
+rsnav-polygon-extract.workspace = true
+rsnav-navmesh.workspace = true
+rsnav-bsp.workspace = true
+arc-swap.workspace = true

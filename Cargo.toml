@@ -8,8 +8,10 @@ members = [
     "crates/bsp",
     "crates/navigation",
     "crates/pathing",
+    "crates/dynamic",
     "crates/demo",
     "crates/fixtures",
+    "crates/rtsim",
 ]
 
 [workspace.package]
@@ -26,6 +28,8 @@ rsnav-navmesh = { path = "crates/navmesh" }
 rsnav-bsp = { path = "crates/bsp" }
 rsnav-navigation = { path = "crates/navigation" }
 rsnav-pathing = { path = "crates/pathing" }
+rsnav-dynamic = { path = "crates/dynamic" }
+arc-swap = "1"
 
 [profile.release]
 lto = "thin"
