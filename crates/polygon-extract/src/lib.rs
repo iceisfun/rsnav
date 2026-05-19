@@ -27,14 +27,47 @@ pub struct Bitfield {
     pub data: Vec<bool>,
 }
 
+/// Errors returned by [`Bitfield::new`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum BitfieldError {
+    /// `data.len()` doesn't equal `width * height`.
+    BadDataLength {
+        width: u32,
+        height: u32,
+        data_len: usize,
+    },
+}
+
+impl std::fmt::Display for BitfieldError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadDataLength { width, height, data_len } => write!(
+                f,
+                "Bitfield::new: data length {} does not equal width * height = {} * {} = {}",
+                data_len,
+                width,
+                height,
+                (*width as usize) * (*height as usize),
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BitfieldError {}
+
 impl Bitfield {
-    pub fn new(width: u32, height: u32, data: Vec<bool>) -> Self {
-        assert_eq!(
-            data.len(),
-            (width as usize) * (height as usize),
-            "Bitfield::new: data length must equal width * height"
-        );
-        Self { width, height, data }
+    /// Wrap `data` as a `width × height` row-major bitfield. Returns
+    /// [`BitfieldError::BadDataLength`] when `data.len() != width * height`.
+    pub fn new(width: u32, height: u32, data: Vec<bool>) -> Result<Self, BitfieldError> {
+        let expected = (width as usize) * (height as usize);
+        if data.len() != expected {
+            return Err(BitfieldError::BadDataLength {
+                width,
+                height,
+                data_len: data.len(),
+            });
+        }
+        Ok(Self { width, height, data })
     }
 
     /// All-false grid of the given size.
@@ -248,34 +281,49 @@ fn trace_loops(bits: &Bitfield) -> Vec<Polygon> {
         }
         let mut loop_verts: Vec<Vertex> = Vec::new();
         let mut cur = seed;
-        loop {
+        // Both `break_with_loop` blocks below are structural-invariant
+        // failures of the 4-connectivity trace. They should be unreachable
+        // for well-formed input; `debug_assert!` lets the test suite catch
+        // them, while release builds drop the partial loop and continue
+        // instead of crashing user code. If you see one of these debug
+        // panics it's a bug in `collect_border_edges` or the bitfield.
+        let abandon = loop {
             visited[cur] = true;
             let e = edges[cur];
             loop_verts.push(Vertex::new(e.start.0 as f64, e.start.1 as f64));
             // Find the next edge: among edges starting at e.end, pick the
             // one owned by the same cell.
-            let candidates = by_start
-                .get(&e.end)
-                .expect("border-edge chain ended at unmatched corner");
+            let Some(candidates) = by_start.get(&e.end) else {
+                debug_assert!(false, "border-edge chain ended at unmatched corner");
+                break true;
+            };
             // One candidate → take it (continuation between adjacent cells,
             // even if the cell ID differs). Multiple candidates → diagonal-
             // touch case; prefer same-cell so each cell's boundary stays
             // its own polygon under 4-connectivity.
-            let next = if candidates.len() == 1 {
-                candidates[0]
+            let next_opt = if candidates.len() == 1 {
+                Some(candidates[0])
             } else {
                 candidates
                     .iter()
                     .copied()
                     .find(|&j| edges[j].cell == e.cell)
-                    .expect("ambiguous corner without same-cell continuation")
+            };
+            let next = match next_opt {
+                Some(n) => n,
+                None => {
+                    debug_assert!(false, "ambiguous corner without same-cell continuation");
+                    break true;
+                }
             };
             if next == seed {
-                break;
+                break false;
             }
             cur = next;
+        };
+        if !abandon {
+            loops.push(Polygon::from_vertices(loop_verts));
         }
-        loops.push(Polygon::from_vertices(loop_verts));
     }
     loops
 }
@@ -354,7 +402,7 @@ mod tests {
                 data[math_row * (width as usize) + col] = walkable;
             }
         }
-        Bitfield::new(width, height, data)
+        Bitfield::new(width, height, data).expect("test grid: dimensions match")
     }
 
     #[test]

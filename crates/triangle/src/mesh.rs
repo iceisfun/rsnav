@@ -404,21 +404,36 @@ impl CdtMesh {
         self.free_tris.push(tri);
     }
 
+    /// Read a triangle slot by raw index. **Panics** if `tri` is out of
+    /// range — most commonly because the index was issued by a
+    /// different mesh. Triangle indices are not portable across
+    /// `CdtMesh` instances.
     #[inline]
     pub fn triangle(&self, tri: u32) -> &TriangleSlot {
         &self.triangles[tri as usize]
     }
 
+    /// Mutable variant of [`triangle`](Self::triangle). Same cross-mesh
+    /// caveat.
     #[inline]
     pub fn triangle_mut(&mut self, tri: u32) -> &mut TriangleSlot {
         &mut self.triangles[tri as usize]
     }
 
     /// Live triangle count, excluding the dummy and any recycled slots.
+    ///
+    /// Uses saturating subtraction: by construction `triangles.len() >= 1`
+    /// (the dummy occupies slot 0) and `free_tris.len() <= triangles.len() - 1`,
+    /// so the natural difference is always non-negative — but a single
+    /// off-by-one bug elsewhere would otherwise produce an unsigned-
+    /// underflow panic that's hard to root-cause. Saturating turns it
+    /// into a quietly wrong `0` instead.
     #[inline]
     pub fn live_triangle_count(&self) -> usize {
-        // Subtract the dummy and the recycled (currently-dead) slots.
-        self.triangles.len() - 1 - self.free_tris.len()
+        self.triangles
+            .len()
+            .saturating_sub(1)
+            .saturating_sub(self.free_tris.len())
     }
 
     // -- subseg pool ----------------------------------------------------
@@ -455,7 +470,11 @@ impl CdtMesh {
 
     #[inline]
     pub fn live_subseg_count(&self) -> usize {
-        self.subsegs.len() - 1 - self.free_subs.len()
+        // Same saturating-subtract rationale as `live_triangle_count`.
+        self.subsegs
+            .len()
+            .saturating_sub(1)
+            .saturating_sub(self.free_subs.len())
     }
 
     // --- Triangle handle accessors (org/dest/apex/sym/bond) -----------

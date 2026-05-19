@@ -26,10 +26,12 @@ Use rsnav2 when you need any of:
 - A small steering helper that turns a polyline into a lookahead target
   for an agent and resists corner shortcutting.
 
-Not in scope for v1 (will panic with a clear message if you try):
+Not in scope for v1:
 
-- Steiner-point quality refinement (Triangle's `-q`).
-- Self-intersecting PSLG segments (Triangle's `segmentintersection`).
+- Steiner-point quality refinement (Triangle's `-q`). No facility for it.
+- Self-intersecting PSLG segments (Triangle's `segmentintersection`). The
+  segment-insertion functions return `Err(SegmentInsertError::SelfIntersection)`
+  instead — see [Pitfalls](#pitfalls).
 - Conforming-Delaunay midpoint splitting (Triangle's `conformingedge`).
 
 ---
@@ -84,7 +86,7 @@ Run `cargo run -p <crate> --example <name>`.
 You always go in this order. `form_skeleton` requires the Delaunay
 triangulation to already be there; `carve_holes` requires the segments
 to already be inserted; `build_from_cdt` requires both. Skipping any
-step panics or yields a mesh with garbage region IDs.
+step yields a mesh with garbage region IDs or an empty walkable area.
 
 ---
 
@@ -107,7 +109,7 @@ PSLG (the CDT input), `rsnav_triangle::pslg`:
 
 | Type | Notes |
 | --- | --- |
-| `Pslg { vertices, segments, holes }` | Mutable; build it manually. `deduplicate()` is recommended before `form_skeleton` if the input may contain bit-exact duplicate positions. |
+| `Pslg { vertices, segments, holes }` | Mutable; build it manually. `form_skeleton` auto-handles bit-exact duplicate positions, so a separate `deduplicate()` pass is no longer required. `deduplicate()` still exists if you want a canonicalised PSLG for some other reason (caching, hashing). |
 | `PslgVertex { position, attributes, marker }` | `marker == 0` = unmarked. |
 | `PslgSegment { a, b, marker }` | `a`/`b` are u32 indices into `Pslg::vertices`. |
 | `PslgHole { point }` | Seed point inside the hole — the carve flood-fills from here. |
@@ -144,7 +146,7 @@ Polyline follower, `rsnav_pathing` (zero dependency on the navmesh):
 
 | Type / fn | Notes |
 | --- | --- |
-| `PathFollower::new(points: Vec<Vertex>)` | Panics on empty. Owns the path; arc-length tracked internally. |
+| `PathFollower::new(points: Vec<Vertex>) -> Result<Self, PathFollowerError>` | Returns `Err(EmptyPath)` on empty input. Owns the path; arc-length tracked internally. |
 | `FollowerOptions { lookahead, corner_avoidance, corner_angle_threshold }` | `corner_avoidance = 0.0` disables anti-shortcut bias. Threshold in radians (~0.1 = 5.7°). |
 | `target(agent_pos, &opts) -> Vertex` | Projects agent forward (monotone — never backtracks), returns lookahead steering target with optional corner bias. |
 | `progress()`, `arc_length()`, `at_end()`, `total_length()` | State accessors. |
@@ -153,7 +155,7 @@ Bitfield → polygons, `rsnav_polygon_extract`:
 
 | Type / fn | Notes |
 | --- | --- |
-| `Bitfield { width, height, data: Vec<bool> }` | Row-major, `true` = walkable. Cell (col, row) covers `[col, col+1] × [row, row+1]` with y-up (row 0 at bottom). |
+| `Bitfield { width, height, data: Vec<bool> }` | Row-major, `true` = walkable. Cell (col, row) covers `[col, col+1] × [row, row+1]` with y-up (row 0 at bottom). Construct via `Bitfield::new(w, h, data) -> Result<Self, BitfieldError>` (returns `BadDataLength` if `data.len() != w * h`) or the infallible `Bitfield::empty(w, h)`. |
 | `ExtractOptions { min_area, remove_collinear, diagonal_smoothing }` | Defaults: keep all, strip collinear vertices, no smoothing. |
 | `extract(&bits, &opts) -> Vec<PolygonWithHoles>` | Outer rings CCW, holes CW. 4-connectivity (diagonal-only touch = disconnected). |
 
@@ -194,10 +196,15 @@ for &(a, b) in &[(4u32, 5), (5, 6), (6, 7), (7, 4)] {
 pslg.holes.push(PslgHole { point: Vertex::new(5.0, 5.0) });
 
 delaunay(&mut cdt, DivConqOptions::default());
-form_skeleton(&mut cdt, &pslg, /* mark_hull_with */ None);
+form_skeleton(&mut cdt, &pslg, /* mark_hull_with */ None)
+    .expect("PSLG is non-self-intersecting");
 carve_holes(&mut cdt, &pslg, /* convex outer? */ false);
 let nav = build_from_cdt(&cdt);
 ```
+
+`form_skeleton` returns `Result<(), SegmentInsertError>`. On
+`Err(SelfIntersection { endpoint1, endpoint2 })` the CDT is left in a
+valid state — discard the bad segment from the PSLG and retry, or bail.
 
 ### 2. Build a navmesh from a bitfield (occupancy grid)
 
@@ -205,7 +212,8 @@ let nav = build_from_cdt(&cdt);
 use rsnav_polygon_extract::{extract, Bitfield, ExtractOptions};
 use rsnav_common::Polygon;
 
-let regions = extract(&Bitfield::new(w, h, data), &ExtractOptions::default());
+let bits = Bitfield::new(w, h, data).expect("data length == w * h");
+let regions = extract(&bits, &ExtractOptions::default());
 
 // Then for each region, push outer + holes into a Pslg, choose hole seed
 // points via Polygon::interior_point() (NOT centroid — concave holes will
@@ -294,7 +302,8 @@ for tight corners or zoomed-in screenshots.
 ```rust
 use rsnav_pathing::{FollowerOptions, PathFollower};
 
-let mut follower = PathFollower::new(path.points);  // from find_path
+let mut follower = PathFollower::new(path.points)   // from find_path
+    .expect("path is non-empty");
 let opts = FollowerOptions {
     lookahead: 1.5,
     corner_avoidance: 0.4,
@@ -321,11 +330,25 @@ agents only with care — it owns one agent's arc-length state.
   to flood-fill the wrong region — silently. `interior_point` runs an
   ear-find and returns a guaranteed-inside point.
 
-- **`Pslg::deduplicate` before `form_skeleton` if inputs may overlap.**
-  The D&C Delaunay drops bit-exact duplicate vertex positions. Any
-  segment still referencing the dropped ID will panic during insertion
-  ("no vertex in any live triangle"). `deduplicate` collapses duplicates
-  and remaps segment endpoints.
+- **Duplicate-position vertices are handled automatically.** The D&C
+  Delaunay drops bit-exact duplicate positions, so a segment referencing
+  a dropped ID would otherwise crash insertion. `form_skeleton` now
+  builds a position → first-occurrence-ID remap from the mesh's vertex
+  pool and rewrites segment endpoints through it before inserting. No
+  separate `Pslg::deduplicate` call is required. (The standalone
+  `deduplicate` method still exists if you want a canonicalised PSLG
+  for some other reason.)
+
+- **Segment insertion can fail.** `form_skeleton` returns
+  `Result<(), SegmentInsertError>`. The two variants:
+  - `SelfIntersection { endpoint1, endpoint2 }` — the segment would
+    cross an existing constrained subsegment. v1 doesn't support self-
+    intersecting PSLG input; the CDT is left in a valid state with the
+    bad segment NOT inserted.
+  - `VertexNotInTriangulation { vertex }` — a segment endpoint isn't a
+    corner of any live triangle. With the auto-remap above this only
+    fires for genuinely missing vertices — a segment endpoint not in
+    the CDT input at all.
 
 - **The pipeline order is non-negotiable.** `delaunay → form_skeleton →
   carve_holes → build_from_cdt`. Skipping `carve_holes` leaves
@@ -374,10 +397,12 @@ agents only with care — it owns one agent's arc-length state.
 
 - `cargo run -p rsnav-demo --release` — egui authoring app. Right-click
   sets source, left-click sets goal, "Create navmesh" rebuilds. Left
-  panel has a fixture browser that scans `~/work/gonav/testdata`.
-- `cargo run -p rsnav-fixtures --release` — batch runner over a directory
-  of JSON fixtures (status table, exits non-zero on failure; drop-in
-  for CI). Pass a file + `-v` for per-hole diagnostics.
+  panel has a fixture browser; the directory field is pre-filled with
+  `./testdata` and is editable.
+- `cargo run -p rsnav-fixtures --release -- --testdata <PATH>` — batch
+  runner over a `.json` file or a directory of them (status table, exits
+  non-zero on failure; drop-in for CI). `--testdata` defaults to
+  `./testdata` if omitted. Add `-v` for per-hole diagnostics.
 
 ---
 

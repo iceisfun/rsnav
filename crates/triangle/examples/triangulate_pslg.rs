@@ -56,7 +56,7 @@ fn main() {
     // Build: Delaunay on the points → insert segments → carve holes.
     delaunay(&mut cdt, DivConqOptions::default());
     println!("after delaunay:       {} triangles", cdt.live_triangle_count());
-    form_skeleton(&mut cdt, &pslg, None);
+    form_skeleton(&mut cdt, &pslg, None).unwrap();
     println!("after form_skeleton:  {} triangles", cdt.live_triangle_count());
     carve_holes(&mut cdt, &pslg, false);
     println!("after carve_holes:    {} triangles", cdt.live_triangle_count());

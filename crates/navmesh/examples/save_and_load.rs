@@ -45,7 +45,7 @@ fn main() {
         cdt.push_vertex(VertexSlot::new(v.position, 0));
     }
     delaunay(&mut cdt, DivConqOptions::default());
-    form_skeleton(&mut cdt, &pslg, None);
+    form_skeleton(&mut cdt, &pslg, None).unwrap();
     carve_holes(&mut cdt, &pslg, false);
     let nav = build_from_cdt(&cdt);
 

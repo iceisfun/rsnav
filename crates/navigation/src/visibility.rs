@@ -91,7 +91,7 @@ mod tests {
             pslg.segments.push(PslgSegment { a, b, marker: 1 });
         }
         delaunay(&mut cdt, DivConqOptions::default());
-        form_skeleton(&mut cdt, &pslg, None);
+        form_skeleton(&mut cdt, &pslg, None).unwrap();
         let nav = build_from_cdt(&cdt);
         let bsp = Bsp::build(&nav);
         (nav, bsp)
@@ -122,7 +122,7 @@ mod tests {
         }
         pslg.holes.push(PslgHole { point: Vertex::new(5.0, 5.0) });
         delaunay(&mut cdt, DivConqOptions::default());
-        form_skeleton(&mut cdt, &pslg, None);
+        form_skeleton(&mut cdt, &pslg, None).unwrap();
         carve_holes(&mut cdt, &pslg, false);
         let nav = build_from_cdt(&cdt);
         let bsp = Bsp::build(&nav);

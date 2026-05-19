@@ -34,7 +34,7 @@ fn main() {
                 corner_angle_threshold: 0.1,
             }
         };
-        let mut follower = PathFollower::new(path.clone());
+        let mut follower = PathFollower::new(path.clone()).unwrap();
         let mut agent = Vertex::new(0.0, 0.0);
         println!("─── {} (corner_avoidance = {:.1}) ───", label, opts.corner_avoidance);
         println!("    step  agent_pos           steering target      arc%");

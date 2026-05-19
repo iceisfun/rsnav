@@ -54,22 +54,42 @@ pub struct PathFollower {
     arc: f64,
 }
 
+/// Errors returned by [`PathFollower::new`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PathFollowerError {
+    /// The supplied polyline had no points.
+    EmptyPath,
+}
+
+impl std::fmt::Display for PathFollowerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyPath => write!(f, "PathFollower needs at least one point"),
+        }
+    }
+}
+
+impl std::error::Error for PathFollowerError {}
+
 impl PathFollower {
-    /// Wrap a polyline. Panics if `points` is empty.
-    pub fn new(points: Vec<Vertex>) -> Self {
-        assert!(!points.is_empty(), "PathFollower needs at least one point");
+    /// Wrap a polyline. Returns [`PathFollowerError::EmptyPath`] if
+    /// `points` is empty.
+    pub fn new(points: Vec<Vertex>) -> Result<Self, PathFollowerError> {
+        if points.is_empty() {
+            return Err(PathFollowerError::EmptyPath);
+        }
         let n = points.len();
         let mut cum = vec![0.0; n];
         for i in 1..n {
             cum[i] = cum[i - 1] + points[i - 1].distance(points[i]);
         }
         let total_length = cum[n - 1];
-        Self {
+        Ok(Self {
             points,
             cum_lengths: cum,
             total_length,
             arc: 0.0,
-        }
+        })
     }
 
     /// Total arc length of the wrapped polyline.
@@ -252,7 +272,7 @@ mod tests {
 
     #[test]
     fn straight_path_lookahead_is_linear() {
-        let mut f = PathFollower::new(vec![v(0.0, 0.0), v(10.0, 0.0)]);
+        let mut f = PathFollower::new(vec![v(0.0, 0.0), v(10.0, 0.0)]).unwrap();
         let opts = FollowerOptions {
             lookahead: 2.0,
             corner_avoidance: 0.0,
@@ -265,7 +285,7 @@ mod tests {
 
     #[test]
     fn lookahead_past_end_clamps_to_last_point() {
-        let mut f = PathFollower::new(vec![v(0.0, 0.0), v(10.0, 0.0)]);
+        let mut f = PathFollower::new(vec![v(0.0, 0.0), v(10.0, 0.0)]).unwrap();
         let opts = FollowerOptions {
             lookahead: 100.0,
             corner_avoidance: 0.0,
@@ -277,7 +297,7 @@ mod tests {
 
     #[test]
     fn off_path_agent_projects_to_nearest() {
-        let mut f = PathFollower::new(vec![v(0.0, 0.0), v(10.0, 0.0)]);
+        let mut f = PathFollower::new(vec![v(0.0, 0.0), v(10.0, 0.0)]).unwrap();
         let opts = FollowerOptions {
             lookahead: 1.0,
             corner_avoidance: 0.0,
@@ -290,7 +310,7 @@ mod tests {
 
     #[test]
     fn progress_is_monotone_forward() {
-        let mut f = PathFollower::new(vec![v(0.0, 0.0), v(10.0, 0.0)]);
+        let mut f = PathFollower::new(vec![v(0.0, 0.0), v(10.0, 0.0)]).unwrap();
         let opts = FollowerOptions::default();
         f.target(v(5.0, 0.0), &opts);
         assert!((f.arc_length() - 5.0).abs() < 1e-9);
@@ -302,7 +322,7 @@ mod tests {
 
     #[test]
     fn at_end_reports_completion() {
-        let mut f = PathFollower::new(vec![v(0.0, 0.0), v(10.0, 0.0)]);
+        let mut f = PathFollower::new(vec![v(0.0, 0.0), v(10.0, 0.0)]).unwrap();
         let opts = FollowerOptions::default();
         f.target(v(10.0, 0.0), &opts);
         assert!(f.at_end());
@@ -327,11 +347,11 @@ mod tests {
             corner_angle_threshold: 0.1,
         };
 
-        let mut f1 = PathFollower::new(path.clone());
+        let mut f1 = PathFollower::new(path.clone()).unwrap();
         let t_none = f1.target(v(3.0, 0.0), &opts_none);
         assert!(t_none.approx_eq(v(5.0, 0.5), 1e-9), "got {:?}", t_none);
 
-        let mut f2 = PathFollower::new(path);
+        let mut f2 = PathFollower::new(path).unwrap();
         let t_safe = f2.target(v(3.0, 0.0), &opts_safe);
         // For a left turn at (5, 0) (east → north), outward = south-east.
         // Target shifted east (x > 5) and downward (y < 0.5).
@@ -351,7 +371,7 @@ mod tests {
             corner_avoidance: 1.0,
             corner_angle_threshold: 0.05, // ~3°, larger than the 1° turn
         };
-        let mut f = PathFollower::new(path);
+        let mut f = PathFollower::new(path).unwrap();
         let t = f.target(v(3.0, 0.0), &opts);
         // Plain lookahead at arc 5.5 on the second segment.
         let expected = v(5.0, 0.0).lerp(v(10.0, 0.0875), 0.5 / 5.000766);
@@ -371,7 +391,7 @@ mod tests {
             corner_avoidance: 1.0,
             corner_angle_threshold: 0.1,
         };
-        let mut f = PathFollower::new(path);
+        let mut f = PathFollower::new(path).unwrap();
         let t = f.target(v(3.0, 0.0), &opts);
         // Outward for a right turn (east → south) is north-east. Target
         // unbiased would be (5, -0.5); biased should be x > 5 and y > -0.5.
@@ -389,7 +409,7 @@ mod tests {
             corner_avoidance: 1.0,
             corner_angle_threshold: 0.1,
         };
-        let mut f = PathFollower::new(path);
+        let mut f = PathFollower::new(path).unwrap();
         let t = f.target(v(5.0, 0.0), &opts);
         // Target arc = 7, corner at arc 20. Distance 13 >> avoidance.
         assert!(t.approx_eq(v(7.0, 0.0), 1e-9), "got {:?}", t);

@@ -80,7 +80,7 @@ fn build_donut_navmesh() -> rsnav_navmesh::NavMesh {
     }
     pslg.holes.push(PslgHole { point: Vertex::new(2.0, 2.0) });
     delaunay(&mut cdt, DivConqOptions::default());
-    form_skeleton(&mut cdt, &pslg, None);
+    form_skeleton(&mut cdt, &pslg, None).unwrap();
     carve_holes(&mut cdt, &pslg, false);
     build_from_cdt(&cdt)
 }

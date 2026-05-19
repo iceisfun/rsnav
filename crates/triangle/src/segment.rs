@@ -20,8 +20,11 @@
 //! `segmentintersection` (handles self-intersecting PSLGs by inserting a
 //! Steiner point at the crossing) and `conformingedge` (forces conformity
 //! by recursive midpoint splitting) are intentionally **not** ported in v1.
-//! `insert_segment` panics if it would need them — they only matter for
-//! invalid input or the `-q`/`-Y` quality-refinement modes.
+//! Each function returns [`SegmentInsertError::SelfIntersection`] when it
+//! would need them — only invalid input (a user-drawn self-crossing
+//! polygon) or the `-q`/`-Y` quality-refinement modes need them.
+
+use std::collections::HashMap;
 
 use rsnav_common::VertexId;
 
@@ -29,6 +32,49 @@ use crate::flip;
 use crate::mesh::{CdtMesh, Otri, DUMMY_SUB, DUMMY_TRI};
 use crate::predicates::orient2d;
 use crate::pslg::Pslg;
+
+// --- Errors --------------------------------------------------------------
+
+/// Failure modes for [`insert_segment`] and the functions it calls.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SegmentInsertError {
+    /// The PSLG segment from `endpoint1` to `endpoint2` would cross an
+    /// existing constrained subsegment. v1 doesn't support self-
+    /// intersecting PSLG input (the [`segmentintersection`] /
+    /// [`conformingedge`] paths from triangle.c are not ported).
+    /// The CDT is left in a valid state but the segment was not inserted.
+    SelfIntersection {
+        endpoint1: VertexId,
+        endpoint2: VertexId,
+    },
+    /// The segment references a vertex that isn't a corner of any live
+    /// triangle. [`form_skeleton`] auto-remaps duplicate-position vertex
+    /// IDs to their canonical ID (the first-occurrence index), so this
+    /// fires only for genuinely missing vertices — a segment endpoint
+    /// that wasn't pushed into the CDT at all.
+    VertexNotInTriangulation { vertex: VertexId },
+}
+
+impl std::fmt::Display for SegmentInsertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SelfIntersection { endpoint1, endpoint2 } => write!(
+                f,
+                "PSLG segment ({} → {}) crosses an existing constrained subsegment \
+                 (self-intersecting input is not supported in v1)",
+                endpoint1.get(),
+                endpoint2.get()
+            ),
+            Self::VertexNotInTriangulation { vertex } => write!(
+                f,
+                "vertex {} is not a corner of any live triangle in the CDT",
+                vertex.get()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SegmentInsertError {}
 
 // --- makevertexmap -------------------------------------------------------
 
@@ -207,12 +253,16 @@ fn oprevself(mesh: &CdtMesh, o: &mut Otri) {
 // --- scoutsegment --------------------------------------------------------
 
 /// March from `org(searchtri)` toward `endpoint2` along existing triangle
-/// edges. Returns `true` if the segment was successfully inserted (i.e. an
-/// existing edge of the mesh coincides with the segment, possibly after
-/// chaining through collinear interior vertices).
+/// edges. Returns `Ok(true)` if the segment was successfully inserted
+/// (i.e. an existing edge of the mesh coincides with the segment, possibly
+/// after chaining through collinear interior vertices).
 ///
-/// On `false` return, `searchtri` is positioned at the triangle from which
+/// On `Ok(false)`, `searchtri` is positioned at the triangle from which
 /// [`constrained_edge`] should start digging.
+///
+/// Returns [`SegmentInsertError::SelfIntersection`] if the segment's
+/// path crosses an existing constrained subsegment — v1 doesn't support
+/// self-intersecting PSLG input.
 ///
 /// Port of `scoutsegment()`.
 pub fn scout_segment(
@@ -220,7 +270,8 @@ pub fn scout_segment(
     searchtri: &mut Otri,
     endpoint2: VertexId,
     newmark: i32,
-) -> bool {
+) -> Result<bool, SegmentInsertError> {
+    let endpoint1 = mesh.org(*searchtri);
     let collinear = find_direction(mesh, searchtri, endpoint2);
     let rightvertex = mesh.dest(*searchtri);
     let leftvertex = mesh.apex(*searchtri);
@@ -235,7 +286,7 @@ pub fn scout_segment(
             *searchtri = searchtri.lprev();
         }
         insert_subseg(mesh, *searchtri, newmark);
-        return true;
+        return Ok(true);
     }
 
     match collinear {
@@ -257,13 +308,12 @@ pub fn scout_segment(
             let crosstri = searchtri.lnext();
             let crosssubseg = mesh.tspivot(crosstri);
             if crosssubseg.sub == DUMMY_SUB {
-                false
+                Ok(false)
             } else {
-                panic!(
-                    "scout_segment: segment to ({}, {}) crosses an existing constrained subsegment — \
-                     self-intersecting PSLG input is not supported in this v1 port",
-                    ep2_pos.x, ep2_pos.y,
-                );
+                Err(SegmentInsertError::SelfIntersection {
+                    endpoint1,
+                    endpoint2,
+                })
             }
         }
     }
@@ -331,13 +381,16 @@ pub fn delaunay_fixup(mesh: &mut CdtMesh, fixuptri: &mut Otri, leftside: bool) {
 /// triangulation by repeatedly flipping the edges it crosses, then
 /// re-Delaunay-fying each side.
 ///
+/// Returns [`SegmentInsertError::SelfIntersection`] if the dig would
+/// have to flip an existing constrained subsegment.
+///
 /// Port of `constrainededge()`.
 pub fn constrained_edge(
     mesh: &mut CdtMesh,
     starttri: &mut Otri,
     endpoint2: VertexId,
     newmark: i32,
-) {
+) -> Result<(), SegmentInsertError> {
     let endpoint1 = mesh.org(*starttri);
     let endpoint1_pos = mesh.vertex_pos(endpoint1);
     let endpoint2_pos = mesh.vertex_pos(endpoint2);
@@ -382,10 +435,10 @@ pub fn constrained_edge(
                 if crosssubseg.sub == DUMMY_SUB {
                     flip::flip(mesh, &mut fixuptri);
                 } else {
-                    panic!(
-                        "constrained_edge: PSLG segment crosses an existing constrained subsegment \
-                         (self-intersecting input not supported in v1)",
-                    );
+                    return Err(SegmentInsertError::SelfIntersection {
+                        endpoint1,
+                        endpoint2,
+                    });
                 }
             }
         }
@@ -395,16 +448,24 @@ pub fn constrained_edge(
 
     if collision {
         // Insert the remainder of the segment past the collision point.
-        if !scout_segment(mesh, &mut fixuptri, endpoint2, newmark) {
-            constrained_edge(mesh, &mut fixuptri, endpoint2, newmark);
+        if !scout_segment(mesh, &mut fixuptri, endpoint2, newmark)? {
+            constrained_edge(mesh, &mut fixuptri, endpoint2, newmark)?;
         }
     }
+    Ok(())
 }
 
 // --- insertsegment -------------------------------------------------------
 
 /// Insert one PSLG segment connecting two vertices that already exist in
 /// the mesh. Port of `insertsegment()`.
+///
+/// Returns [`SegmentInsertError::SelfIntersection`] if the segment would
+/// cross an existing constrained subseg, or
+/// [`SegmentInsertError::VertexNotInTriangulation`] if either endpoint
+/// has been deduplicated out of the triangulation (use
+/// [`form_skeleton`] for the high-level driver, which auto-remaps
+/// duplicate-position vertex IDs).
 ///
 /// Pre: [`make_vertex_map`] has been called so each endpoint has a valid
 /// `triangle` back-pointer.
@@ -413,19 +474,20 @@ pub fn insert_segment(
     endpoint1: VertexId,
     endpoint2: VertexId,
     newmark: i32,
-) {
-    // Find a triangle whose origin is endpoint1.
-    let mut searchtri1 = locate_vertex(mesh, endpoint1);
-    if !scout_segment(mesh, &mut searchtri1, endpoint2, newmark) {
+) -> Result<(), SegmentInsertError> {
+    let mut searchtri1 = locate_vertex(mesh, endpoint1)
+        .map_err(|vertex| SegmentInsertError::VertexNotInTriangulation { vertex })?;
+    if !scout_segment(mesh, &mut searchtri1, endpoint2, newmark)? {
         // Scout from the other end too, so collisions detected from either
         // side leave us with a tight start point.
-        let mut searchtri2 = locate_vertex(mesh, endpoint2);
-        if scout_segment(mesh, &mut searchtri2, endpoint1, newmark) {
-            return;
+        let mut searchtri2 = locate_vertex(mesh, endpoint2)
+            .map_err(|vertex| SegmentInsertError::VertexNotInTriangulation { vertex })?;
+        if scout_segment(mesh, &mut searchtri2, endpoint1, newmark)? {
+            return Ok(());
         }
-        // Direct constraint dig.
-        constrained_edge(mesh, &mut searchtri1, endpoint2, newmark);
+        constrained_edge(mesh, &mut searchtri1, endpoint2, newmark)?;
     }
+    Ok(())
 }
 
 /// Look up a triangle that has `v` as one of its corners and return a handle
@@ -437,21 +499,23 @@ pub fn insert_segment(
 /// cache is stale (a prior segment-insertion flip moved `v` to a
 /// different triangle entirely) and we fall back to a linear scan over
 /// live triangles. On a successful scan we refresh the cache so the next
-/// lookup is O(1) again.
+/// lookup is O(1) again. Returns `Err(v)` if `v` isn't a corner of any
+/// live triangle — the typical cause is a duplicate-position vertex
+/// dropped by `delaunay()`; [`form_skeleton`] auto-remaps those.
 ///
 /// This mirrors triangle.c's `insertsegment()` which checks the cached
 /// triangle's org and falls back to `locate()` (point location) on
 /// mismatch. We use a linear scan instead of point location — it's O(n)
 /// per fallback, but the fallback only fires when flips have stale-d the
 /// cache, which scales with mesh complexity, not query count.
-fn locate_vertex(mesh: &mut CdtMesh, v: VertexId) -> Otri {
+fn locate_vertex(mesh: &mut CdtMesh, v: VertexId) -> Result<Otri, VertexId> {
     let encoded = mesh.vertex(v).triangle;
     if encoded.tri() != DUMMY_TRI {
         let base = encoded.to_otri();
         for orient_off in 0..3u8 {
             let candidate = Otri::new(base.tri, (base.orient + orient_off) % 3);
             if mesh.org(candidate) == v {
-                return candidate;
+                return Ok(candidate);
             }
         }
     }
@@ -463,14 +527,11 @@ fn locate_vertex(mesh: &mut CdtMesh, v: VertexId) -> Otri {
             let h = Otri::new(tri_idx, orient);
             if mesh.org(h) == v {
                 mesh.vertex_mut(v).triangle = h.encode();
-                return h;
+                return Ok(h);
             }
         }
     }
-    panic!(
-        "locate_vertex: vertex {} not found in any live triangle",
-        v.get()
-    );
+    Err(v)
 }
 
 // --- formskeleton --------------------------------------------------------
@@ -480,20 +541,70 @@ fn locate_vertex(mesh: &mut CdtMesh, v: VertexId) -> Otri {
 /// that aren't already constrained — pass `Some(1)` to mimic triangle.c's
 /// default `markhull` step.
 ///
+/// Returns [`SegmentInsertError::SelfIntersection`] on the first segment
+/// that would cross an existing constrained subseg. The CDT is left in a
+/// valid state up to that point — callers can either bail or strip the
+/// bad segment from the PSLG and retry.
+///
+/// Auto-handles duplicate-position vertices: [`delaunay()`] silently
+/// drops bit-exact duplicates, so a segment that references a dropped
+/// ID would otherwise crash in [`locate_vertex`]. This function builds a
+/// position → first-occurrence-ID remap from the mesh's own vertex pool
+/// and rewrites each segment's endpoints through it. Degenerate
+/// (canonically-self-loop) segments after remap are silently skipped.
+///
 /// Port of `formskeleton()`.
-pub fn form_skeleton(mesh: &mut CdtMesh, pslg: &Pslg, mark_hull_with: Option<i32>) {
+pub fn form_skeleton(
+    mesh: &mut CdtMesh,
+    pslg: &Pslg,
+    mark_hull_with: Option<i32>,
+) -> Result<(), SegmentInsertError> {
     make_vertex_map(mesh);
+
+    // Build the position → canonical-vertex-ID remap from the mesh's
+    // pool. After delaunay() has dropped exact-position duplicates, the
+    // canonical (in-triangulation) ID for any position is the first
+    // pool-order vertex with that position.
+    let remap = canonical_remap(mesh);
+
     for seg in &pslg.segments {
-        let a = VertexId::new(seg.a);
-        let b = VertexId::new(seg.b);
-        if a == b {
-            continue; // degenerate segment; skip silently
+        if (seg.a as usize) >= remap.len() || (seg.b as usize) >= remap.len() {
+            // Segment endpoint out of range of the mesh's vertex pool.
+            // Treat as missing-from-triangulation.
+            return Err(SegmentInsertError::VertexNotInTriangulation {
+                vertex: VertexId::new(
+                    if (seg.a as usize) >= remap.len() { seg.a } else { seg.b },
+                ),
+            });
         }
-        insert_segment(mesh, a, b, seg.marker);
+        let a = remap[seg.a as usize];
+        let b = remap[seg.b as usize];
+        if a == b {
+            continue; // self-loop after dedupe — silently skip
+        }
+        insert_segment(mesh, a, b, seg.marker)?;
     }
     if let Some(mark) = mark_hull_with {
         mark_hull(mesh, mark);
     }
+    Ok(())
+}
+
+/// For every vertex `i` in the mesh's pool, return the ID of the
+/// first-occurrence vertex with the same position. Used by
+/// [`form_skeleton`] to redirect segment endpoints around the
+/// duplicates that `delaunay()` silently drops.
+fn canonical_remap(mesh: &CdtMesh) -> Vec<VertexId> {
+    let n = mesh.vertices.len();
+    let mut by_pos: HashMap<(u64, u64), VertexId> = HashMap::with_capacity(n);
+    let mut remap = Vec::with_capacity(n);
+    for i in 0..n {
+        let v = mesh.vertices[i].position;
+        let key = (v.x.to_bits(), v.y.to_bits());
+        let canonical = *by_pos.entry(key).or_insert(VertexId::new(i as u32));
+        remap.push(canonical);
+    }
+    remap
 }
 
 /// Cover every convex-hull edge with a subseg if it isn't already
@@ -581,7 +692,7 @@ mod tests {
         let c = push(&mut m, 2.5, 5.0);
         delaunay(&mut m, DivConqOptions::default());
         make_vertex_map(&mut m);
-        let mut handle = locate_vertex(&mut m, a);
+        let mut handle = locate_vertex(&mut m, a).expect("vertex a should be in the triangulation");
         let result = find_direction(&m, &mut handle, c);
         assert_eq!(m.org(handle), a);
         // c is a corner of the only real triangle; the handle should end
@@ -599,7 +710,7 @@ mod tests {
         let tri_count_before = m.live_triangle_count();
         make_vertex_map(&mut m);
         // Hull edge (0,0)-(4,0) (verts 0 and 1) is definitely a Delaunay edge.
-        insert_segment(&mut m, VertexId::new(0), VertexId::new(1), 7);
+        insert_segment(&mut m, VertexId::new(0), VertexId::new(1), 7).unwrap();
         assert_eq!(m.live_triangle_count(), tri_count_before);
         // The subseg should now exist on at least one triangle.
         assert!(
@@ -620,7 +731,7 @@ mod tests {
         // insert the OTHER diagonal; if it already coincides, the test is a
         // no-op (some perturbations may pick either). For a perfectly square
         // input the choice is arbitrary; force diagonal (0, 2).
-        insert_segment(&mut m, VertexId::new(0), VertexId::new(2), 3);
+        insert_segment(&mut m, VertexId::new(0), VertexId::new(2), 3).unwrap();
         // Mesh remains 2 triangles either way.
         assert_eq!(m.live_triangle_count(), 2);
         // Confirm there's now a subseg on the (0, 2) edge.
@@ -664,7 +775,7 @@ mod tests {
         delaunay(&mut mesh, DivConqOptions::default());
         let tris_after_delaunay = mesh.live_triangle_count();
 
-        form_skeleton(&mut mesh, &pslg, None);
+        form_skeleton(&mut mesh, &pslg, None).unwrap();
 
         // form_skeleton may have added new vertices (for forced subseg splits)
         // and triangles (for flipped diagonals). Triangle count should still
@@ -718,7 +829,7 @@ mod tests {
             holes: Vec::new(),
         };
 
-        form_skeleton(&mut mesh, &pslg, Some(1));
+        form_skeleton(&mut mesh, &pslg, Some(1)).unwrap();
         assert_eq!(mesh.live_triangle_count(), 2);
 
         // 4 hull subsegs + 1 diagonal = 5 subsegs.

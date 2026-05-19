@@ -333,7 +333,7 @@ mod tests {
             ],
             holes: vec![PslgHole { point: Vertex::new(2.0, 2.0) }],
         };
-        form_skeleton(&mut mesh, &pslg, None);
+        form_skeleton(&mut mesh, &pslg, None).unwrap();
         carve_holes(&mut mesh, &pslg, false);
         build_from_cdt(&mesh)
     }

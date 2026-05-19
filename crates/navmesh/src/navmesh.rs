@@ -69,11 +69,17 @@ impl NavMesh {
         self.triangles.len()
     }
 
+    /// Read a vertex position by ID. **Panics** if `id` is out of
+    /// range — most commonly because the ID was issued by a different
+    /// mesh. NavMesh IDs are not portable across instances; pass IDs
+    /// only back to the same NavMesh that produced them.
     #[inline]
     pub fn vertex(&self, id: VertexId) -> Vertex {
         self.vertices[id.index()]
     }
 
+    /// Read a triangle by ID. **Panics** if `id` is out of range. Same
+    /// cross-mesh caveat as [`vertex`](Self::vertex).
     #[inline]
     pub fn triangle(&self, id: TriangleId) -> &NavTriangle {
         &self.triangles[id.index()]

@@ -222,7 +222,7 @@ mod tests {
                 point: Vertex::new(2.0, 2.0),
             }],
         };
-        form_skeleton(&mut mesh, &pslg, None);
+        form_skeleton(&mut mesh, &pslg, None).unwrap();
         carve_holes(&mut mesh, &pslg, false);
         mesh
     }
@@ -325,7 +325,7 @@ mod tests {
             ],
             holes: Vec::new(),
         };
-        form_skeleton(&mut mesh, &pslg, None);
+        form_skeleton(&mut mesh, &pslg, None).unwrap();
         let nav = build_from_cdt(&mesh);
         assert_eq!(
             nav.region_count, 2,

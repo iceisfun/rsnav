@@ -45,10 +45,16 @@ impl Mesh2d {
         id
     }
 
+    /// Read a vertex by ID. **Panics** if `id` is out of range — most
+    /// commonly because the ID was issued by a *different* mesh. Mesh2d
+    /// IDs are not portable across mesh instances; treat them like
+    /// pointers into a particular `Vec`.
     pub fn vertex(&self, id: VertexId) -> Vertex {
         self.vertices[id.index()]
     }
 
+    /// Read a triangle by ID. **Panics** if `id` is out of range. Same
+    /// cross-mesh caveat as [`vertex`](Self::vertex).
     pub fn triangle(&self, id: TriangleId) -> Triangle {
         self.triangles[id.index()]
     }

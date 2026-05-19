@@ -1,14 +1,15 @@
 //! Run the full navmesh pipeline against a directory of PSLG fixtures
 //! and print a status table.
 //!
-//! Default directory: `~/work/gonav/testdata`. Override with a positional
-//! arg (file or directory).
+//! Fixture path is supplied via `--testdata <PATH>` (a file or a
+//! directory of `.json` files). When omitted it defaults to `./testdata`
+//! relative to the current working directory.
 //!
-//!     cargo run -p rsnav-fixtures                       # scan default dir
-//!     cargo run -p rsnav-fixtures -- ~/my/fixtures      # scan custom dir
-//!     cargo run -p rsnav-fixtures -- ./broken.json -v   # detail one file
+//!     cargo run -p rsnav-fixtures -- --testdata ./testdata
+//!     cargo run -p rsnav-fixtures -- --testdata ~/my/fixtures
+//!     cargo run -p rsnav-fixtures -- --testdata ./broken.json -v
 //!
-//! Supported JSON schema (gonav fixture format):
+//! Supported JSON schema (gonav-compatible):
 //!
 //! ```jsonc
 //! {
@@ -107,6 +108,8 @@ enum Status {
     IoError(String),
     BuildEmpty,
     InteriorPointFailed { hole_index: usize },
+    /// form_skeleton refused to insert a segment (e.g. self-intersection).
+    SegmentInsertion(String),
     Panic(String),
 }
 
@@ -119,6 +122,7 @@ impl Status {
             Status::IoError(_) => "io_err",
             Status::BuildEmpty => "empty",
             Status::InteriorPointFailed { .. } => "no_seed",
+            Status::SegmentInsertion(_) => "seg_err",
             Status::Panic(_) => "PANIC",
         }
     }
@@ -126,7 +130,10 @@ impl Status {
     fn detail(&self) -> Option<String> {
         match self {
             Status::Ok | Status::NoPerimeter | Status::BuildEmpty => None,
-            Status::ParseError(s) | Status::IoError(s) | Status::Panic(s) => Some(s.clone()),
+            Status::ParseError(s)
+            | Status::IoError(s)
+            | Status::SegmentInsertion(s)
+            | Status::Panic(s) => Some(s.clone()),
             Status::InteriorPointFailed { hole_index } => {
                 Some(format!("hole {} has no interior point", hole_index))
             }
@@ -137,11 +144,35 @@ impl Status {
 // --- main ---------------------------------------------------------------
 
 fn main() {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
-    args.retain(|a| !(a == "-v" || a == "--verbose"));
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let mut verbose = false;
+    let mut testdata: Option<PathBuf> = None;
 
-    let target: PathBuf = args.into_iter().next().map(PathBuf::from).unwrap_or_else(default_dir);
+    let mut iter = raw.into_iter();
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "-v" | "--verbose" => verbose = true,
+            "-h" | "--help" => {
+                print_usage();
+                return;
+            }
+            "--testdata" => match iter.next() {
+                Some(path) => testdata = Some(PathBuf::from(path)),
+                None => {
+                    eprintln!("error: --testdata requires a PATH argument");
+                    print_usage();
+                    std::process::exit(1);
+                }
+            },
+            _ => {
+                eprintln!("error: unrecognized argument: {a}");
+                print_usage();
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let target: PathBuf = testdata.unwrap_or_else(|| PathBuf::from("./testdata"));
 
     let paths: Vec<PathBuf> = if target.is_file() {
         vec![target.clone()]
@@ -200,11 +231,13 @@ fn main() {
     }
 }
 
-fn default_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default()
-        .join("work/gonav/testdata")
+fn print_usage() {
+    eprintln!("usage: rsnav-fixtures [--testdata <PATH>] [-v|--verbose] [-h|--help]");
+    eprintln!();
+    eprintln!("  --testdata <PATH>   File or directory of .json fixtures to run.");
+    eprintln!("                      Defaults to ./testdata if not provided.");
+    eprintln!("  -v, --verbose       Print per-fixture diagnostics after the table.");
+    eprintln!("  -h, --help          Show this help.");
 }
 
 // --- Run a single fixture ----------------------------------------------
@@ -307,7 +340,7 @@ fn run_fixture(path: &Path, want_diagnostics: bool) -> Outcome {
     }));
 
     match build {
-        Ok((nav, build_ms)) => {
+        Ok(Ok((nav, build_ms))) => {
             let tris = nav.triangle_count();
             Outcome {
                 file: name,
@@ -323,6 +356,19 @@ fn run_fixture(path: &Path, want_diagnostics: bool) -> Outcome {
                 hole_diagnostics: diagnostics,
             }
         }
+        Ok(Err(seg_err)) => Outcome {
+            file: name,
+            n_perimeters,
+            n_outer_verts,
+            n_holes,
+            n_hole_verts,
+            bbox,
+            status: Status::SegmentInsertion(format!("{seg_err}")),
+            triangles: None,
+            regions: None,
+            build_ms: None,
+            hole_diagnostics: diagnostics,
+        },
         Err(panic_info) => {
             let msg = panic_info
                 .downcast_ref::<String>()
@@ -354,7 +400,7 @@ fn run_pipeline(
     perimeters: &[Vec<Vertex>],
     holes: &[Vec<Vertex>],
     hole_seeds: &[Vertex],
-) -> (NavMesh, f64) {
+) -> Result<(NavMesh, f64), rsnav_triangle::SegmentInsertError> {
     let start = Instant::now();
     let mut pslg = Pslg::new();
     let mut next_idx = 0u32;
@@ -378,24 +424,19 @@ fn run_pipeline(
         pslg.holes.push(PslgHole { point: *s });
     }
 
-    // Collapse exact-position duplicate vertices BEFORE building the CDT.
-    // delaunay() drops them silently from the triangulation and any
-    // segment referencing a dropped ID then crashes the segment-insertion
-    // pass. (Real fixtures from gonav hit this; e.g. lut_gholein has 22
-    // duplicate positions where adjacent ring vertices coincide.)
-    let pslg = pslg.deduplicate();
-
+    // form_skeleton auto-handles duplicate-position vertices internally;
+    // no need to pre-dedupe here.
     let mut cdt = CdtMesh::new();
     for v in &pslg.vertices {
         cdt.push_vertex(VertexSlot::new(v.position, 0));
     }
 
     delaunay(&mut cdt, DivConqOptions::default());
-    form_skeleton(&mut cdt, &pslg, None);
+    form_skeleton(&mut cdt, &pslg, None)?;
     carve_holes(&mut cdt, &pslg, false);
     let nav = build_from_cdt(&cdt);
     let ms = start.elapsed().as_secs_f64() * 1000.0;
-    (nav, ms)
+    Ok((nav, ms))
 }
 
 // --- Geometry helpers --------------------------------------------------

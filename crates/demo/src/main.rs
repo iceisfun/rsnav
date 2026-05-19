@@ -41,7 +41,7 @@ const DEBUG_FILE: &str = "rsnav-debug.json";
 /// Default directory for the "fixtures" browser. The text input under the
 /// Fixtures section is pre-filled with this and is editable, so you can
 /// point at any directory of *.json files.
-const DEFAULT_FIXTURES_DIR: &str = "~/work/gonav/testdata";
+const DEFAULT_FIXTURES_DIR: &str = "./testdata";
 
 // =========================================================================
 // Entry point
@@ -424,21 +424,17 @@ impl DemoApp {
             }
         }
 
-        // Collapse exact-position duplicate vertices before the CDT —
-        // delaunay() drops duplicates from its triangulation and any
-        // segment referencing a dropped vertex then crashes
-        // segment insertion. Real authored fixtures hit this (e.g. when
-        // adjacent perimeter and hole rings happen to share a vertex
-        // position).
-        let pslg = pslg.deduplicate();
-
-        // Build pipeline.
+        // Build pipeline. form_skeleton auto-handles duplicate-position
+        // vertices internally; no need to pre-dedupe here.
         let mut cdt = CdtMesh::new();
         for v in &pslg.vertices {
             cdt.push_vertex(VertexSlot::new(v.position, 0));
         }
         delaunay(&mut cdt, DivConqOptions::default());
-        form_skeleton(&mut cdt, &pslg, None);
+        if let Err(e) = form_skeleton(&mut cdt, &pslg, None) {
+            self.last_build_error = Some(format!("Segment insertion failed: {e}"));
+            return;
+        }
         carve_holes(&mut cdt, &pslg, false);
         let nav = build_from_cdt(&cdt);
         let bsp = Bsp::build(&nav);

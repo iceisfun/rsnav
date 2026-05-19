@@ -84,5 +84,5 @@ fn grid(width: u32, rows: &[&str]) -> Bitfield {
             data[math_row * (width as usize) + col] = walkable;
         }
     }
-    Bitfield::new(width, height, data)
+    Bitfield::new(width, height, data).expect("test grid: dimensions match")
 }

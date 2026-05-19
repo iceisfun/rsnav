@@ -56,16 +56,16 @@ byte-for-byte against the `triangle` binary's `.ele` output (29 triangles).
 cargo run -p rsnav-demo --release
 ```
 
-Author polygons with the mouse, press **Create navmesh**, then probe with right-click (set source) / left-click (set goal) for paths. The left panel has a *Fixtures* browser that scans `~/work/gonav/testdata` for `.json` maps.
+Author polygons with the mouse, press **Create navmesh**, then probe with right-click (set source) / left-click (set goal) for paths. The left panel has a *Fixtures* browser; the path field is pre-filled with `./testdata` and is editable — point it at any directory of `.json` maps.
 
 ### Batch-run fixtures from the CLI
 
 ```
-cargo run -p rsnav-fixtures --release                  # default dir
-cargo run -p rsnav-fixtures --release -- some.json -v  # one file, verbose
+cargo run -p rsnav-fixtures --release -- --testdata ./testdata
+cargo run -p rsnav-fixtures --release -- --testdata ./broken.json -v
 ```
 
-Prints a status table (triangle count, region count, build_ms per fixture). Exits non-zero on any failure — drop-in for CI.
+`--testdata <PATH>` is a file or a directory of `.json` fixtures; if omitted it defaults to `./testdata`. Prints a status table (triangle count, region count, build_ms per fixture) and exits non-zero on any failure — drop-in for CI.
 
 ### Programmatic use
 
@@ -78,6 +78,7 @@ Each crate ships a runnable example (`cargo run -p <crate> --example <name>`):
 | `rsnav-navmesh` | `save_and_load` | Build a navmesh, serialize to bytes, reload, compare. |
 | `rsnav-bsp` | `locate_and_nearest` | BVH point-in-mesh + nearest-point queries. |
 | `rsnav-navigation` | `find_path` | A* + funnel with `distance_from_wall`. |
+| `rsnav-navigation` | `visibility_region` | Star-shaped visibility polygon from a point (sampled). |
 | `rsnav-pathing` | `follow_path` | Simulated agent walking a polyline with lookahead + anti-shortcut. |
 
 ## Crates
@@ -107,15 +108,15 @@ Working and tested (124 tests pass workspace-wide):
 - ✅ CDT round-trip against `triangle.c` reference (`A.poly` → 29 triangles, byte-exact)
 - ✅ 200-point random Delaunay stress passes the empty-circumcircle test
 - ✅ Wall-distance clearance pathing (rejects narrow portals, pulls funnel endpoints off walls)
-- ✅ Real gonav fixtures (`arcane_sanctuary` 1967 tris / 6 regions; `lut_gholein` 1257 tris / 23 regions) build clean
+- ✅ Real gonav-format fixtures (representative loads: ~1900 tris / 6 regions and ~1250 tris / 23 regions) build clean when pointed at via `--testdata`
 
-Deliberate v1 omissions (panic with a clear message if hit):
+Deliberate v1 omissions:
 
-- Steiner point quality refinement (`-q` switch in `triangle`)
-- Self-intersecting PSLG segments (`segmentintersection` in `triangle`)
-- Conforming-Delaunay midpoint splitting (`conformingedge` in `triangle`)
-- Visibility-region polygon-from-a-point query
-- Interactive pan/zoom in the demo (only auto-fit + Fit-view button)
+- Steiner point quality refinement (`-q` switch in `triangle`) — no facility for it.
+- Self-intersecting PSLG segments (`segmentintersection` in `triangle`) — `form_skeleton` returns `Err(SelfIntersection)` rather than splitting the crossing.
+- Conforming-Delaunay midpoint splitting (`conformingedge` in `triangle`).
+- Visibility-region exact (Asano/Suri sweep). The shipped `visibility_region` uses uniform angular sampling — exact enough for visualization at typical resolutions.
+- Interactive pan/zoom in the demo (only auto-fit + Fit-view button).
 
 ## References
 

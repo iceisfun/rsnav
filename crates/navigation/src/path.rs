@@ -140,7 +140,7 @@ mod tests {
             ],
             holes: vec![PslgHole { point: Vertex::new(2.0, 2.0) }],
         };
-        form_skeleton(&mut mesh, &pslg, None);
+        form_skeleton(&mut mesh, &pslg, None).unwrap();
         carve_holes(&mut mesh, &pslg, false);
         let nav = build_from_cdt(&mesh);
         let bsp = Bsp::build(&nav);
@@ -277,7 +277,7 @@ mod tests {
                 PslgHole { point: Vertex::new(5.0, 3.5) }, // inside top bump
             ],
         };
-        form_skeleton(&mut mesh, &pslg, None);
+        form_skeleton(&mut mesh, &pslg, None).unwrap();
         carve_holes(&mut mesh, &pslg, false);
         let nav = build_from_cdt(&mesh);
         let bsp = Bsp::build(&nav);

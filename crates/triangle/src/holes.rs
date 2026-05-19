@@ -281,7 +281,7 @@ mod tests {
         // the convex hull == PSLG boundary so it happens to work either
         // way, but we follow triangle.c's order (skeleton, carve, then
         // optional markhull) consistently.
-        form_skeleton(&mut mesh, &pslg, None);
+        form_skeleton(&mut mesh, &pslg, None).unwrap();
         (mesh, pslg)
     }
 
@@ -331,7 +331,7 @@ mod tests {
             mesh.push_vertex(VertexSlot::new(v.position, v.marker));
         }
         delaunay(&mut mesh, DivConqOptions::default());
-        form_skeleton(&mut mesh, &pslg, None);
+        form_skeleton(&mut mesh, &pslg, None).unwrap();
         carve_holes(&mut mesh, &pslg, false);
         assert_eq!(
             mesh.live_triangle_count(),

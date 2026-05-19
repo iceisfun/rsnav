@@ -93,7 +93,7 @@ fn build_donut_with_diag_wall() -> (NavMesh, Bsp) {
     }
     pslg.holes.push(PslgHole { point: Vertex::new(2.0, 2.0) });
     delaunay(&mut cdt, DivConqOptions::default());
-    form_skeleton(&mut cdt, &pslg, None);
+    form_skeleton(&mut cdt, &pslg, None).unwrap();
     carve_holes(&mut cdt, &pslg, false);
     let nav = build_from_cdt(&cdt);
     let bsp = Bsp::build(&nav);
