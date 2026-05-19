@@ -165,6 +165,13 @@ pub struct CrowdConfig {
     /// How close (in world units) the agent must come to the current
     /// corridor corner before the cursor advances. Default `0.25`.
     pub arrive_eps: f64,
+    /// Speed, as a fraction of the agent's `max_speed`, at which a
+    /// *goal-less* agent nudges itself out of the way when a neighbor
+    /// closes in. Keeps a parked agent "soft" — it yields instead of
+    /// acting as an immovable wall — without it wandering far from
+    /// where it stopped. Default `0.5`. Set to `0.0` to make idle
+    /// agents fully immovable (the pre-soft-hold behavior).
+    pub hold_speed_frac: f64,
 }
 
 impl Default for CrowdConfig {
@@ -177,6 +184,7 @@ impl Default for CrowdConfig {
             align_weight: 1.0,
             avoid_weight: 2.0,
             arrive_eps: 0.25,
+            hold_speed_frac: 0.5,
         }
     }
 }
@@ -618,12 +626,18 @@ impl Crowd {
     // ---- per-agent velocity choice ---------------------------------------
 
     fn choose_velocity(&self, idx: usize, slot: &Slot) -> Vertex {
+        // An agent with no reachable goal still participates in
+        // collision avoidance: it holds position but yields when a
+        // neighbor pushes in, so a parked agent (idle, waiting for a
+        // slot, mid-deposit) never becomes an immovable wall. That wall
+        // is what turns ordinary drop-off congestion into a hard
+        // deadlock.
         if slot.agent.goal.is_none() || slot.plan_failed {
-            return Vertex::ZERO;
+            return self.choose_hold_velocity(idx, slot);
         }
         let v_pref = self.preferred_velocity(slot);
         if v_pref.length_sq() < 1e-12 {
-            return Vertex::ZERO;
+            return self.choose_hold_velocity(idx, slot);
         }
         let max_speed = slot.agent.max_speed.max(1e-6);
         let pref_norm_sq = max_speed * max_speed;
@@ -683,6 +697,80 @@ impl Crowd {
             }
         }
 
+        best
+    }
+
+    /// Velocity for an agent with no (reachable) goal.
+    ///
+    /// Holds position when nothing is pressing on it, but stays "soft":
+    ///
+    /// 1. If it currently overlaps neighbors, it moves directly along
+    ///    the penetration-depth-weighted separation vector — a pile of
+    ///    parked agents decompresses instead of staying jammed.
+    /// 2. Otherwise, if a neighbor's motion will collide with it soon,
+    ///    it takes the lowest-penalty nudge from a full circle of
+    ///    candidate velocities.
+    /// 3. Otherwise it stays put.
+    ///
+    /// A parked agent therefore yields to pressure rather than acting
+    /// as an immovable wall, while still settling to a stop once the
+    /// crowd around it clears.
+    fn choose_hold_velocity(&self, idx: usize, slot: &Slot) -> Vertex {
+        let nudge = slot.agent.max_speed * self.config.hold_speed_frac;
+        if nudge <= 0.0 {
+            return Vertex::ZERO;
+        }
+        let me_pos = slot.agent.pos;
+        let me_r = slot.agent.radius;
+        let search = self.config.neighbor_radius + me_r;
+
+        // (1) Direct decompression out of any current overlaps.
+        let mut push = Vertex::ZERO;
+        self.hash.for_neighbors(me_pos, search, |j| {
+            if j == idx {
+                return;
+            }
+            let Some(Some(other)) = self.slots.get(j) else {
+                return;
+            };
+            let away = me_pos - other.agent.pos;
+            let dist = away.length();
+            let r = me_r + other.agent.radius;
+            if dist < r {
+                let depth = r - dist;
+                let dir = if dist > 1e-6 {
+                    away * (1.0 / dist)
+                } else {
+                    // Exactly coincident — fan agents apart by index
+                    // (golden angle) so they don't pick the same way.
+                    let a = idx as f64 * 2.399_963_229_728_653;
+                    Vertex::new(a.cos(), a.sin())
+                };
+                push = push + dir * depth;
+            }
+        });
+        if push.length_sq() > 1e-12 {
+            return push.normalize_or_zero() * nudge;
+        }
+
+        // (2) Not overlapping: hold unless a neighbor is closing in.
+        let zero_pen = self.collision_penalty(idx, slot, Vertex::ZERO);
+        if zero_pen <= 0.0 {
+            return Vertex::ZERO;
+        }
+        let n = self.config.vo_samples.max(4) as usize;
+        let mut best = Vertex::ZERO;
+        let mut best_pen = zero_pen;
+        for k in 0..n {
+            let theta = std::f64::consts::TAU * (k as f64) / (n as f64);
+            let (sin, cos) = theta.sin_cos();
+            let v = Vertex::new(cos * nudge, sin * nudge);
+            let pen = self.collision_penalty(idx, slot, v);
+            if pen < best_pen {
+                best_pen = pen;
+                best = v;
+            }
+        }
         best
     }
 
@@ -863,6 +951,28 @@ mod tests {
             crowd.agent(b).unwrap().goal.is_none(),
             "agent B didn't reach its goal (pos={:?})",
             crowd.agent(b).unwrap().pos,
+        );
+    }
+
+    #[test]
+    fn parked_agents_decompress() {
+        // Two goal-less agents placed overlapping must push apart —
+        // a parked agent stays "soft", it does not freeze into a wall.
+        let nav = open_arena(16, 16);
+        let mut crowd = Crowd::new(nav, CrowdConfig::default());
+        let a = crowd.add_agent(Agent::new(Vertex::new(8.0, 8.0), 0.5, 2.0));
+        let b = crowd.add_agent(Agent::new(Vertex::new(8.4, 8.0), 0.5, 2.0));
+        // Neither agent is ever given a goal.
+        for _ in 0..600 {
+            crowd.tick(1.0 / 60.0);
+        }
+        let pa = crowd.agent(a).unwrap().pos;
+        let pb = crowd.agent(b).unwrap().pos;
+        let sum_r = 1.0;
+        assert!(
+            pa.distance(pb) >= sum_r - 0.05,
+            "parked agents stayed overlapped: dist={:.3}",
+            pa.distance(pb),
         );
     }
 
