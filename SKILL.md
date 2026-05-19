@@ -47,8 +47,12 @@ crates/
   bsp/             rsnav-bsp             BVH over a NavMesh
   navigation/      rsnav-navigation      A* + funnel + LOS + visibility
   pathing/         rsnav-pathing         polyline follower (no nav dep)
+  dynamic/         rsnav-dynamic         background-thread navmesh worker
+                                         (Bitfield -> NavMesh) + typed
+                                         telemetry events + stats counters
   demo/            rsnav-demo            egui authoring + probing app
   fixtures/        rsnav-fixtures        CLI runner for JSON fixtures
+  rtsim/           rsnav-rtsim           RTS-style dynamic-obstacles testbed
 ```
 
 Every library crate ships a runnable example in `crates/<name>/examples/`.
@@ -158,6 +162,25 @@ Bitfield → polygons, `rsnav_polygon_extract`:
 | `Bitfield { width, height, data: Vec<bool> }` | Row-major, `true` = walkable. Cell (col, row) covers `[col, col+1] × [row, row+1]` with y-up (row 0 at bottom). Construct via `Bitfield::new(w, h, data) -> Result<Self, BitfieldError>` (returns `BadDataLength` if `data.len() != w * h`) or the infallible `Bitfield::empty(w, h)`. |
 | `ExtractOptions { min_area, remove_collinear, diagonal_smoothing }` | Defaults: keep all, strip collinear vertices, no smoothing. |
 | `extract(&bits, &opts) -> Vec<PolygonWithHoles>` | Outer rings CCW, holes CW. 4-connectivity (diagonal-only touch = disconnected). |
+
+Dynamic obstacles + telemetry, `rsnav_dynamic`:
+
+| Type / fn | Notes |
+| --- | --- |
+| `NavWorker` | Owns a background thread that turns `Arc<Bitfield>` snapshots into `Arc<NavBuild>`. `spawn(BuildOptions)` for no-telemetry; `spawn_with_listener(opts, Arc<dyn NavListener>)` for typed events. `Drop` joins the thread cleanly; `shutdown()` joins explicitly. |
+| `BuildOptions { extract: ExtractOptions, perimeter_marker, hole_marker }` | Knobs forwarded to the per-snapshot pipeline. Defaults: extract defaults, marker 1 / 2. |
+| `NavBuild { navmesh, bsp, build_ms, generation }` | One successful build. `generation` increases monotonically per worker. The first published build is `generation = 1`. |
+| `BuildError::{NoPerimeter, SegmentInsertion(SegmentInsertError), EmptyMesh}` | Why a rebuild failed. Worker keeps the previous published build intact and reports via `last_error()` / `NavEvent::BuildFailed`. |
+| `submit_snapshot(Arc<Bitfield>)` | Non-blocking. If another snapshot is already queued, the worker silently keeps only the newest one (counted in `NavStats::snapshots_coalesced`). |
+| `poll_swap() -> bool` | Call once per frame, before any system reads `current()`. Returns true if a newer build was atomically swapped in this call. |
+| `current() -> Option<Arc<NavBuild>>` | The build presented to game systems this frame. `None` until the first build publishes. |
+| `latest_published() -> Option<Arc<NavBuild>>` | The freshest build the worker has put out, regardless of `poll_swap` — useful for tests and one-shot waits. |
+| `stats() -> NavStats` | Cheap snapshot of running counters. Safe every frame. |
+| `last_error() -> Option<String>` | Last build's error text; cleared when a subsequent build succeeds. |
+| `NavStats { snapshots_submitted, snapshots_coalesced, builds_completed, builds_failed, last_completed_generation, last_build_ms, max_build_ms, total_build_ms }` | Plain `Copy` struct. Caller derives averages itself (`total / completed`). |
+| `NavEvent<'a>::{BuildStarted, BuildCompleted, BuildFailed}` | Typed events emitted by the worker. `BuildFailed` borrows the `&BuildError`; listeners that want to retain events must convert to an owned form themselves. |
+| `NavListener` trait | `fn on_event(&self, event: &NavEvent<'_>)`. Send + Sync + 'static. Blanket impl for `Fn(&NavEvent<'_>)` closures — pass `Arc::new(|ev: &NavEvent<'_>\| { ... }) as Arc<dyn NavListener>`. Invoked synchronously on the worker thread; keep handlers cheap. |
+| `build_navmesh_from_bitfield(&Bitfield, &BuildOptions) -> Result<NavBuild, BuildError>` | Synchronous one-shot pipeline. Same routine the worker calls internally; useful for tests, batch jobs, or any caller that doesn't want a thread. |
 
 ---
 
@@ -320,6 +343,100 @@ loop {
 The follower is path-only (no navmesh ref). Reuse it across multiple
 agents only with care — it owns one agent's arc-length state.
 
+### 8. Dynamic obstacles in a game loop
+
+When the world can change while the game is running (buildings, harvested
+forests, doodads spawning/despawning), keep the navmesh on a background
+thread and let game systems read whatever the worker has most recently
+published. The `Bitfield` is the ground truth; "add an obstacle" and
+"remove an obstacle" are both just bitfield edits + a new snapshot.
+
+```rust
+use std::sync::Arc;
+use rsnav_dynamic::{BuildOptions, NavWorker};
+use rsnav_polygon_extract::Bitfield;
+
+// Game-startup wiring.
+let world_w = 128;
+let world_h = 128;
+let mut grid = vec![true; (world_w * world_h) as usize]; // all walkable
+let mut worker = NavWorker::spawn(BuildOptions::default());
+worker.submit_snapshot(Arc::new(
+    Bitfield::new(world_w, world_h, grid.clone()).expect("dims"),
+));
+
+// When the player places a 4x4 building at (col, row):
+fn paint_rect(grid: &mut [bool], w: u32, col: u32, row: u32, dw: u32, dh: u32, walkable: bool) {
+    for dy in 0..dh {
+        for dx in 0..dw {
+            grid[((row + dy) * w + (col + dx)) as usize] = walkable;
+        }
+    }
+}
+paint_rect(&mut grid, world_w, 30, 40, 4, 4, false);
+worker.submit_snapshot(Arc::new(
+    Bitfield::new(world_w, world_h, grid.clone()).expect("dims"),
+));
+
+// When the building is destroyed: flip the same cells back.
+paint_rect(&mut grid, world_w, 30, 40, 4, 4, true);
+worker.submit_snapshot(Arc::new(
+    Bitfield::new(world_w, world_h, grid.clone()).expect("dims"),
+));
+
+// In your game loop (every frame):
+loop {
+    if worker.poll_swap() {
+        // A new build is now visible to queries. Invalidate cached
+        // routes, reset agent paths, etc.
+    }
+    if let Some(build) = worker.current() {
+        // Use build.navmesh / build.bsp for path queries this frame.
+        let _ = (build.navmesh.triangle_count(), build.bsp.is_empty());
+    }
+    break; // (in a real game this is the frame boundary)
+}
+```
+
+Submit-rate doesn't need throttling — the worker coalesces, so a burst
+of edits in one frame results in at most one extra rebuild. Rebuilds
+happen off-thread; `poll_swap` is the cooperative point at which game
+state observes them.
+
+### 9. Telemetry (typed events + stats)
+
+```rust
+use std::sync::Arc;
+use rsnav_dynamic::{BuildOptions, NavEvent, NavListener, NavWorker};
+
+// A closure is enough — there's a blanket NavListener impl for Fn.
+let listener: Arc<dyn NavListener> = Arc::new(|ev: &NavEvent<'_>| match ev {
+    NavEvent::BuildStarted { generation } => log_my_engine(format!("nav start g{generation}")),
+    NavEvent::BuildCompleted { generation, build_ms, triangles, regions } => {
+        log_my_engine(format!("nav done  g{generation}: {build_ms:.2}ms {triangles}t {regions}r"));
+    }
+    NavEvent::BuildFailed { generation, error } => {
+        log_my_engine(format!("nav FAIL  g{generation}: {error}"));
+    }
+});
+let worker = NavWorker::spawn_with_listener(BuildOptions::default(), listener);
+
+// In your HUD or dashboard each frame:
+let stats = worker.stats();
+let avg_ms = if stats.builds_completed > 0 {
+    stats.total_build_ms / stats.builds_completed as f64
+} else { 0.0 };
+my_hud.write(format!(
+    "nav: {} builds  avg {:.1}ms  max {:.1}ms  coalesced {}",
+    stats.builds_completed, avg_ms, stats.max_build_ms, stats.snapshots_coalesced,
+));
+```
+
+A custom struct implementing `NavListener` is the right choice when the
+listener needs to own state (event ring buffer, atomic counters, channel
+sender). `rtsim` does this for the in-app event log — see
+`crates/rtsim/src/main.rs` (`EventLog`).
+
 ---
 
 ## Gotchas and idioms
@@ -391,6 +508,25 @@ agents only with care — it owns one agent's arc-length state.
   with end-to-end fixtures. When unsure how an API is meant to be
   invoked, the tests in the relevant module file are the best reference.
 
+- **`NavListener` callbacks run on the worker thread.** They fire
+  synchronously between builds, before the next snapshot is processed.
+  Keep handlers cheap: push to a channel, increment an atomic, format
+  one line of log. If you do real work in the callback (network I/O,
+  big formatting, file writes), it directly delays the next build.
+
+- **The worker coalesces submissions.** Submitting two `Bitfield`
+  snapshots while the worker is busy means only the *newest* gets built;
+  the older ones are dropped and counted in `NavStats::snapshots_coalesced`.
+  This is intentional — you can spam `submit_snapshot` from the main
+  thread without throttling. Game systems still see *every* completed
+  build through `poll_swap`, but they don't see every submission.
+
+- **`poll_swap` is the cooperative swap point.** The worker publishes
+  builds whenever they finish, but `current()` only updates when the
+  game thread calls `poll_swap()`. Call it at frame start, before any
+  system reads the navmesh, to guarantee every system sees the same
+  build all frame.
+
 ---
 
 ## Demo and CLI
@@ -403,6 +539,13 @@ agents only with care — it owns one agent's arc-length state.
   runner over a `.json` file or a directory of them (status table, exits
   non-zero on failure; drop-in for CI). `--testdata` defaults to
   `./testdata` if omitted. Add `-v` for per-hole diagnostics.
+- `cargo run -p rsnav-rtsim --release` — RTS-style testbed for the
+  `NavWorker` flow. 128×128 cell bitfield, mouse tools (paint walls,
+  clear, harvest forest cells one at a time), ~10 agents pathing
+  between random walkable points through the live mesh. Side panel
+  shows `NavStats` counters and a scrolling recent-events log via the
+  typed `NavListener` API — useful for seeing the coalescing /
+  in-flight / build-ms cadence interactively.
 
 ---
 
@@ -417,6 +560,7 @@ agents only with care — it owns one agent's arc-length state.
 | `rsnav-navigation` | `find_path` | A* + funnel with and without `distance_from_wall`. |
 | `rsnav-navigation` | `visibility_region` | 180-sample sweep from a room with a pillar. |
 | `rsnav-pathing` | `follow_path` | L-shape walk with anti-shortcut on/off. |
+| `rsnav-dynamic` | `live_worker` | Spawn a `NavWorker` with a printing `NavListener`, place a building, demolish it; print stats at the end. |
 
 All run as `cargo run -p <crate> --example <name>`.
 

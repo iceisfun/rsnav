@@ -48,6 +48,22 @@ byte-for-byte against the `triangle` binary's `.ele` output (29 triangles).
                                                               └────────────────────┘
 ```
 
+For game-loop integration with dynamic obstacles, `rsnav-dynamic` wraps the
+pipeline in a background-thread worker that consumes `Bitfield` snapshots
+and publishes results lock-free:
+
+```
+  game thread                                  worker thread (NavWorker)
+  ┌──────────────────────┐                     ┌──────────────────────────────────┐
+  │ edit Bitfield        │                     │  polygon-extract → CDT → navmesh │
+  │ submit_snapshot ─────┼──── coalesce ─────▶ │  → BSP                           │
+  │                      │                     │                                  │
+  │ poll_swap()          │ ◀── ArcSwap ─────── │  publish Arc<NavBuild>           │
+  │   ↳ Arc<NavBuild>    │                     │  dispatch NavEvent → listener    │
+  │ stats() → NavStats   │ ◀── atomics ─────── │  bump counters                   │
+  └──────────────────────┘                     └──────────────────────────────────┘
+```
+
 ## Quick start
 
 ### Interactive demo
@@ -67,6 +83,14 @@ cargo run -p rsnav-fixtures --release -- --testdata ./broken.json -v
 
 `--testdata <PATH>` is a file or a directory of `.json` fixtures; if omitted it defaults to `./testdata`. Prints a status table (triangle count, region count, build_ms per fixture) and exits non-zero on any failure — drop-in for CI.
 
+### Dynamic-obstacles testbed
+
+```
+cargo run -p rsnav-rtsim --release
+```
+
+RTS-style harness: a 128×128 cell bitfield is the ground truth; mouse tools paint walls, clear them, or harvest forest cells one at a time. A background `NavWorker` (from `rsnav-dynamic`) keeps the navmesh in sync by re-running the full pipeline on each bitfield snapshot, coalescing rapid changes so it never falls behind. ~10 agents path between random walkable points and re-plan after every navmesh swap, demonstrating that game systems can keep operating while the mesh churns. The side panel surfaces live worker stats (submitted / coalesced / in-flight / completed / build_ms) and a scrolling event log via the typed `NavListener` API.
+
 ### Programmatic use
 
 Each crate ships a runnable example (`cargo run -p <crate> --example <name>`):
@@ -80,6 +104,7 @@ Each crate ships a runnable example (`cargo run -p <crate> --example <name>`):
 | `rsnav-navigation` | `find_path` | A* + funnel with `distance_from_wall`. |
 | `rsnav-navigation` | `visibility_region` | Star-shaped visibility polygon from a point (sampled). |
 | `rsnav-pathing` | `follow_path` | Simulated agent walking a polyline with lookahead + anti-shortcut. |
+| `rsnav-dynamic` | `live_worker` | Spawn a `NavWorker`, place + demolish an obstacle, print telemetry events. |
 
 ## Crates
 
@@ -92,8 +117,10 @@ Each crate ships a runnable example (`cargo run -p <crate> --example <name>`):
 | `rsnav-bsp` | BVH (AABB-tree) over a `NavMesh`. `locate(point)` and `nearest(point)`, both `O(log n)` average. |
 | `rsnav-navigation` | A* across triangle adjacency, Simple Stupid Funnel string-pull, triangle-walk line-of-sight, nearest-point. `distance_from_wall` rejects narrow portals and pulls portal endpoints inward at wall vertices. |
 | `rsnav-pathing` | `PathFollower`: lookahead + monotone arc-progress projection + anti-shortcut bias at corners. No navmesh dependency — operates on any polyline. |
+| `rsnav-dynamic` | `NavWorker`: background-thread navmesh updates driven by `Bitfield` snapshots, with lock-free `poll_swap` for game loops. Typed `NavListener` events (`BuildStarted` / `Completed` / `Failed`) and a polling `NavStats` accessor for HUDs and ops dashboards. Coalesces rapid submissions — only the newest snapshot is built. |
 | `rsnav-demo` | egui authoring + probing app (the *Quick start* demo above). |
 | `rsnav-fixtures` | CLI runner for `.json` PSLG fixtures (the *Batch-run* tool above). |
+| `rsnav-rtsim` | RTS-style dynamic-obstacles testbed (the *Dynamic-obstacles* app above). |
 
 ## File format
 
