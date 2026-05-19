@@ -138,8 +138,8 @@ Each crate ships a runnable example (`cargo run -p <crate> --example <name>`):
 | `rsnav-common` | `Vertex`, `Polygon`, `Triangle`, `Aabb`, `Mesh2d`, IDs. Geometry helpers (`orient2d`, `incircle`, segment intersection, `Polygon::interior_point` — used for safe hole seeds on concave polygons). |
 | `rsnav-triangle` | Constrained Delaunay triangulator. Faithful Rust port of Shewchuk's `triangle.c` restricted to the `-DCDT_ONLY` subset (no Steiner-point quality refinement, no Voronoi). D&C Delaunay, segment insertion, hole carving, `.poly`/`.node`/`.ele` I/O. |
 | `rsnav-polygon-extract` | Bitfield → `PolygonWithHoles`. 4-connectivity region detection, optional collinear-vertex removal, optional zigzag → diagonal smoothing, min-area culling. |
-| `rsnav-navmesh` | Runtime mesh: flat vertices + triangles, per-triangle adjacency, edge constraint markers, area, centroid, connected-component region IDs. Versioned little-endian binary format ([FORMAT.md](crates/navmesh/FORMAT.md)). |
-| `rsnav-bsp` | BVH (AABB-tree) over a `NavMesh`. `locate(point)` and `nearest(point)`, both `O(log n)` average. |
+| `rsnav-navmesh` | Runtime mesh: flat vertices + triangles, per-triangle adjacency, edge constraint markers, area, centroid, connected-component region IDs. Per-region accessors (triangles / area / centroid / bounds), area-weighted `random_point` sampling for spawns, `boundary_edges` outline iteration. Versioned little-endian binary format ([FORMAT.md](crates/navmesh/FORMAT.md)). |
+| `rsnav-bsp` | BVH (AABB-tree) over a `NavMesh`. `locate(point)` and `nearest(point)`, both `O(log n)` average, plus `query_aabb` broad-phase range queries. |
 | `rsnav-navigation` | A* across triangle adjacency, Simple Stupid Funnel string-pull, triangle-walk line-of-sight, nearest-point. `distance_from_wall` rejects narrow portals and pulls portal endpoints inward at wall vertices. |
 | `rsnav-pathing` | `PathFollower`: lookahead + monotone arc-progress projection + anti-shortcut bias at corners. No navmesh dependency — operates on any polyline. |
 | `rsnav-dynamic` | `NavWorker`: background-thread navmesh updates driven by `Bitfield` snapshots, with lock-free `poll_swap` for game loops. Typed `NavListener` events (`BuildStarted` / `Completed` / `Failed`) and a polling `NavStats` accessor for HUDs and ops dashboards. Coalesces rapid submissions — only the newest snapshot is built. |
@@ -157,7 +157,7 @@ Required sections: `META`, `VERTICES`, `TRIANGLES`. Optional (recomputed if abse
 
 ## Status
 
-Working and tested (~150 tests pass workspace-wide):
+Working and tested (~160 tests pass workspace-wide):
 
 - ✅ CDT round-trip against `triangle.c` reference (`A.poly` → 29 triangles, byte-exact)
 - ✅ 200-point random Delaunay stress passes the empty-circumcircle test

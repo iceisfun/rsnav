@@ -129,6 +129,9 @@ Runtime mesh, `rsnav_navmesh`:
 | --- | --- |
 | `NavMesh { vertices, triangles, aabb, region_count }` | Flat parallel arrays. `to_bytes`/`from_bytes` round-trip exact. Use `nav.reachable(a, b)` as a cheap O(1) "do A* at all?" pre-check. |
 | `NavTriangle { vertices, neighbors, edge_markers, area, centroid, region }` | CCW order. `neighbors[i] == TriangleId::INVALID` ⇒ boundary. `edge_markers[i] != 0` ⇒ constrained edge (the PSLG marker is preserved). `region` is the connected component under "non-wall neighbor". `edge_vertices(i)`, `is_edge_constrained(i)`, `is_edge_boundary(i)`. |
+| `NavMesh::region_triangles(id)` / `region_area(id)` / `region_centroid(id)` / `region_bounds(id)` | Per-region views over the connected-component `region` field: a `TriangleId` iterator, the summed area, the area-weighted centroid, and an `Aabb`. An out-of-range region id is graceful — empty iterator / `0.0` / `None` / `None`. |
+| `NavMesh::random_point(rng)` / `random_point_in_region(region, rng)` | Uniform *area-weighted* random point inside the whole mesh / one region — ideal for spawn placement. `rng` is any `impl FnMut() -> f64` yielding `[0, 1)` (no `rand` dependency); `O(n)` per call. `None` when the (region's) area is zero. |
+| `NavMesh::boundary_edges() -> impl Iterator<Item = BoundaryEdge>` | Every no-neighbor edge — outer rim + hole rims — as `BoundaryEdge { triangle, from, to, marker }`, CCW so the walkable interior is left of `from → to`. For rendering the playable outline / exporting to a PSLG. |
 
 BVH, `rsnav_bsp`:
 
@@ -138,6 +141,7 @@ BVH, `rsnav_bsp`:
 | `Bsp::locate(&nav, p) -> Option<TriangleId>` | Point-in-mesh. `None` outside the mesh / inside a hole. |
 | `Bsp::nearest(&nav, p) -> Option<Nearest>` | Snap to nearest surface point. Always succeeds for non-empty mesh. |
 | `Nearest { triangle, point, distance }` | Distance is 0 when `p` is interior. |
+| `Bsp::query_aabb(aabb, \|tri\| ...)` | Broad-phase range query — visits every triangle whose stored AABB intersects `aabb`, average `O(log n + k)`. Reports a *superset* (a thin triangle has a fat AABB); refine inside the visitor for exact overlap. Doesn't touch the `NavMesh`. For AoE scans, render culling, box-selection. |
 
 Pathing + queries, `rsnav_navigation`:
 
@@ -191,7 +195,7 @@ Multi-agent crowds, `rsnav_crowd`:
 
 | Type / fn | Notes |
 | --- | --- |
-| `Agent { pos, vel, radius, max_speed, priority, goal }` + `Agent::new(pos, radius, max_speed)` | Plain `Copy` snapshot of one agent's externally visible state. `priority` is reserved for v1's chokepoint-yielding rule and ignored by v0 avoidance. `goal == None` ⇒ agent idles and brakes. |
+| `Agent { pos, vel, radius, max_speed, priority, goal }` + `Agent::new(pos, radius, max_speed)` | Plain `Copy` snapshot of one agent's externally visible state. `priority` is right-of-way: higher-priority agents hold their line while lower-priority neighbors yield (default `0.0` everywhere ⇒ no effect). `goal == None` ⇒ agent idles and brakes. |
 | `AgentId(u32)` | Opaque handle, stable across removals (the slab reuses freed indices for new agents but does not shift other ids). |
 | `Goal { target, arrive_radius }` | Agent's goal is cleared automatically once `pos.distance(target) <= arrive_radius`. |
 | `CrowdConfig` | Defaults: `vo_samples = 16`, `neighbor_radius = 6.0`, `time_horizon = 1.5 s`, `stuck_ticks = 60`, `align_weight = 1.0`, `avoid_weight = 2.0`, `arrive_eps = 0.25`. Lower `avoid_weight` for denser crowds, raise it for more cautious agents. |
@@ -613,9 +617,13 @@ layer on top of the primitive.
   `align_weight · alignment − avoid_weight · TTC_penalty` and picks the
   winner. In practice this produces clean lane-forming, side-stepping,
   and head-on resolution; in adversarial cases (dense chokepoints with
-  many agents trying to go opposite directions, every drop-off slot
-  contested simultaneously) agents can brush each other or stall
-  briefly waiting for a slot to free up. Both are v0 limitations.
+  many agents trying to go opposite directions) agents can brush each
+  other or stall briefly. Use [`Agent::priority`] to bias who yields:
+  the TTC penalty against a neighbor is scaled by `2^((other−me)/2)`
+  (clamped to a `[0.25, 4.0]` factor), so a higher-priority unit holds
+  its line and lower-priority ones step aside. Equal priority is the
+  neutral default. A hard, already-overlapping contact is never
+  discounted regardless of priority.
 
 - **`Crowd::set_nav` validates instead of nuking.** It checks whether
   each agent's remaining corridor (`path[cursor..]`) and goal still
