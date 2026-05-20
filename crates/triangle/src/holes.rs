@@ -90,8 +90,9 @@ fn seed_holes(
     infected: &mut [bool],
     worklist: &mut VecDeque<u32>,
 ) {
+    let positions = mesh.vertices_positions();
     for hole in &pslg.holes {
-        if let Some(tri) = locate_triangle(mesh, hole.point) {
+        if let Some(tri) = locate_triangle(mesh, &positions, hole.point) {
             if !infected[tri as usize] {
                 infected[tri as usize] = true;
                 worklist.push_back(tri);
@@ -105,7 +106,7 @@ fn seed_holes(
 /// live triangle that contains `pt` (boundary inclusive). Slow but simple
 /// — fine for a handful of hole seeds; build a BSP first if you need to
 /// hot-loop this on large meshes.
-fn locate_triangle(mesh: &CdtMesh, pt: Vertex) -> Option<u32> {
+fn locate_triangle(mesh: &CdtMesh, positions: &[Vertex], pt: Vertex) -> Option<u32> {
     for tri_idx in 1..mesh.triangles.len() as u32 {
         let slot = mesh.triangle(tri_idx);
         if slot.is_dead() {
@@ -116,7 +117,7 @@ fn locate_triangle(mesh: &CdtMesh, pt: Vertex) -> Option<u32> {
             continue;
         }
         let t = Triangle::new(slot.vertices[0], slot.vertices[1], slot.vertices[2]);
-        if t.contains(&mesh.vertices_positions(), pt) {
+        if t.contains(positions, pt) {
             return Some(tri_idx);
         }
     }
