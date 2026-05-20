@@ -1688,6 +1688,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsnav-door-demo"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "egui",
+ "rsnav-bsp",
+ "rsnav-common",
+ "rsnav-crowd",
+ "rsnav-dynamic",
+ "rsnav-navmesh",
+ "rsnav-polygon-extract",
+]
+
+[[package]]
 name = "rsnav-dynamic"
 version = "0.1.0"
 dependencies = [

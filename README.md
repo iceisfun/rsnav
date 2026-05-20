@@ -115,6 +115,14 @@ cargo run -p rsnav-crowd-demo --release
 
 Small RTS world (town hall + mine + forest blob) on a 96×64 bitfield with a mix of peon roles: **mine peons** loop `mine ring slot → harvest → hall slot → deposit → repeat`, **forest peons** loop `nearest tree → harvest from its walkable neighbor → hall slot → deposit → repeat` (each harvest flips one tree cell back to walkable and the navmesh follows), and a few **wanderers** path to random walkable points to keep the avoidance solver under load. Forest blobs respawn when fully chewed. Side panel has per-role spawn buttons, mine/hall slot usage, forest cells remaining, eviction counter, and the standard `NavWorker` stats. The peon FSM and slot-reservation logic live entirely in the demo — `rsnav-crowd` itself ships only the per-agent crowd primitive.
 
+### Doors testbed
+
+```
+cargo run -p rsnav-door-demo --release
+```
+
+A 76×48 bitfield split into four rooms by a cross of walls, each wall holding two **doors**. A door is a pure obstacle: open, its cells are walkable; closed, they are carved out of the bitfield and the `NavWorker` rebuilds the mesh without the gap. A handful of actors patrol back and forth between two fixed points (`home ⇄ away`); **click a door** on the map — or use the side-panel checkboxes — to open or close it. When a door toggles mid-route, `Crowd::set_nav` revalidates each actor's *remaining* path by line-of-sight: actors the door just blocked drop the stale corridor and replan, unaffected actors keep walking. A fully closed-off actor gets a red ring and retries every tick until a route reopens. `Door::rect` / `Door::horizontal` / `Door::vertical` are the demo's door-authoring helpers.
+
 ### Programmatic use
 
 Each crate ships a runnable example (`cargo run -p <crate> --example <name>`):
@@ -148,6 +156,7 @@ Each crate ships a runnable example (`cargo run -p <crate> --example <name>`):
 | `rsnav-fixtures` | CLI runner for `.json` PSLG fixtures (the *Batch-run* tool above). |
 | `rsnav-rtsim` | RTS-style dynamic-obstacles testbed (the *Dynamic-obstacles* app above). |
 | `rsnav-crowd-demo` | Multi-agent peon-economy testbed (the *Multi-agent crowd* app above). |
+| `rsnav-door-demo` | Togglable-doors testbed (the *Doors* app above). |
 
 ## File format
 

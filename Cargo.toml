@@ -11,6 +11,7 @@ members = [
     "crates/dynamic",
     "crates/crowd",
     "crates/crowd-demo",
+    "crates/door-demo",
     "crates/demo",
     "crates/fixtures",
     "crates/rtsim",

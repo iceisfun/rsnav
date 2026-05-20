@@ -58,6 +58,8 @@ crates/
   rtsim/           rsnav-rtsim           RTS-style dynamic-obstacles testbed
   crowd-demo/      rsnav-crowd-demo      multi-agent peon-economy testbed
                                          (FSM + slot reservation + forest)
+  door-demo/       rsnav-door-demo       togglable-doors testbed
+                                         (walls + doors + patrolling actors)
 ```
 
 Every library crate ships a runnable example in `crates/<name>/examples/`.
@@ -674,6 +676,19 @@ layer on top of the primitive.
   event log. The peon FSM, ring-slot reservation, and opportunistic
   slot stealing live in the demo's `main.rs` and are not part of the
   `rsnav-crowd` library.
+- `cargo run -p rsnav-door-demo --release` — togglable-doors testbed.
+  76×48 cell bitfield split into four rooms by a cross of walls; each
+  wall holds two **doors**. A door is a pure obstacle — open cells are
+  walkable, closed cells are carved out of the bitfield so the
+  `NavWorker` rebuilds the mesh without the gap (the "Option A" door:
+  no mesh-specific code, just a `bool` flip and a resubmit). Actors
+  patrol `home ⇄ away`; click a door (or use the checkboxes) to toggle
+  it. The point of interest: when a door changes mid-route the path
+  generation no longer matches the live mesh, so `Crowd::set_nav`
+  revalidates each actor's remaining `[pos, corners…]` route by
+  line-of-sight and replans only the blocked ones. `Door::rect` /
+  `horizontal` / `vertical` author the doors; all of this lives in the
+  demo's `main.rs`, not the library.
 
 ---
 
@@ -713,6 +728,9 @@ All run as `cargo run -p <crate> --example <name>`.
 - `crates/crowd-demo/src/main.rs` — a worked example of the
   application layer (FSM, ring slots, forest harvest, slot stealing)
   on top of `rsnav-crowd`.
+- `crates/door-demo/src/main.rs` — togglable doors as bitfield
+  obstacles, patrolling actors, and path revalidation across navmesh
+  hot-swaps.
 
 Tests in each file cover the canonical use shape end-to-end and are
 small enough to read top-to-bottom.
