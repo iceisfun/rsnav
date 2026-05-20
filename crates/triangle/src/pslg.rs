@@ -93,12 +93,15 @@ impl Pslg {
     }
 
     /// Collapse exact-position duplicate vertices into single IDs and
-    /// remap every segment endpoint accordingly. Useful preprocessing
-    /// before [`crate::form_skeleton`], because the divide-and-conquer
-    /// Delaunay drops exact-position duplicates from its triangulation
-    /// — if any segment references one of the dropped IDs the segment
-    /// insertion later panics looking for a vertex that's no longer in
-    /// any live triangle.
+    /// remap every segment endpoint accordingly.
+    ///
+    /// This is **optional**. [`crate::form_skeleton`] already builds its
+    /// own position → canonical-ID remap from the triangulation's vertex
+    /// pool and rewrites segment endpoints through it before insertion,
+    /// so duplicate-position vertices in a PSLG no longer break the
+    /// pipeline by themselves. Call this only when you want a
+    /// canonicalised PSLG in its own right — for caching, hashing, or
+    /// handing to another consumer that assumes unique vertex positions.
     ///
     /// Two vertices are considered duplicates only when both coordinates
     /// match bit-for-bit. Attribute and marker mismatches are resolved
