@@ -1,8 +1,22 @@
-//! Pure-function geometry helpers used across crates.
+//! Pure-function 2D geometry helpers shared across the workspace.
 //!
-//! Non-adaptive predicates only — convenient for tests and high-level callers.
-//! The robust adaptive `orient2d` / `incircle` (Shewchuk) lives in the `triangle`
-//! crate where it is actually needed.
+//! Everything here is a free function over [`Vertex`] values — no mesh,
+//! no allocation, no state — so it is equally usable from library code,
+//! from tests, and from downstream callers embedding rsnav.
+//!
+//! - **Predicates:** [`signed_area2`], [`orient2d`], [`incircle`]. These
+//!   are the *non-adaptive* (non-robust) forms — fast and exact enough
+//!   for tests and high-level callers. The robust adaptive `orient2d` /
+//!   `incircle` (Shewchuk) lives in the `triangle` crate, where
+//!   degenerate-input correctness actually matters.
+//! - **Point ↔ segment:** [`on_segment_collinear`],
+//!   [`nearest_point_on_segment`].
+//! - **Segment ↔ segment:** [`segments_intersect`] *classifies* a
+//!   crossing (none / point / collinear overlap); [`segment_intersection`]
+//!   returns the parametric crossing — the `t` / `u` parameters and the
+//!   point — that walking a segment across a mesh needs.
+//! - **Point ↔ triangle:** [`point_in_triangle`] (winding-agnostic,
+//!   boundary inclusive) and [`nearest_point_on_triangle`].
 
 use crate::Vertex;
 

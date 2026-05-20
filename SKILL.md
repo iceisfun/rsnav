@@ -712,8 +712,11 @@ All run as `cargo run -p <crate> --example <name>`.
 
 ## Reading the source when in doubt
 
-- `crates/common/src/{vertex,polygon,triangle,mesh2d,aabb,geom}.rs` —
+- `crates/common/src/{vertex,polygon,triangle,mesh2d,aabb}.rs` —
   data primitives.
+- `crates/common/src/geom.rs` — reusable pure-function geometry toolkit:
+  orient/incircle predicates, segment intersection, point-in-triangle,
+  nearest point on segment/triangle.
 - `crates/triangle/src/lib.rs` — re-exports the user-facing surface
   (`delaunay`, `form_skeleton`, `carve_holes`, the `Pslg` types).
 - `crates/navmesh/src/{navmesh,build,binary}.rs` — runtime mesh, CDT
