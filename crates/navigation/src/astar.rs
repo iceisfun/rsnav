@@ -6,7 +6,7 @@ use std::collections::BinaryHeap;
 use rsnav_common::{TriangleId, Vertex};
 use rsnav_navmesh::NavMesh;
 
-use crate::wall::is_wall_edge_local;
+use crate::wall::{is_wall_edge_local, WallInfo};
 
 #[derive(Copy, Clone, Debug)]
 struct Frontier {
@@ -50,11 +50,18 @@ pub enum AstarError {
 ///
 /// Edges considered for traversal:
 /// - Not a wall (constrained or boundary).
-/// - Edge length > `min_portal_width` (when `min_portal_width > 0`).
+/// - Wide enough for the agent body: when `min_portal_width > 0`, the
+///   portal edge must be longer than the inward shift the funnel will
+///   apply to it — `min_portal_width` for *each* endpoint that is a
+///   wall vertex (so a portal flanked by two walls needs more than
+///   `2 * min_portal_width`). This keeps A*'s route choice in lockstep
+///   with [`crate::funnel`]'s clearance model: A* never commits to a
+///   corridor the funnel would have to collapse to a sub-body-width gap.
 ///
 /// The returned vector starts with `start` and ends with `goal`.
 pub fn astar(
     nav: &NavMesh,
+    walls: &WallInfo,
     start: TriangleId,
     goal: TriangleId,
     goal_point: Vertex,
@@ -100,7 +107,14 @@ pub fn astar(
                 );
                 let pa = nav.vertex(va);
                 let pb = nav.vertex(vb);
-                if pa.distance(pb) <= min_portal_width {
+                // The funnel pulls each portal endpoint that is a wall
+                // vertex inward by `min_portal_width`; the width the
+                // agent body can actually use is the edge length minus
+                // those shifts. Reject a portal that leaves no room.
+                // Mirrors `funnel::oriented_portal` exactly.
+                let needed = (if walls.is_wall_vertex(va) { min_portal_width } else { 0.0 })
+                    + (if walls.is_wall_vertex(vb) { min_portal_width } else { 0.0 });
+                if pa.distance(pb) <= needed {
                     continue;
                 }
             }

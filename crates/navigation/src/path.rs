@@ -12,16 +12,23 @@ use crate::wall::WallInfo;
 /// Options that tune `find_path`.
 #[derive(Copy, Clone, Debug)]
 pub struct PathOptions {
-    /// Minimum desired clearance from any constrained / boundary edge.
-    /// When `> 0`:
-    /// - A* rejects portals whose edge length is `<= distance_from_wall`
-    ///   (an agent of that "radius" wouldn't fit through).
+    /// Agent clearance radius — how far the routed path is kept from
+    /// any constrained / boundary edge. Models a disc-shaped agent of
+    /// this radius. When `> 0`:
+    /// - A* rejects a portal unless it is wide enough for the agent
+    ///   *body* to pass: the edge length must exceed the inward shift
+    ///   the funnel will apply — `distance_from_wall` for each portal
+    ///   endpoint that is a wall vertex. A portal flanked by two walls
+    ///   therefore needs more than `2 * distance_from_wall` of width.
     /// - Funnel shifts each portal endpoint that sits on a wall vertex
     ///   inward along the portal by `distance_from_wall`. When both
     ///   endpoints are wall vertices and the portal is too short to
     ///   accommodate both shifts, the portal collapses to its midpoint
     ///   (the path is forced through the narrow gap but never crosses
     ///   the wall).
+    ///
+    /// The two stages share one wall-vertex set, so A* never routes
+    /// through a corridor the funnel would collapse below body width.
     pub distance_from_wall: f64,
 }
 
@@ -65,12 +72,16 @@ pub fn find_path(
     let start_tri = bsp.locate(nav, start).ok_or(PathError::StartOutsideMesh)?;
     let goal_tri = bsp.locate(nav, goal).ok_or(PathError::GoalOutsideMesh)?;
 
-    let triangles = astar(nav, start_tri, goal_tri, goal, opts.distance_from_wall)
+    // Built once and shared by A* and the funnel so the two stages
+    // apply the *same* clearance model — A* won't route through a
+    // portal the funnel would then have to collapse.
+    let walls = WallInfo::from_navmesh(nav);
+
+    let triangles = astar(nav, &walls, start_tri, goal_tri, goal, opts.distance_from_wall)
         .map_err(|e| match e {
             AstarError::UnreachableRegion | AstarError::Unreachable => PathError::Unreachable,
         })?;
 
-    let walls = WallInfo::from_navmesh(nav);
     let points = funnel(nav, &walls, &triangles, start, goal, opts.distance_from_wall);
 
     Ok(PathResult { points, triangles })
@@ -345,6 +356,29 @@ mod tests {
         // span the corridor, the goal is unreachable.
         let (nav, bsp) = build_squeeze_navmesh(0.4);
         let opts = PathOptions { distance_from_wall: 0.5 };
+        let err = find_path(
+            &nav,
+            &bsp,
+            Vertex::new(1.0, 2.0),
+            Vertex::new(9.0, 2.0),
+            &opts,
+        )
+        .unwrap_err();
+        assert_eq!(err, PathError::Unreachable);
+    }
+
+    #[test]
+    fn distance_from_wall_blocks_portal_narrower_than_body() {
+        // Regression: A* clearance must reject a portal the agent's
+        // *body* can't fit through, not just one narrower than a single
+        // radius. squeeze_width = 0.7 with clearance 0.4: the pinch is
+        // wider than one radius (0.4) but narrower than the full body
+        // span the funnel reserves (0.4 on each wall-vertex side = 0.8).
+        // The agent cannot pass, so A* must report the goal unreachable.
+        // Before the fix A* only rejected portals `<= 0.4` and would
+        // route a doomed path straight into the pinch.
+        let (nav, bsp) = build_squeeze_navmesh(0.7);
+        let opts = PathOptions { distance_from_wall: 0.4 };
         let err = find_path(
             &nav,
             &bsp,
