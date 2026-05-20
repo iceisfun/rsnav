@@ -100,6 +100,12 @@ pub fn find_path(
 /// straight leg between them blocked. `path_clear` walks each segment
 /// with [`line_of_sight`], so it catches that case.
 ///
+/// Only a definitive [`LineOfSightResult::Clear`] passes a segment — a
+/// blocked, off-mesh, or [`LineOfSightResult::Indeterminate`] (the walk
+/// hit a numerical degeneracy) result all fail it, so an uncertain
+/// check conservatively triggers a replan rather than trusting a stale
+/// corridor.
+///
 /// Pass only the part of the route the agent has yet to traverse —
 /// typically `[agent_pos, remaining_corners..]`. A `false` result
 /// means: replan. Returns `true` for an empty or single-point slice

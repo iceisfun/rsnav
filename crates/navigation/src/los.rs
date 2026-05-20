@@ -19,11 +19,23 @@ pub enum LineOfSightResult {
     /// `from` is not inside any triangle of the mesh, so we can't even
     /// start the walk.
     SourceOutsideMesh,
+    /// The triangle walk hit a numerical degeneracy — the segment grazed
+    /// a vertex or ran collinear with a triangle edge — or its step cap
+    /// before it could reach `to`. Whether the segment is actually clear
+    /// is **unknown**: callers must treat this conservatively (replan
+    /// the route, stop a visibility ray short, etc.). It exists as its
+    /// own variant precisely so an uncertain walk can't masquerade as a
+    /// verified-clear one — reporting `Clear` here would be a silent
+    /// false negative in exactly the dangerous direction.
+    Indeterminate,
 }
 
 /// Walk the directed segment `from → to` through the mesh, starting in
-/// `start_tri` (which must contain `from`). Returns the first wall hit
-/// or `Clear` if the whole segment is inside walkable space.
+/// `start_tri` (which must contain `from`). Returns the first wall hit,
+/// `Clear` if the whole segment is inside walkable space, or
+/// `Indeterminate` if a numerical degeneracy stopped the walk before it
+/// could decide (see [`LineOfSightResult::Indeterminate`] — treat it as
+/// "not clear").
 ///
 /// `from` must lie inside `start_tri`. Callers typically obtain
 /// `start_tri` via `bsp.locate(from)`.
@@ -77,9 +89,12 @@ pub fn line_of_sight(
         let (edge, hit, _t) = match best_edge {
             Some(v) => v,
             None => {
-                // No exit and `to` isn't inside — numerical issue; treat
-                // as clear to avoid livelock. This is conservative.
-                return LineOfSightResult::Clear;
+                // No exit edge found, yet `to` isn't inside this
+                // triangle either: the segment grazed a vertex or ran
+                // collinear with an edge. We genuinely cannot tell if
+                // the rest of the segment is clear — say so, rather
+                // than claiming `Clear` and hiding a possible wall.
+                return LineOfSightResult::Indeterminate;
             }
         };
 
@@ -94,7 +109,9 @@ pub fn line_of_sight(
         }
         cur_tri = neighbor;
     }
-    LineOfSightResult::Clear
+    // Step cap reached without arriving at `to` — a numerical cycle in
+    // the walk. Don't claim the segment is clear; report the uncertainty.
+    LineOfSightResult::Indeterminate
 }
 
 /// Point-in-triangle for the navmesh's CCW triangles (boundary inclusive).

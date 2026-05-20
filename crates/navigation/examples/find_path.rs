@@ -60,6 +60,9 @@ fn main() {
             println!("    Blocked at ({:.3}, {:.3})", point.x, point.y)
         }
         LineOfSightResult::SourceOutsideMesh => println!("    Source outside mesh"),
+        LineOfSightResult::Indeterminate => {
+            println!("    Indeterminate (degenerate walk — treat as not clear)")
+        }
     }
 }
 

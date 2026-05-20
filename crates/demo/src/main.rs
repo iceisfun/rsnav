@@ -1028,6 +1028,10 @@ impl DemoApp {
                             LineOfSightResult::SourceOutsideMesh => {
                                 (Color32::from_gray(120), np.point)
                             }
+                            // Degenerate walk — amber, treat as uncertain.
+                            LineOfSightResult::Indeterminate => {
+                                (Color32::from_rgb(220, 180, 80), np.point)
+                            }
                         };
                         painter.line_segment(
                             [

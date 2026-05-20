@@ -63,6 +63,12 @@ pub fn visibility_region(
             LineOfSightResult::Blocked { point } => point,
             // Unreachable in practice — we just located src_tri.
             LineOfSightResult::SourceOutsideMesh => endpoint,
+            // A degenerate ray (grazed a vertex / ran along an edge):
+            // keep it at full length. The region is already an
+            // approximation, and a spurious *short* ray would punch a
+            // visible notch into the polygon, whereas a spurious long
+            // one just slightly over-reports an open direction.
+            LineOfSightResult::Indeterminate => endpoint,
         };
         boundary.push(hit);
     }
