@@ -14,11 +14,19 @@
 //! line-of-sight. Actors whose corridor the door just blocked drop
 //! their stale route and replan; unaffected actors keep walking.
 //!
-//! That last point is the headline: a path is planned against one
-//! navmesh generation, but the world keeps changing under it. When the
-//! path generation no longer matches the live navmesh, the still-valid
-//! tail of the route is kept and the blocked remainder is replanned —
-//! no global replan storm, no actor frozen on a stale corridor.
+//! When closing a door seals a room into its own navmesh region, an
+//! actor's patrol target can land on the far side of a wall it can no
+//! longer cross. Rather than freeze, the actor *reroutes*: it picks a
+//! random point inside its own region ([`NavMesh::random_point_in_region`])
+//! and patrols that instead, drawing a fresh in-region point each time
+//! it arrives. The `home`/`away` endpoints are never discarded, so the
+//! moment the door reopens the original patrol resumes.
+//!
+//! That is the headline: a path is planned against one navmesh
+//! generation, but the world keeps changing under it. The still-valid
+//! tail of a route is kept and only the blocked remainder is replanned;
+//! and when a target becomes wholly unreachable the actor stays busy on
+//! a reachable detour rather than stalling on a stale corridor.
 //!
 //! Conventions: 1 world unit = 1 cell; math-up Y (row 0 at the bottom),
 //! flipped for egui in [`world_to_screen`].
@@ -209,6 +217,12 @@ struct Actor {
     away: Vertex,
     /// `true` while the current goal is `away`.
     heading_away: bool,
+    /// `true` while the actor is detoured onto a temporary in-region
+    /// goal because a closed door sealed its patrol target into a
+    /// different navmesh region. The `home`/`away` endpoints are kept
+    /// untouched; the normal patrol resumes the moment the door
+    /// reopens and the target rejoins the actor's region.
+    wandering: bool,
 }
 
 // =========================================================================
@@ -340,6 +354,7 @@ impl DoorDemoApp {
             home,
             away,
             heading_away: true,
+            wandering: false,
         });
     }
 
@@ -379,43 +394,115 @@ impl DoorDemoApp {
 
     // -- Patrol -----------------------------------------------------------
 
-    /// Flip any actor that has reached its destination onto the next
-    /// leg. The `Crowd` clears `agent.goal` on arrival, so a `None`
-    /// goal means "arrived" — and an actor blocked by a shut door
-    /// keeps its goal (and so keeps retrying) until the door reopens.
+    /// Drive each actor's patrol, rerouting around sealed rooms.
+    ///
+    /// Normal case: `home ⇄ away`, flipping on arrival (the `Crowd`
+    /// clears `agent.goal` on arrival, so a `None` goal means
+    /// "arrived"). When a closed door carves the current patrol target
+    /// into a *different* navmesh region the actor can no longer reach
+    /// it — rather than freeze, it picks a random point inside its own
+    /// region ([`NavMesh::random_point_in_region`]) and patrols that,
+    /// drawing a fresh in-region point each time it arrives. The
+    /// `home`/`away` endpoints are left untouched, so the moment a door
+    /// reopens and the target rejoins the actor's region the normal
+    /// patrol resumes on the leg it was on.
     fn tick_actors(&mut self) {
+        let Some(build) = self.current_build.clone() else {
+            return;
+        };
+        let nav = &build.navmesh;
+        let bsp = &build.bsp;
+
         for i in 0..self.actors.len() {
             let id = self.actors[i].id;
-            let arrived = self
+            // Copy out the fields we need so the immutable `Crowd`
+            // borrow is released before any `set_goal` below.
+            let Some((agent_pos, arrived)) = self
                 .crowd
                 .agent(id)
-                .map(|a| a.goal.is_none())
-                .unwrap_or(false);
-            if arrived {
-                self.actors[i].heading_away = !self.actors[i].heading_away;
-                let target = if self.actors[i].heading_away {
-                    self.actors[i].away
-                } else {
-                    self.actors[i].home
-                };
-                self.crowd.set_goal(
-                    id,
-                    Some(Goal {
-                        target,
-                        arrive_radius: ARRIVE_RADIUS,
-                    }),
-                );
+                .map(|a| (a.pos, a.goal.is_none()))
+            else {
+                continue;
+            };
+            let patrol_target = if self.actors[i].heading_away {
+                self.actors[i].away
+            } else {
+                self.actors[i].home
+            };
+
+            // Is the patrol target in the same navmesh region as the
+            // actor right now? `None` if either point fails to locate
+            // (momentarily off-mesh) — leave the actor alone that frame.
+            let patrol_reachable = match (
+                bsp.locate(nav, agent_pos),
+                bsp.locate(nav, patrol_target),
+            ) {
+                (Some(a), Some(b)) => Some(nav.reachable(a, b)),
+                _ => None,
+            };
+
+            match patrol_reachable {
+                // Target reachable — run the normal patrol.
+                Some(true) => {
+                    if self.actors[i].wandering {
+                        // A door reopened: drop the detour, head back
+                        // to the real patrol target.
+                        self.actors[i].wandering = false;
+                        self.set_actor_goal(id, patrol_target);
+                    } else if arrived {
+                        // Reached the patrol target — flip the leg.
+                        self.actors[i].heading_away = !self.actors[i].heading_away;
+                        let next = if self.actors[i].heading_away {
+                            self.actors[i].away
+                        } else {
+                            self.actors[i].home
+                        };
+                        self.set_actor_goal(id, next);
+                    }
+                }
+                // Target sealed into another region — wander this
+                // actor's own region. Pick a fresh in-region point on
+                // entry and on every arrival; keep walking an in-flight
+                // detour otherwise.
+                Some(false) => {
+                    if !self.actors[i].wandering || arrived {
+                        if let Some(p) = self.region_point_at(nav, bsp, agent_pos) {
+                            self.actors[i].wandering = true;
+                            self.set_actor_goal(id, p);
+                        }
+                    }
+                }
+                // Couldn't locate the actor or its target — skip a frame.
+                None => {}
             }
         }
     }
 
-    /// Count actors whose last replan failed — i.e. the door(s) on
-    /// every route to their goal are shut.
-    fn blocked_count(&self) -> usize {
-        self.actors
-            .iter()
-            .filter(|a| self.crowd.plan_failed(a.id))
-            .count()
+    /// Set an actor's crowd goal to `target` with the patrol arrive
+    /// radius.
+    fn set_actor_goal(&mut self, id: AgentId, target: Vertex) {
+        self.crowd.set_goal(
+            id,
+            Some(Goal {
+                target,
+                arrive_radius: ARRIVE_RADIUS,
+            }),
+        );
+    }
+
+    /// A random point inside the navmesh region that contains `from` —
+    /// a guaranteed in-region (hence reachable) detour goal. `None` if
+    /// `from` is off-mesh or its region is somehow empty.
+    fn region_point_at(&mut self, nav: &NavMesh, bsp: &Bsp, from: Vertex) -> Option<Vertex> {
+        let tri = bsp.locate(nav, from)?;
+        let region = nav.triangle(tri).region;
+        nav.random_point_in_region(region, || self.rng.unit_f64())
+    }
+
+    /// Count actors currently rerouted onto a temporary in-region goal
+    /// because a closed door sealed their patrol target off.
+    fn rerouted_count(&self) -> usize {
+        self.actors.iter().filter(|a| a.wandering).count()
     }
 
     // -- Doors ------------------------------------------------------------
@@ -616,9 +703,10 @@ impl DoorDemoApp {
 
                 let p = world_to_screen(rect, agent.pos);
                 let r_px = (s * agent.radius as f32).max(2.5);
-                // A blocked actor (every route shut) gets a red ring.
-                let outline = if self.crowd.plan_failed(actor.id) {
-                    Color32::from_rgb(230, 70, 70)
+                // An actor rerouted around a sealed door (patrolling a
+                // temporary in-region point) gets an amber ring.
+                let outline = if actor.wandering {
+                    Color32::from_rgb(235, 170, 60)
                 } else {
                     Color32::BLACK
                 };
@@ -665,14 +753,14 @@ impl DoorDemoApp {
         ui.add_space(8.0);
         ui.separator();
         ui.heading("Actors");
-        ui.label(format!("count   : {}", self.actors.len()));
-        let blocked = self.blocked_count();
-        let blocked_color = if blocked > 0 {
-            Color32::from_rgb(230, 120, 120)
+        ui.label(format!("count    : {}", self.actors.len()));
+        let rerouted = self.rerouted_count();
+        let rerouted_color = if rerouted > 0 {
+            Color32::from_rgb(235, 170, 60)
         } else {
             Color32::from_gray(170)
         };
-        ui.colored_label(blocked_color, format!("blocked : {blocked}"));
+        ui.colored_label(rerouted_color, format!("rerouted : {rerouted}"));
         ui.horizontal(|ui| {
             if ui.button("+1").clicked() {
                 self.spawn_actor();
@@ -759,7 +847,9 @@ impl DoorDemoApp {
             egui::RichText::new(
                 "Closing a door carves the navmesh; Crowd::set_nav \
                  revalidates each actor's remaining path by \
-                 line-of-sight and replans only the blocked ones.",
+                 line-of-sight. An actor whose patrol target is sealed \
+                 into another region reroutes within its own region \
+                 (amber ring) until the door reopens.",
             )
             .small()
             .color(Color32::from_gray(140)),
