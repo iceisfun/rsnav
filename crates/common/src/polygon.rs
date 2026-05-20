@@ -176,7 +176,7 @@ impl Polygon {
                 if j == prev_idx || j == i || j == next_idx {
                     continue;
                 }
-                if point_in_tri_inclusive(a, b, c, self.vertices[j]) {
+                if geom::point_in_triangle(a, b, c, self.vertices[j]) {
                     clear = false;
                     break;
                 }
@@ -223,16 +223,6 @@ impl From<Vec<Vertex>> for Polygon {
     fn from(vertices: Vec<Vertex>) -> Self {
         Self { vertices }
     }
-}
-
-#[inline]
-fn point_in_tri_inclusive(a: Vertex, b: Vertex, c: Vertex, p: Vertex) -> bool {
-    let d1 = geom::orient2d(a, b, p);
-    let d2 = geom::orient2d(b, c, p);
-    let d3 = geom::orient2d(c, a, p);
-    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
-    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
-    !(has_neg && has_pos)
 }
 
 /// An outer ring with zero or more interior holes.

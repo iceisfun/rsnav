@@ -125,6 +125,93 @@ pub fn nearest_point_on_segment(a: Vertex, b: Vertex, p: Vertex) -> Vertex {
     a + ab * t
 }
 
+/// Tests whether point `p` lies inside triangle `(a, b, c)`, boundary
+/// **inclusive**. Winding-agnostic — works for both CW and CCW triangles.
+#[inline]
+pub fn point_in_triangle(a: Vertex, b: Vertex, c: Vertex, p: Vertex) -> bool {
+    let d1 = orient2d(a, b, p);
+    let d2 = orient2d(b, c, p);
+    let d3 = orient2d(c, a, p);
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(has_neg && has_pos)
+}
+
+/// Closest point on triangle `(a, b, c)` to `p`, paired with the
+/// euclidean distance to it.
+///
+/// Returns `(p, 0.0)` when `p` is inside or on the boundary; otherwise
+/// the closest point lies on whichever of the three edges is nearest.
+/// Winding-agnostic.
+pub fn nearest_point_on_triangle(
+    a: Vertex,
+    b: Vertex,
+    c: Vertex,
+    p: Vertex,
+) -> (Vertex, f64) {
+    if point_in_triangle(a, b, c, p) {
+        return (p, 0.0);
+    }
+    let candidates = [
+        nearest_point_on_segment(a, b, p),
+        nearest_point_on_segment(b, c, p),
+        nearest_point_on_segment(c, a, p),
+    ];
+    let mut best = (candidates[0], candidates[0].distance(p));
+    for cand in &candidates[1..] {
+        let d = cand.distance(p);
+        if d < best.1 {
+            best = (*cand, d);
+        }
+    }
+    best
+}
+
+/// A proper (non-parallel) crossing of two segments — see
+/// [`segment_intersection`].
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct SegmentHit {
+    /// Parameter of the hit along the first segment, in `[0, 1]`.
+    pub t: f64,
+    /// Parameter of the hit along the second segment, in `[0, 1]`.
+    pub u: f64,
+    /// The intersection point.
+    pub point: Vertex,
+}
+
+/// Parametric intersection of segments `(a1, a2)` and `(b1, b2)`.
+///
+/// Returns `None` when the segments are parallel or collinear, or when
+/// they would cross outside either segment's `[0, 1]` range. Unlike
+/// [`segments_intersect`] — which *classifies* the intersection and
+/// reports collinear overlap — this yields the crossing parameters,
+/// which a caller walking a segment across a mesh needs.
+pub fn segment_intersection(
+    a1: Vertex,
+    a2: Vertex,
+    b1: Vertex,
+    b2: Vertex,
+) -> Option<SegmentHit> {
+    let r = a2 - a1;
+    let s = b2 - b1;
+    let denom = r.x * s.y - r.y * s.x;
+    if denom == 0.0 {
+        return None; // parallel or collinear
+    }
+    let q_p = b1 - a1;
+    let t = (q_p.x * s.y - q_p.y * s.x) / denom;
+    let u = (q_p.x * r.y - q_p.y * r.x) / denom;
+    let unit = 0.0..=1.0;
+    if !unit.contains(&t) || !unit.contains(&u) {
+        return None;
+    }
+    Some(SegmentHit {
+        t,
+        u,
+        point: Vertex::new(a1.x + t * r.x, a1.y + t * r.y),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +287,51 @@ mod tests {
         assert_eq!(
             nearest_point_on_segment(v(0.0, 0.0), v(10.0, 0.0), v(3.0, 7.0)),
             v(3.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn point_in_triangle_inclusive_any_winding() {
+        let a = v(0.0, 0.0);
+        let b = v(4.0, 0.0);
+        let c = v(0.0, 4.0);
+        // Interior, on an edge, and at a vertex all count as inside.
+        assert!(point_in_triangle(a, b, c, v(1.0, 1.0)));
+        assert!(point_in_triangle(a, b, c, v(2.0, 0.0)));
+        assert!(point_in_triangle(a, b, c, a));
+        assert!(!point_in_triangle(a, b, c, v(3.0, 3.0)));
+        // Same answers for the clockwise winding.
+        assert!(point_in_triangle(a, c, b, v(1.0, 1.0)));
+        assert!(!point_in_triangle(a, c, b, v(3.0, 3.0)));
+    }
+
+    #[test]
+    fn nearest_point_on_triangle_inside_and_outside() {
+        let a = v(0.0, 0.0);
+        let b = v(4.0, 0.0);
+        let c = v(0.0, 4.0);
+        let (pt, d) = nearest_point_on_triangle(a, b, c, v(1.0, 1.0));
+        assert_eq!(pt, v(1.0, 1.0));
+        assert_eq!(d, 0.0);
+        // A point below the a–b edge snaps onto it.
+        let (pt, d) = nearest_point_on_triangle(a, b, c, v(2.0, -3.0));
+        assert!(pt.approx_eq(v(2.0, 0.0), 1e-12));
+        assert!((d - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn segment_intersection_crossing_and_parallel() {
+        let hit = segment_intersection(v(0.0, 0.0), v(2.0, 2.0), v(0.0, 2.0), v(2.0, 0.0))
+            .expect("segments cross");
+        assert!(hit.point.approx_eq(v(1.0, 1.0), 1e-12));
+        assert!((hit.t - 0.5).abs() < 1e-12 && (hit.u - 0.5).abs() < 1e-12);
+        // Parallel: no crossing.
+        assert!(
+            segment_intersection(v(0.0, 0.0), v(2.0, 0.0), v(0.0, 1.0), v(2.0, 1.0)).is_none()
+        );
+        // Infinite lines cross, but outside both segments' [0,1] range.
+        assert!(
+            segment_intersection(v(0.0, 0.0), v(1.0, 0.0), v(5.0, -1.0), v(5.0, 1.0)).is_none()
         );
     }
 }

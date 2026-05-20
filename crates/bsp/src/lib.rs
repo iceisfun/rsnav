@@ -150,7 +150,7 @@ impl Bsp {
                     let p0 = mesh.vertex(tri.vertices[0]);
                     let p1 = mesh.vertex(tri.vertices[1]);
                     let p2 = mesh.vertex(tri.vertices[2]);
-                    if point_in_triangle_ccw(p0, p1, p2, p) {
+                    if geom::point_in_triangle(p0, p1, p2, p) {
                         return Some(TriangleId::new(tri_idx));
                     }
                 }
@@ -191,7 +191,7 @@ impl Bsp {
         // Prune: if even the closest point on this node's AABB is farther
         // than our current best, the whole subtree is hopeless.
         if *have_any {
-            let lower_bound = aabb_distance(node_aabb, p);
+            let lower_bound = node_aabb.distance_to_point(p);
             if lower_bound >= best.distance {
                 return;
             }
@@ -200,18 +200,14 @@ impl Bsp {
             BspNode::Internal { left, right, .. } => {
                 // Descend into the closer child first so the better bound
                 // can prune the farther child sooner.
-                let dl = aabb_distance(
-                    match &self.nodes[left as usize] {
-                        BspNode::Internal { aabb, .. } | BspNode::Leaf { aabb, .. } => *aabb,
-                    },
-                    p,
-                );
-                let dr = aabb_distance(
-                    match &self.nodes[right as usize] {
-                        BspNode::Internal { aabb, .. } | BspNode::Leaf { aabb, .. } => *aabb,
-                    },
-                    p,
-                );
+                let left_aabb = match &self.nodes[left as usize] {
+                    BspNode::Internal { aabb, .. } | BspNode::Leaf { aabb, .. } => *aabb,
+                };
+                let right_aabb = match &self.nodes[right as usize] {
+                    BspNode::Internal { aabb, .. } | BspNode::Leaf { aabb, .. } => *aabb,
+                };
+                let dl = left_aabb.distance_to_point(p);
+                let dr = right_aabb.distance_to_point(p);
                 let (first, second) = if dl <= dr { (left, right) } else { (right, left) };
                 self.nearest_in(first, mesh, p, best, have_any);
                 self.nearest_in(second, mesh, p, best, have_any);
@@ -223,7 +219,7 @@ impl Bsp {
                     let p0 = mesh.vertex(tri.vertices[0]);
                     let p1 = mesh.vertex(tri.vertices[1]);
                     let p2 = mesh.vertex(tri.vertices[2]);
-                    let (closest, d) = nearest_point_on_triangle(p0, p1, p2, p);
+                    let (closest, d) = geom::nearest_point_on_triangle(p0, p1, p2, p);
                     if !*have_any || d < best.distance {
                         *best = Nearest {
                             triangle: TriangleId::new(tri_idx),
@@ -281,56 +277,6 @@ impl Bsp {
             }
         }
     }
-}
-
-// --- Geometry helpers ----------------------------------------------------
-
-/// Point-in-triangle for a CCW triangle. Boundary is inclusive.
-#[inline]
-fn point_in_triangle_ccw(a: Vertex, b: Vertex, c: Vertex, p: Vertex) -> bool {
-    let d1 = geom::orient2d(a, b, p);
-    let d2 = geom::orient2d(b, c, p);
-    let d3 = geom::orient2d(c, a, p);
-    d1 >= 0.0 && d2 >= 0.0 && d3 >= 0.0
-}
-
-/// Closest point on triangle `(a, b, c)` to `p`, plus the euclidean
-/// distance. Works whether `p` is inside or outside the triangle.
-fn nearest_point_on_triangle(a: Vertex, b: Vertex, c: Vertex, p: Vertex) -> (Vertex, f64) {
-    // Inside test using the non-robust orient. (We're computing a numeric
-    // distance — exact sign of zero is fine.)
-    let d1 = geom::orient2d(a, b, p);
-    let d2 = geom::orient2d(b, c, p);
-    let d3 = geom::orient2d(c, a, p);
-    let inside = d1 >= 0.0 && d2 >= 0.0 && d3 >= 0.0;
-    let inside_cw = d1 <= 0.0 && d2 <= 0.0 && d3 <= 0.0;
-    if inside || inside_cw {
-        return (p, 0.0);
-    }
-    // Outside: closest point is on one of the three edges.
-    let candidates = [
-        geom::nearest_point_on_segment(a, b, p),
-        geom::nearest_point_on_segment(b, c, p),
-        geom::nearest_point_on_segment(c, a, p),
-    ];
-    let mut best = (candidates[0], candidates[0].distance(p));
-    for c in &candidates[1..] {
-        let d = c.distance(p);
-        if d < best.1 {
-            best = (*c, d);
-        }
-    }
-    best
-}
-
-/// Euclidean distance from point `p` to the closest point on AABB `a`. Zero
-/// when `p` is inside (or on the boundary of) `a`.
-fn aabb_distance(a: Aabb, p: Vertex) -> f64 {
-    let cx = p.x.max(a.min.x).min(a.max.x);
-    let cy = p.y.max(a.min.y).min(a.max.y);
-    let dx = p.x - cx;
-    let dy = p.y - cy;
-    (dx * dx + dy * dy).sqrt()
 }
 
 // --- Tests ---------------------------------------------------------------
@@ -445,7 +391,7 @@ mod tests {
             let p0 = nav.vertex(tri.vertices[0]);
             let p1 = nav.vertex(tri.vertices[1]);
             let p2 = nav.vertex(tri.vertices[2]);
-            if point_in_triangle_ccw(p0, p1, p2, p) {
+            if geom::point_in_triangle(p0, p1, p2, p) {
                 return Some(TriangleId::new(i as u32));
             }
         }
@@ -535,7 +481,7 @@ mod tests {
             let p0 = nav.vertex(tri.vertices[0]);
             let p1 = nav.vertex(tri.vertices[1]);
             let p2 = nav.vertex(tri.vertices[2]);
-            let (close, d) = nearest_point_on_triangle(p0, p1, p2, p);
+            let (close, d) = geom::nearest_point_on_triangle(p0, p1, p2, p);
             if best.map_or(true, |b| d < b.distance) {
                 best = Some(Nearest {
                     triangle: TriangleId::new(i as u32),

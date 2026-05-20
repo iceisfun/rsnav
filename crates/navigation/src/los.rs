@@ -2,6 +2,7 @@
 //! stopping at the first constrained / boundary edge that the segment
 //! would cross.
 
+use rsnav_common::geom::{point_in_triangle, segment_intersection};
 use rsnav_common::{TriangleId, Vertex};
 use rsnav_navmesh::NavMesh;
 
@@ -76,12 +77,12 @@ pub fn line_of_sight(
             );
             let pa = nav.vertex(va);
             let pb = nav.vertex(vb);
-            if let Some((t_seg, hit)) = segment_segment_intersect(from, to, pa, pb) {
-                if t_seg < -1e-9 {
+            if let Some(hit) = segment_intersection(from, to, pa, pb) {
+                if hit.t < -1e-9 {
                     continue;
                 }
-                if best_edge.map_or(true, |(_, _, t)| t_seg > t) {
-                    best_edge = Some((edge, hit, t_seg));
+                if best_edge.map_or(true, |(_, _, t)| hit.t > t) {
+                    best_edge = Some((edge, hit.point, hit.t));
                 }
             }
         }
@@ -120,32 +121,5 @@ fn triangle_contains(nav: &NavMesh, tri_id: TriangleId, p: Vertex) -> bool {
     let a = nav.vertex(tri.vertices[0]);
     let b = nav.vertex(tri.vertices[1]);
     let c = nav.vertex(tri.vertices[2]);
-    let d1 = rsnav_common::geom::orient2d(a, b, p);
-    let d2 = rsnav_common::geom::orient2d(b, c, p);
-    let d3 = rsnav_common::geom::orient2d(c, a, p);
-    d1 >= 0.0 && d2 >= 0.0 && d3 >= 0.0
-}
-
-/// Solve for the intersection point of segments `(a1, a2)` and `(b1, b2)`.
-/// Returns `(t along a, intersection)` or `None` if they don't cross
-/// (including the parallel/collinear cases).
-fn segment_segment_intersect(
-    a1: Vertex,
-    a2: Vertex,
-    b1: Vertex,
-    b2: Vertex,
-) -> Option<(f64, Vertex)> {
-    let r = a2 - a1;
-    let s = b2 - b1;
-    let denom = r.x * s.y - r.y * s.x;
-    if denom == 0.0 {
-        return None; // parallel or collinear
-    }
-    let q_p = b1 - a1;
-    let t = (q_p.x * s.y - q_p.y * s.x) / denom;
-    let u = (q_p.x * r.y - q_p.y * r.x) / denom;
-    if t < 0.0 || t > 1.0 || u < 0.0 || u > 1.0 {
-        return None;
-    }
-    Some((t, Vertex::new(a1.x + t * r.x, a1.y + t * r.y)))
+    point_in_triangle(a, b, c, p)
 }

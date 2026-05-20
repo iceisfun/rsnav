@@ -94,6 +94,17 @@ impl Aabb {
             (self.min.y + self.max.y) * 0.5,
         )
     }
+
+    /// Euclidean distance from `p` to the closest point on the box.
+    /// Zero when `p` is inside it or on its boundary.
+    #[inline]
+    pub fn distance_to_point(&self, p: Vertex) -> f64 {
+        let cx = p.x.max(self.min.x).min(self.max.x);
+        let cy = p.y.max(self.min.y).min(self.max.y);
+        let dx = p.x - cx;
+        let dy = p.y - cy;
+        (dx * dx + dy * dy).sqrt()
+    }
 }
 
 #[cfg(test)]
@@ -125,6 +136,15 @@ mod tests {
         assert!(!a.contains(Vertex::new(3.0, 0.0)));
         assert_eq!(a.width(), 3.0);
         assert_eq!(a.height(), 3.0);
+    }
+
+    #[test]
+    fn distance_to_point_inside_and_outside() {
+        let a = Aabb::from_points([Vertex::new(0.0, 0.0), Vertex::new(4.0, 2.0)]);
+        assert_eq!(a.distance_to_point(Vertex::new(2.0, 1.0)), 0.0);
+        assert_eq!(a.distance_to_point(Vertex::new(4.0, 2.0)), 0.0);
+        assert_eq!(a.distance_to_point(Vertex::new(7.0, 1.0)), 3.0);
+        assert!((a.distance_to_point(Vertex::new(7.0, 6.0)) - 5.0).abs() < 1e-12);
     }
 
     #[test]
