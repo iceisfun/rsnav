@@ -341,6 +341,18 @@ impl Crowd {
     /// mesh regeneration is cosmetic or strictly additive (a wall was
     /// removed — existing corridors stay valid; agents just won't take
     /// the new shortcut until their next natural replan).
+    ///
+    /// Revalidation is geometric, not clearance-aware. [`path_clear`] is
+    /// a zero-width line-of-sight test: it confirms a leg still does not
+    /// *cross* a wall, but does not re-verify the agent's radius of
+    /// clearance along it. If a rebuild narrows a corridor below the
+    /// agent's body width without severing the leg's centerline, the
+    /// route is kept — the agent then fails to make progress against
+    /// the new wall and its `stuck` counter forces a full,
+    /// clearance-aware replan (`find_path` with `distance_from_wall`)
+    /// within `stuck_ticks`. A precise swept-disc revalidation here is a
+    /// deliberate non-goal: it would cost more than the occasional
+    /// late replan it would save.
     pub fn set_nav(&mut self, nav: Arc<NavBuild>) {
         self.nav = nav.clone();
         for slot in self.slots.iter_mut().flatten() {
