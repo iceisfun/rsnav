@@ -6,6 +6,14 @@
 //! the most recent snapshot is processed. The main thread reads the
 //! latest published build at frame start via [`NavWorker::poll_swap`].
 //!
+//! ## Listener panic isolation
+//!
+//! [`NavListener::on_event`] callbacks are invoked on the worker thread.
+//! Any panic inside a listener is caught and swallowed — a buggy listener
+//! will not kill the worker thread. Use [`NavWorker::is_running`] to
+//! check whether the worker thread is still alive (it becomes `false` only
+//! on clean shutdown or if a panic in the build pipeline itself kills it).
+//!
 //! ```no_run
 //! use std::sync::Arc;
 //! use rsnav_dynamic::{NavWorker, BuildOptions};
@@ -32,7 +40,7 @@
 //! (`polygon-extract → CDT → NavMesh → BSP`). v1 will swap in a
 //! cavity-remesh strategy behind the same public API.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -204,6 +212,9 @@ struct StatsInner {
     builds_failed: AtomicU64,
     last_completed_generation: AtomicU64,
     timing: Mutex<TimingStats>,
+    /// `true` while the worker thread is running; flipped to `false` by
+    /// `AliveGuard` on every exit path including panics.
+    alive: AtomicBool,
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -344,6 +355,7 @@ impl NavWorker {
         let shared = Arc::new(ArcSwapOption::empty());
         let last_error = Arc::new(Mutex::new(None));
         let stats = Arc::new(StatsInner::default());
+        stats.alive.store(true, Ordering::Relaxed);
         let (tx, rx) = channel::<Cmd>();
         let shared_w = shared.clone();
         let err_w = last_error.clone();
@@ -370,9 +382,18 @@ impl NavWorker {
         self.stats
             .snapshots_submitted
             .fetch_add(1, Ordering::Relaxed);
-        // send can only fail if the worker thread is gone — which means
-        // the caller is already in shutdown, so dropping is fine.
+        // A send failure means the worker thread is no longer running —
+        // either a clean shutdown or the thread died. Callers who need to
+        // detect that can check `is_running()`.
         let _ = self.tx.send(Cmd::Rebuild(bitfield));
+    }
+
+    /// `true` while the background worker thread is alive. Becomes
+    /// `false` if the worker thread has exited — normally only at
+    /// shutdown, but also if a panic in the build pipeline killed it.
+    /// A `false` here means submitted snapshots will no longer build.
+    pub fn is_running(&self) -> bool {
+        self.stats.alive.load(Ordering::Relaxed)
     }
 
     /// A snapshot of the worker's running counters. Cheap (takes one
@@ -455,9 +476,23 @@ fn run_worker(
     listener: Option<Arc<dyn NavListener>>,
     opts: BuildOptions,
 ) {
+    // RAII guard: flip `alive` to false on every exit path, including
+    // panics that unwind out of the build pipeline.
+    struct AliveGuard(Arc<StatsInner>);
+    impl Drop for AliveGuard {
+        fn drop(&mut self) {
+            self.0.alive.store(false, Ordering::Relaxed);
+        }
+    }
+    let _alive = AliveGuard(stats.clone());
+
     let dispatch = |event: &NavEvent<'_>| {
         if let Some(l) = listener.as_ref() {
-            l.on_event(event);
+            // Catch any panic from the listener so a buggy callback
+            // cannot unwind into and kill the worker thread.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                l.on_event(event);
+            }));
         }
     };
 
@@ -802,6 +837,43 @@ mod tests {
             s.snapshots_coalesced >= 1,
             "expected at least one coalesced drop, got {}",
             s.snapshots_coalesced,
+        );
+    }
+
+    // ---- liveness & panic isolation ------------------------------------
+
+    #[test]
+    fn is_running_true_for_live_worker() {
+        let worker = NavWorker::spawn(BuildOptions::default());
+        assert!(worker.is_running(), "worker should be alive after spawn");
+    }
+
+    #[test]
+    fn panicking_listener_does_not_kill_worker() {
+        // A listener that always panics; the worker must survive it.
+        // NOTE: the default panic hook will print to stderr for each
+        // caught panic — that is expected and the test still passes.
+        struct BoomListener;
+        impl NavListener for BoomListener {
+            fn on_event(&self, _ev: &NavEvent<'_>) {
+                panic!("boom");
+            }
+        }
+
+        let worker = NavWorker::spawn_with_listener(
+            BuildOptions::default(),
+            Arc::new(BoomListener) as Arc<dyn NavListener>,
+        );
+        worker.submit_snapshot(Arc::new(solid_bitfield(8, 8)));
+
+        // The worker must still complete the build despite the panicking listener.
+        wait_until(
+            || worker.stats().builds_completed >= 1,
+            "build completes despite panicking listener",
+        );
+        assert!(
+            worker.is_running(),
+            "worker should still be alive after listener panic"
         );
     }
 }
