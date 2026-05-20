@@ -77,7 +77,7 @@ pub fn find_path(
     // portal the funnel would then have to collapse.
     let walls = WallInfo::from_navmesh(nav);
 
-    let triangles = astar(nav, &walls, start_tri, goal_tri, goal, opts.distance_from_wall)
+    let triangles = astar(nav, &walls, start_tri, goal_tri, start, goal, opts.distance_from_wall)
         .map_err(|e| match e {
             AstarError::UnreachableRegion | AstarError::Unreachable => PathError::Unreachable,
         })?;
@@ -434,6 +434,86 @@ mod tests {
                 p
             );
         }
+    }
+
+    /// A 24×16 arena with one wide rectangular hole straddling the
+    /// start/goal line but sitting *above* the vertical centre, so the
+    /// gap below the hole is the clearly shorter way around (~18.3) and
+    /// the gap above is ~5 units longer (~23.7).
+    fn build_offset_hole_navmesh() -> (NavMesh, Bsp) {
+        let pts = [
+            (0.0, 0.0),   // 0  outer rectangle
+            (24.0, 0.0),  // 1
+            (24.0, 16.0), // 2
+            (0.0, 16.0),  // 3
+            (6.0, 5.0),   // 4  hole, CCW
+            (18.0, 5.0),  // 5
+            (18.0, 11.0), // 6
+            (6.0, 11.0),  // 7
+        ];
+        let mut mesh = CdtMesh::new();
+        for (x, y) in pts {
+            mesh.push_vertex(VertexSlot::new(Vertex::new(x, y), 0));
+        }
+        delaunay(&mut mesh, DivConqOptions::default());
+        let pslg = Pslg {
+            vertices: pts
+                .iter()
+                .map(|(x, y)| PslgVertex::new(Vertex::new(*x, *y)))
+                .collect(),
+            segments: vec![
+                PslgSegment { a: 0, b: 1, marker: 1 },
+                PslgSegment { a: 1, b: 2, marker: 1 },
+                PslgSegment { a: 2, b: 3, marker: 1 },
+                PslgSegment { a: 3, b: 0, marker: 1 },
+                PslgSegment { a: 4, b: 5, marker: 2 },
+                PslgSegment { a: 5, b: 6, marker: 2 },
+                PslgSegment { a: 6, b: 7, marker: 2 },
+                PslgSegment { a: 7, b: 4, marker: 2 },
+            ],
+            holes: vec![PslgHole { point: Vertex::new(12.0, 8.0) }],
+        };
+        form_skeleton(&mut mesh, &pslg, None).unwrap();
+        carve_holes(&mut mesh, &pslg, false);
+        let nav = build_from_cdt(&mesh);
+        let bsp = Bsp::build(&nav);
+        (nav, bsp)
+    }
+
+    #[test]
+    fn path_commits_to_shorter_channel_around_offset_hole() {
+        // Regression for the funnel "loop" artifact: the funnel only
+        // string-pulls within the channel A* picks, so A* must pick the
+        // channel that *contains* the shortest path. A centroid-metric
+        // A* can rank the longer over-the-hole channel below the short
+        // under-the-hole one; portal-crossing costs do not.
+        let (nav, bsp) = build_offset_hole_navmesh();
+        // The straight start→goal line at y = 6 is blocked by the hole.
+        let start = Vertex::new(3.0, 6.0);
+        let goal = Vertex::new(21.0, 6.0);
+        let path = find_path(&nav, &bsp, start, goal, &PathOptions::default()).unwrap();
+
+        // The route never enters the hole.
+        for p in &path.points {
+            let in_hole = p.x > 6.0 && p.x < 18.0 && p.y > 5.0 && p.y < 11.0;
+            assert!(!in_hole, "path crosses the hole: {:?}", path.points);
+        }
+
+        // Shortest route hugs the hole's bottom corners (6,5) / (18,5):
+        //   |(3,6)→(6,5)| + 12 + |(18,5)→(21,6)| = √10 + 12 + √10 ≈ 18.32
+        // The over-the-top channel is ~23.7. A length near 18.3 proves
+        // A* committed to the correct (shorter) channel and the funnel
+        // did not have to render a detour.
+        let total: f64 = path.points.windows(2).map(|w| w[0].distance(w[1])).sum();
+        assert!(
+            total < 19.0,
+            "expected the short ~18.3 channel, got {total}: {:?}",
+            path.points,
+        );
+        assert!(
+            total >= 18.32 - 1e-3,
+            "path shorter than the true optimum ≈18.32: {total}",
+        );
     }
 
     #[test]

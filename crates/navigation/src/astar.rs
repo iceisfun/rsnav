@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+use rsnav_common::geom::nearest_point_on_segment;
 use rsnav_common::{TriangleId, Vertex};
 use rsnav_navmesh::NavMesh;
 
@@ -44,9 +45,26 @@ pub enum AstarError {
 
 /// Find the sequence of triangles A* walks from `start` to `goal`.
 ///
-/// `goal_point` is used as the heuristic target — we estimate remaining
-/// cost as the euclidean distance from each triangle's centroid to
+/// The search runs on the triangle adjacency graph, but step costs are
+/// **portal-crossing**, not centroid-to-centroid: each triangle records
+/// the point at which the route enters it — the closest point on the
+/// shared portal edge to the predecessor's entry point — and a step
+/// costs the straight-line distance between consecutive entry points.
+/// The start triangle is entered at the real `start_point`, and the
+/// final leg into the goal triangle also pays the hop on to
 /// `goal_point`.
+///
+/// This matters because the funnel ([`crate::funnel`]) only ever
+/// produces the shortest path *within* the channel A* commits to. A
+/// centroid metric can rank a channel that wraps around an obstacle
+/// below the tight straight-then-turn channel — the centroid path
+/// over-estimates the funnelled length by a different amount per
+/// channel — and the funnel then faithfully renders the detour.
+/// Portal-crossing costs track the funnelled length closely enough
+/// that A* picks the right channel. The cost and heuristic stay
+/// consistent (triangle inequality), so the closed set remains valid;
+/// entry points are chosen greedily per triangle, so this is a close
+/// approximation rather than a proof of optimality.
 ///
 /// Edges considered for traversal:
 /// - Not a wall (constrained or boundary).
@@ -64,6 +82,7 @@ pub fn astar(
     walls: &WallInfo,
     start: TriangleId,
     goal: TriangleId,
+    start_point: Vertex,
     goal_point: Vertex,
     min_portal_width: f64,
 ) -> Result<Vec<TriangleId>, AstarError> {
@@ -77,12 +96,18 @@ pub fn astar(
     let n = nav.triangle_count();
     let mut g_score = vec![f64::INFINITY; n];
     let mut came_from: Vec<TriangleId> = vec![TriangleId::INVALID; n];
+    // Point at which the best-known route enters each triangle. The
+    // start triangle is entered at the real `start_point`.
+    let mut entry = vec![Vertex::ZERO; n];
     let mut closed = vec![false; n];
     let mut heap: BinaryHeap<Frontier> = BinaryHeap::new();
 
     g_score[start.index()] = 0.0;
-    let h_start = nav.triangle(start).centroid.distance(goal_point);
-    heap.push(Frontier { triangle: start, f_score: h_start });
+    entry[start.index()] = start_point;
+    heap.push(Frontier {
+        triangle: start,
+        f_score: start_point.distance(goal_point),
+    });
 
     while let Some(Frontier { triangle, .. }) = heap.pop() {
         if triangle == goal {
@@ -94,19 +119,18 @@ pub fn astar(
         closed[triangle.index()] = true;
 
         let tri = nav.triangle(triangle);
-        let cur_centroid = tri.centroid;
+        let cur_entry = entry[triangle.index()];
 
         for edge in 0..3 {
             if is_wall_edge_local(tri, edge) {
                 continue;
             }
+            let va = tri.vertices[(edge + 1) % 3];
+            let vb = tri.vertices[(edge + 2) % 3];
+            let pa = nav.vertex(va);
+            let pb = nav.vertex(vb);
+
             if min_portal_width > 0.0 {
-                let (va, vb) = (
-                    tri.vertices[(edge + 1) % 3],
-                    tri.vertices[(edge + 2) % 3],
-                );
-                let pa = nav.vertex(va);
-                let pb = nav.vertex(vb);
                 // The funnel pulls each portal endpoint that is a wall
                 // vertex inward by `min_portal_width`; the width the
                 // agent body can actually use is the edge length minus
@@ -118,17 +142,31 @@ pub fn astar(
                     continue;
                 }
             }
+
             let neighbor = tri.neighbors[edge];
             if closed[neighbor.index()] {
                 continue;
             }
-            let n_tri = nav.triangle(neighbor);
-            let step_cost = cur_centroid.distance(n_tri.centroid);
+
+            // Portal-crossing cost: the route enters `neighbor` at the
+            // closest point on the shared portal to where it entered
+            // `triangle`. The step is the distance between those two
+            // entry points; the leg into the goal triangle also pays
+            // the final hop on to `goal_point`, and that triangle's
+            // heuristic is then 0 (its `g` already covers the rest).
+            let crossing = nearest_point_on_segment(pa, pb, cur_entry);
+            let mut step_cost = cur_entry.distance(crossing);
+            let h = if neighbor == goal {
+                step_cost += crossing.distance(goal_point);
+                0.0
+            } else {
+                crossing.distance(goal_point)
+            };
             let tentative_g = g_score[triangle.index()] + step_cost;
             if tentative_g < g_score[neighbor.index()] {
                 g_score[neighbor.index()] = tentative_g;
                 came_from[neighbor.index()] = triangle;
-                let h = n_tri.centroid.distance(goal_point);
+                entry[neighbor.index()] = crossing;
                 heap.push(Frontier {
                     triangle: neighbor,
                     f_score: tentative_g + h,
