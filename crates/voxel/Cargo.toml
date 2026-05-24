@@ -1,0 +1,12 @@
+[package]
+name = "rsnav-voxel"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Voxelize polygon-soup meshes and extract traversable regions for the rsnav stack."
+
+[dependencies]
+rsnav-common.workspace = true
+rsnav-triangle.workspace = true
