@@ -6,6 +6,7 @@
 //!
 //! Work in progress — see crate README for porting status.
 
+pub mod clip;
 pub mod divconq;
 pub mod flip;
 pub mod holes;
@@ -16,6 +17,7 @@ pub mod pslg;
 pub mod segment;
 pub mod sort;
 
+pub use clip::clip_ears;
 pub use divconq::{delaunay, DivConqOptions};
 pub use holes::carve_holes;
 pub use mesh::{CdtMesh, Otri, Osub, VertexSlot, VertexType};

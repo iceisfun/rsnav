@@ -80,6 +80,7 @@ Run `cargo run -p <crate> --example <name>`.
                                               delaunay(cdt, ..)
                                               form_skeleton(cdt, pslg, ..)
                                               carve_holes(cdt, pslg, ..)
+                                              clip_ears(cdt, max_area)   (optional)
                                                        │
                                                        ▼
                                               build_from_cdt(cdt)  ──► NavMesh
@@ -98,6 +99,16 @@ You always go in this order. `form_skeleton` requires the Delaunay
 triangulation to already be there; `carve_holes` requires the segments
 to already be inserted; `build_from_cdt` requires both. Skipping any
 step yields a mesh with garbage region IDs or an empty walkable area.
+
+`clip_ears` is an optional post-carve cleanup pass that prunes small
+"ear" triangles (two wall edges + one interior neighbor) — typically
+half-cell stair-step artifacts left behind when a bitfield with a
+diagonal-ish boundary is triangulated. It promotes the previously-
+interior edge on the surviving neighbor to a constraint (inheriting the
+smaller nonzero wall marker), and iterates until no more ears qualify.
+Cost: a sliver of walkable area per clipped ear, bounded by the
+threshold. Skip it for hand-authored PSLGs where small ears are
+intentional geometry.
 
 ---
 
@@ -172,7 +183,7 @@ Bitfield → polygons, `rsnav_polygon_extract`:
 | Type / fn | Notes |
 | --- | --- |
 | `Bitfield { width, height, data: Vec<bool> }` | Row-major, `true` = walkable. Cell (col, row) covers `[col, col+1] × [row, row+1]` with y-up (row 0 at bottom). Construct via `Bitfield::new(w, h, data) -> Result<Self, BitfieldError>` (returns `BadDataLength` if `data.len() != w * h`) or the infallible `Bitfield::empty(w, h)`. |
-| `ExtractOptions { min_area, remove_collinear, diagonal_smoothing }` | Defaults: keep all, strip collinear vertices, no smoothing. |
+| `ExtractOptions { min_area, remove_collinear, diagonal_smoothing }` | Defaults: keep all, strip collinear vertices, smoothing **on**. `diagonal_smoothing` iterates to a fixed point and collapses *any* run of unit-perpendicular zigzag corners whose flanking direction is preserved — handles multi-step stairs adjacent to longer straight runs. Set `diagonal_smoothing = false` to keep the exact cell-aligned boundary. |
 | `extract(&bits, &opts) -> Vec<PolygonWithHoles>` | Outer rings CCW, holes CW. 4-connectivity (diagonal-only touch = disconnected). |
 
 Dynamic obstacles + telemetry, `rsnav_dynamic`:
@@ -180,7 +191,7 @@ Dynamic obstacles + telemetry, `rsnav_dynamic`:
 | Type / fn | Notes |
 | --- | --- |
 | `NavWorker` | Owns a background thread that turns `Arc<Bitfield>` snapshots into `Arc<NavBuild>`. `spawn(BuildOptions)` for no-telemetry; `spawn_with_listener(opts, Arc<dyn NavListener>)` for typed events. `Drop` joins the thread cleanly; `shutdown()` joins explicitly. |
-| `BuildOptions { extract: ExtractOptions, perimeter_marker, hole_marker }` | Knobs forwarded to the per-snapshot pipeline. Defaults: extract defaults, marker 1 / 2. |
+| `BuildOptions { extract: ExtractOptions, perimeter_marker, hole_marker, clip_ears_max_area }` | Knobs forwarded to the per-snapshot pipeline. Defaults: extract defaults (smoothing on), marker 1 / 2, `clip_ears_max_area = 0.6` (catches half-cell stair ears on unit-cell bitfields). Set `clip_ears_max_area = 0.0` to disable the pass for hand-authored PSLGs where small ears are intentional. |
 | `NavBuild { navmesh, bsp, build_ms, generation }` | One successful build. `generation` increases monotonically per worker. The first published build is `generation = 1`. |
 | `BuildError::{NoPerimeter, SegmentInsertion(SegmentInsertError), EmptyMesh}` | Why a rebuild failed. Worker keeps the previous published build intact and reports via `last_error()` / `NavEvent::BuildFailed`. |
 | `submit_snapshot(Arc<Bitfield>)` | Non-blocking. If another snapshot is already queued, the worker silently keeps only the newest one (counted in `NavStats::snapshots_coalesced`). |
@@ -559,6 +570,16 @@ layer on top of the primitive.
   concavities and hole interiors as walkable triangles; skipping
   `form_skeleton` means edge markers and region splitting won't work.
 
+- **`clip_ears` is opt-in and goes between `carve_holes` and
+  `build_from_cdt`.** It deletes "ear" triangles (two wall edges + one
+  interior neighbor) under an area threshold and promotes the surviving
+  neighbor's interior edge to a constraint with the smaller of the two
+  parent wall markers. Cascading ears are resolved in a fixed-point
+  loop. Two ears sharing their only interior edge ("bowtie") are left
+  intact to avoid stranding a single isolated triangle. Each clip
+  shrinks the walkable area by at most the threshold; pick the threshold
+  relative to your world scale (≈0.6 for unit-cell bitfields).
+
 - **`build_from_cdt` re-numbers everything.** Vertex and triangle indices
   in the resulting `NavMesh` do **not** match `CdtMesh` indices. Don't
   carry CDT indices into the runtime.
@@ -718,7 +739,9 @@ All run as `cargo run -p <crate> --example <name>`.
   orient/incircle predicates, segment intersection, point-in-triangle,
   nearest point on segment/triangle.
 - `crates/triangle/src/lib.rs` — re-exports the user-facing surface
-  (`delaunay`, `form_skeleton`, `carve_holes`, the `Pslg` types).
+  (`delaunay`, `form_skeleton`, `carve_holes`, `clip_ears`, the `Pslg`
+  types).
+- `crates/triangle/src/clip.rs` — `clip_ears` ear-removal post-pass.
 - `crates/navmesh/src/{navmesh,build,binary}.rs` — runtime mesh, CDT
   conversion, serialization.
 - `crates/navmesh/FORMAT.md` — normative binary spec.

@@ -1772,6 +1772,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsnav-smoothing-demo"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "egui",
+ "rsnav-common",
+ "rsnav-dynamic",
+ "rsnav-navmesh",
+ "rsnav-polygon-extract",
+]
+
+[[package]]
 name = "rsnav-triangle"
 version = "0.1.0"
 dependencies = [

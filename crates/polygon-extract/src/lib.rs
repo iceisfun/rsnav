@@ -106,9 +106,8 @@ pub struct ExtractOptions {
     /// raw trace. Default `true`.
     pub remove_collinear: bool,
     /// Replace stair-step (zigzag) sequences along axis-aligned edges with
-    /// single diagonals. Default `false`; turning it on produces fewer
-    /// triangles in the resulting CDT but loses the exact cell-aligned
-    /// boundary.
+    /// single diagonals. Default `true`; turning it off keeps the exact
+    /// cell-aligned boundary at the cost of more triangles in the CDT.
     pub diagonal_smoothing: bool,
 }
 
@@ -117,7 +116,7 @@ impl Default for ExtractOptions {
         Self {
             min_area: 0.0,
             remove_collinear: true,
-            diagonal_smoothing: false,
+            diagonal_smoothing: true,
         }
     }
 }
@@ -334,17 +333,45 @@ fn trace_loops(bits: &Bitfield) -> Vec<Polygon> {
 /// a stair-step middle when:
 ///   * both incident edges are unit-length and perpendicular, AND
 ///   * the edge *before* the incoming edge is parallel-and-same-direction
-///     to the *outgoing* edge.
+///     as the *outgoing* edge (any length).
 ///
 /// The second condition distinguishes a stair (alternating right turns and
-/// left turns) from the corner of a small axis-aligned shape (all turns in
-/// the same rotational direction), which we leave alone.
-fn diagonal_smooth(p: Polygon) -> Polygon {
-    let n = p.vertices.len();
-    if n < 4 {
-        return p;
+/// left turns continuing the original heading) from the corner of a small
+/// axis-aligned shape (all turns in the same rotational direction), which
+/// we leave alone. We accept any positive scalar multiple — not just
+/// bit-exact equality — so a stair adjacent to a longer straight run, or
+/// stairs whose neighbour vertices were already eaten by an earlier pass,
+/// are still recognised.
+///
+/// We iterate until a pass removes nothing. Each pass can expose new stair
+/// middles that the previous pass couldn't see (e.g. a stair after a
+/// single-unit tower that itself got collapsed first).
+fn diagonal_smooth(mut p: Polygon) -> Polygon {
+    loop {
+        let n = p.vertices.len();
+        if n < 4 {
+            return p;
+        }
+        let stair = mark_stair_middles(&p);
+        let kept: Vec<Vertex> = (0..n)
+            .filter(|i| !stair[*i])
+            .map(|i| p.vertices[i])
+            .collect();
+        if kept.len() == n {
+            return p; // no change — done
+        }
+        if kept.len() < 3 {
+            // Degenerate result (rare — happens only if the entire polygon
+            // is a perfect zigzag loop). Fall back to the previous polygon.
+            return p;
+        }
+        p = Polygon::from_vertices(kept);
     }
-    let stair: Vec<bool> = (0..n)
+}
+
+fn mark_stair_middles(p: &Polygon) -> Vec<bool> {
+    let n = p.vertices.len();
+    (0..n)
         .map(|i| {
             let v_m2 = p.vertices[(i + n - 2) % n];
             let v_m1 = p.vertices[(i + n - 1) % n];
@@ -356,21 +383,12 @@ fn diagonal_smooth(p: Polygon) -> Polygon {
             let unit_perp = e_in.length_sq() == 1.0
                 && e_out.length_sq() == 1.0
                 && e_in.dot(e_out) == 0.0;
-            unit_perp && e_before == e_out
+            // Parallel-and-same-direction: zero cross + positive dot.
+            // (Bit-exact on integer cell coordinates; no epsilon needed.)
+            let same_dir = e_before.cross(e_out) == 0.0 && e_before.dot(e_out) > 0.0;
+            unit_perp && same_dir
         })
-        .collect();
-
-    let kept: Vec<Vertex> = (0..n)
-        .filter(|i| !stair[*i])
-        .map(|i| p.vertices[i])
-        .collect();
-
-    if kept.len() < 3 {
-        // Degenerate result (rare — happens only if the entire polygon is a
-        // perfect zigzag loop). Fall back to the un-smoothed polygon.
-        return p;
-    }
-    Polygon::from_vertices(kept)
+        .collect()
 }
 
 // --- Sanity --------------------------------------------------------------
@@ -497,6 +515,34 @@ mod tests {
         for r in &regions {
             assert_eq!(r.outer.area(), 1.0);
         }
+    }
+
+    /// `diagonal_smooth` should collapse a stair adjacent to a long
+    /// straight run. The first stair-middle's `e_before` then has length 3
+    /// (the run before the stair), which the original strict
+    /// `e_before == e_out` test missed.
+    #[test]
+    fn diagonal_smooth_handles_stair_next_to_long_run() {
+        // L-shape with a stair on one inside edge: a long horizontal bottom
+        // then a 3-step stair rising to the top, then a horizontal cap and
+        // a vertical left side.
+        let p = Polygon::from_vertices(vec![
+            Vertex::new(0.0, 0.0),
+            Vertex::new(3.0, 0.0),   // long run
+            Vertex::new(3.0, 1.0),   // stair start (rises)
+            Vertex::new(4.0, 1.0),
+            Vertex::new(4.0, 2.0),
+            Vertex::new(5.0, 2.0),
+            Vertex::new(5.0, 3.0),   // stair end
+            Vertex::new(0.0, 3.0),
+        ]);
+        let before = p.vertices.len();
+        let smoothed = diagonal_smooth(p);
+        assert!(
+            smoothed.vertices.len() < before,
+            "long-run-then-stair should still get smoothed: before={before}, after={}",
+            smoothed.vertices.len()
+        );
     }
 
     /// A true staircase made of L-tromino steps so the cells are actually

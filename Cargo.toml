@@ -15,6 +15,7 @@ members = [
     "crates/demo",
     "crates/fixtures",
     "crates/rtsim",
+    "crates/smoothing-demo",
 ]
 
 [workspace.package]
