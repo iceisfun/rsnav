@@ -22,9 +22,11 @@ pub mod los;
 pub mod path;
 pub mod visibility;
 pub mod wall;
+pub mod wall_clearance;
 
 pub use los::{line_of_sight, LineOfSightResult};
 pub use path::{
     find_path, nearest_point, path_clear, NearestPoint, PathError, PathOptions, PathResult,
 };
 pub use visibility::{visibility_region, VisibilityRegion};
+pub use wall_clearance::WallClearance;
