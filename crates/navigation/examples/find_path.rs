@@ -6,7 +6,7 @@
 
 use rsnav_bsp::Bsp;
 use rsnav_common::Vertex;
-use rsnav_navigation::{find_path, line_of_sight, LineOfSightResult, PathOptions};
+use rsnav_navigation::{find_path, line_of_sight, LineOfSightResult, PathOptions, WallInfo};
 use rsnav_navmesh::{build_from_cdt, NavMesh};
 use rsnav_triangle::{
     carve_holes, delaunay,
@@ -52,9 +52,10 @@ fn main() {
     println!("    total length: {:.3}", path_length(&safe.points));
 
     // Line of sight from start to goal: blocked by the central hole.
+    let walls = WallInfo::from_navmesh(&nav);
     let start_tri = bsp.locate(&nav, start).unwrap();
     println!("\nLOS from start to goal:");
-    match line_of_sight(&nav, start_tri, start, goal) {
+    match line_of_sight(&nav, &walls, start_tri, start, goal) {
         LineOfSightResult::Clear => println!("    Clear (visible)"),
         LineOfSightResult::Blocked { point } => {
             println!("    Blocked at ({:.3}, {:.3})", point.x, point.y)

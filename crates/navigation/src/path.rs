@@ -62,6 +62,11 @@ pub struct PathResult {
 }
 
 /// Run A* + funnel to produce a string-pulled path from `start` to `goal`.
+///
+/// This convenience builds a door-free [`WallInfo`] from the mesh each call.
+/// If you have doors — or are pathing repeatedly and want to reuse one wall
+/// oracle — build a [`WallInfo`] once (with
+/// [`WallInfo::from_navmesh_with_doors`]) and call [`find_path_with_walls`].
 pub fn find_path(
     nav: &NavMesh,
     bsp: &Bsp,
@@ -69,20 +74,33 @@ pub fn find_path(
     goal: Vertex,
     opts: &PathOptions,
 ) -> Result<PathResult, PathError> {
+    let walls = WallInfo::from_navmesh(nav);
+    find_path_with_walls(nav, bsp, &walls, start, goal, opts)
+}
+
+/// Run A* + funnel against a caller-provided wall oracle.
+///
+/// Pass a [`WallInfo`] built with
+/// [`WallInfo::from_navmesh_with_doors`](crate::wall::WallInfo::from_navmesh_with_doors)
+/// to route around *closed* doors: A* won't cross a gated edge and the funnel
+/// insets around its endpoints, using the one shared clearance model.
+pub fn find_path_with_walls(
+    nav: &NavMesh,
+    bsp: &Bsp,
+    walls: &WallInfo,
+    start: Vertex,
+    goal: Vertex,
+    opts: &PathOptions,
+) -> Result<PathResult, PathError> {
     let start_tri = bsp.locate(nav, start).ok_or(PathError::StartOutsideMesh)?;
     let goal_tri = bsp.locate(nav, goal).ok_or(PathError::GoalOutsideMesh)?;
 
-    // Built once and shared by A* and the funnel so the two stages
-    // apply the *same* clearance model — A* won't route through a
-    // portal the funnel would then have to collapse.
-    let walls = WallInfo::from_navmesh(nav);
-
-    let triangles = astar(nav, &walls, start_tri, goal_tri, start, goal, opts.distance_from_wall)
+    let triangles = astar(nav, walls, start_tri, goal_tri, start, goal, opts.distance_from_wall)
         .map_err(|e| match e {
             AstarError::UnreachableRegion | AstarError::Unreachable => PathError::Unreachable,
         })?;
 
-    let points = funnel(nav, &walls, &triangles, start, goal, opts.distance_from_wall);
+    let points = funnel(nav, walls, &triangles, start, goal, opts.distance_from_wall);
 
     Ok(PathResult { points, triangles })
 }
@@ -110,14 +128,19 @@ pub fn find_path(
 /// typically `[agent_pos, remaining_corners..]`. A `false` result
 /// means: replan. Returns `true` for an empty or single-point slice
 /// (nothing to walk).
-pub fn path_clear(nav: &NavMesh, bsp: &Bsp, points: &[Vertex]) -> bool {
+///
+/// `walls` is the wall oracle: pass one built with
+/// [`WallInfo::from_navmesh_with_doors`](crate::wall::WallInfo::from_navmesh_with_doors)
+/// and a leg crossing a *closed* door fails revalidation, so closing a door
+/// across a live path triggers the replan it should.
+pub fn path_clear(nav: &NavMesh, bsp: &Bsp, walls: &WallInfo, points: &[Vertex]) -> bool {
     for seg in points.windows(2) {
         let (a, b) = (seg[0], seg[1]);
         let Some(start_tri) = bsp.locate(nav, a) else {
             return false; // segment starts off the mesh
         };
         if !matches!(
-            line_of_sight(nav, start_tri, a, b),
+            line_of_sight(nav, walls, start_tri, a, b),
             LineOfSightResult::Clear,
         ) {
             return false;
@@ -242,20 +265,25 @@ mod tests {
     #[test]
     fn line_of_sight_through_open_region() {
         let (nav, bsp) = build_square_with_hole_navmesh();
+        let walls = WallInfo::from_navmesh(&nav);
         let a = Vertex::new(0.5, 0.5);
         let b = Vertex::new(3.5, 0.5);
         let start_tri = bsp.locate(&nav, a).unwrap();
-        assert_eq!(line_of_sight(&nav, start_tri, a, b), LineOfSightResult::Clear);
+        assert_eq!(
+            line_of_sight(&nav, &walls, start_tri, a, b),
+            LineOfSightResult::Clear
+        );
     }
 
     #[test]
     fn line_of_sight_blocked_by_hole_wall() {
         let (nav, bsp) = build_square_with_hole_navmesh();
+        let walls = WallInfo::from_navmesh(&nav);
         // Horizontal segment across the middle of the hole.
         let a = Vertex::new(0.5, 2.0);
         let b = Vertex::new(3.5, 2.0);
         let start_tri = bsp.locate(&nav, a).unwrap();
-        match line_of_sight(&nav, start_tri, a, b) {
+        match line_of_sight(&nav, &walls, start_tri, a, b) {
             LineOfSightResult::Blocked { point } => {
                 // Should be blocked at the inner-ring wall around x=1.5, y=2.0.
                 assert!((point.x - 1.5).abs() < 1e-9, "blocked at {:?}", point);
@@ -527,11 +555,13 @@ mod tests {
     #[test]
     fn path_clear_accepts_open_routes_and_rejects_blocked() {
         let (nav, bsp) = build_square_with_hole_navmesh();
+        let walls = WallInfo::from_navmesh(&nav);
 
         // Straight leg through the open bottom band — clear.
         assert!(path_clear(
             &nav,
             &bsp,
+            &walls,
             &[Vertex::new(0.5, 0.5), Vertex::new(3.5, 0.5)],
         ));
 
@@ -539,6 +569,7 @@ mod tests {
         assert!(path_clear(
             &nav,
             &bsp,
+            &walls,
             &[
                 Vertex::new(0.5, 2.0),
                 Vertex::new(0.5, 0.5),
@@ -551,6 +582,7 @@ mod tests {
         assert!(!path_clear(
             &nav,
             &bsp,
+            &walls,
             &[Vertex::new(0.5, 2.0), Vertex::new(3.5, 2.0)],
         ));
 
@@ -558,11 +590,12 @@ mod tests {
         assert!(!path_clear(
             &nav,
             &bsp,
+            &walls,
             &[Vertex::new(0.5, 0.5), Vertex::new(-1.0, 0.5)],
         ));
 
         // Nothing to walk — trivially clear.
-        assert!(path_clear(&nav, &bsp, &[]));
-        assert!(path_clear(&nav, &bsp, &[Vertex::new(0.5, 0.5)]));
+        assert!(path_clear(&nav, &bsp, &walls, &[]));
+        assert!(path_clear(&nav, &bsp, &walls, &[Vertex::new(0.5, 0.5)]));
     }
 }

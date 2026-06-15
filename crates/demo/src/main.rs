@@ -24,7 +24,9 @@ use serde::{Deserialize, Serialize};
 use rsnav_bsp::Bsp;
 use rsnav_common::{Aabb, Polygon as CommonPolygon, TriangleId, Vertex};
 use rsnav_navigation::{
-    find_path, line_of_sight, nearest_point, visibility_region, LineOfSightResult, PathOptions,
+    find_path_with_walls, line_of_sight, nearest_point, nearest_portal_edge, visibility_region,
+    zone_crossings, DoorId, DoorSet, DoorState, LineOfSightResult, PathOptions, PathResult,
+    WallInfo,
 };
 use rsnav_navmesh::{build_from_cdt, NavMesh};
 use rsnav_triangle::{
@@ -79,12 +81,24 @@ struct DemoApp {
 
     // Exploration probe state
     path_src: Option<Vertex>,
-    last_path: Option<Vec<Vertex>>,
+    path_goal: Option<Vertex>,
+    last_path: Option<PathResult>,
+    show_zones: bool,
     path_distance_from_wall: f64,
     hover_canvas: Option<Vertex>,
     show_visibility: bool,
     visibility_radius: f64,
     visibility_samples: usize,
+
+    // Doors. `walls` is the wall oracle A*/LOS/visibility consult — rebuilt
+    // from the mesh + current door states whenever either changes. When
+    // `place_door` is on, exploration clicks author a door segment (first
+    // click sets `door_first`, second completes it) instead of pathing.
+    doors: DoorSet,
+    walls: Option<WallInfo>,
+    place_door: bool,
+    door_mode: DoorMode,
+    door_first: Option<Vertex>,
 
     // Status line shown under the tool panel (Save / Load / Build feedback).
     status: Option<String>,
@@ -175,6 +189,18 @@ enum DrawingKind {
     Hole,
 }
 
+/// How a door is authored in exploration mode.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum DoorMode {
+    /// Click the edge under the cursor; that one portal becomes the door.
+    /// The candidate edge is highlighted on hover, so you see exactly what
+    /// will be gated before committing.
+    Edge,
+    /// Click two points across a passage; every portal the segment crosses
+    /// becomes the door.
+    Segment,
+}
+
 impl Default for DemoApp {
     fn default() -> Self {
         Self {
@@ -186,12 +212,19 @@ impl Default for DemoApp {
             bsp: None,
             last_build_error: None,
             path_src: None,
+            path_goal: None,
             last_path: None,
+            show_zones: false,
             path_distance_from_wall: 0.0,
             hover_canvas: None,
             show_visibility: false,
             visibility_radius: 200.0,
             visibility_samples: 180,
+            doors: DoorSet::new(),
+            walls: None,
+            place_door: false,
+            door_mode: DoorMode::Edge,
+            door_first: None,
             status: None,
             fixtures_dir: DEFAULT_FIXTURES_DIR.to_string(),
             fixture_listing: Vec::new(),
@@ -217,9 +250,14 @@ impl DemoApp {
         self.navmesh = None;
         self.bsp = None;
         self.path_src = None;
+        self.path_goal = None;
         self.last_path = None;
         self.last_build_error = None;
         self.drawing = None;
+        self.doors = DoorSet::new();
+        self.walls = None;
+        self.place_door = false;
+        self.door_first = None;
     }
 
     /// Serialize the current authored polygons to JSON and write to
@@ -451,7 +489,13 @@ impl DemoApp {
         self.bsp = Some(bsp);
         self.drawing = None;
         self.path_src = None;
+        self.path_goal = None;
         self.last_path = None;
+        // Fresh mesh → no doors; build the (static) wall oracle.
+        self.doors = DoorSet::new();
+        self.door_first = None;
+        self.place_door = false;
+        self.rebuild_walls();
         self.request_fit = true;
     }
 
@@ -489,18 +533,73 @@ impl DemoApp {
     }
 
     fn compute_path_to(&mut self, goal: Vertex) {
-        let (Some(nav), Some(bsp), Some(src)) =
-            (&self.navmesh, &self.bsp, self.path_src)
-        else {
+        self.path_goal = Some(goal);
+        self.repath();
+    }
+
+    /// Re-run the planner for the stored source/goal against the current
+    /// wall oracle. Called after a goal pick and after any door change —
+    /// doors never mutate an existing path, they trigger a fresh plan.
+    fn repath(&mut self) {
+        let (Some(nav), Some(bsp), Some(walls), Some(src), Some(goal)) = (
+            &self.navmesh,
+            &self.bsp,
+            &self.walls,
+            self.path_src,
+            self.path_goal,
+        ) else {
             return;
         };
         let opts = PathOptions {
             distance_from_wall: self.path_distance_from_wall,
         };
-        match find_path(nav, bsp, src, goal, &opts) {
-            Ok(res) => self.last_path = Some(res.points),
+        match find_path_with_walls(nav, bsp, walls, src, goal, &opts) {
+            Ok(res) => self.last_path = Some(res),
             Err(_) => self.last_path = None,
         }
+    }
+
+    /// Rebuild the wall oracle from the mesh + current door states. Cheap
+    /// (`O(triangles)`); the mesh and BSP are untouched.
+    fn rebuild_walls(&mut self) {
+        self.walls = self
+            .navmesh
+            .as_ref()
+            .map(|nav| WallInfo::from_navmesh_with_doors(nav, &self.doors));
+    }
+
+    /// Author a door from the segment `a → b`: resolve its edges, add it
+    /// (closed, so the effect is immediately visible), rebuild walls, and
+    /// repath.
+    fn place_door(&mut self, a: Vertex, b: Vertex) {
+        let (Some(nav), Some(bsp)) = (&self.navmesh, &self.bsp) else {
+            return;
+        };
+        let id = self.doors.add(nav, bsp, a, b, DoorState::Closed);
+        let cut = self.doors.get(id).map_or(0, |d| d.edge_count());
+        self.status = Some(if cut == 0 {
+            "Door cut no portal — draw it across an open passage.".into()
+        } else {
+            format!("Door placed (closed), cut {cut} edge(s).")
+        });
+        self.rebuild_walls();
+        self.repath();
+    }
+
+    /// Author a door on the internal portal edge nearest `world` (the edge
+    /// the cursor is over). Added closed so the effect shows immediately.
+    fn place_edge_door(&mut self, world: Vertex) {
+        let (Some(nav), Some(bsp)) = (&self.navmesh, &self.bsp) else {
+            return;
+        };
+        let Some((va, vb)) = nearest_portal_edge(nav, bsp, world) else {
+            self.status = Some("No portal edge there — click over an internal edge.".into());
+            return;
+        };
+        self.doors.add_edge(nav, va, vb, DoorState::Closed);
+        self.status = Some("Door placed on edge (closed).".into());
+        self.rebuild_walls();
+        self.repath();
     }
 }
 
@@ -619,7 +718,68 @@ impl DemoApp {
             }
             if ui.button("Clear path").clicked() {
                 self.path_src = None;
+                self.path_goal = None;
                 self.last_path = None;
+            }
+
+            ui.add_space(8.0);
+            ui.label("Doors");
+            if ui.checkbox(&mut self.place_door, "place door").changed() {
+                // Entering or leaving place-mode drops a half-drawn door.
+                self.door_first = None;
+            }
+            if self.place_door {
+                ui.horizontal(|ui| {
+                    if ui
+                        .radio_value(&mut self.door_mode, DoorMode::Edge, "pick edge")
+                        .clicked()
+                    {
+                        self.door_first = None;
+                    }
+                    if ui
+                        .radio_value(&mut self.door_mode, DoorMode::Segment, "draw segment")
+                        .clicked()
+                    {
+                        self.door_first = None;
+                    }
+                });
+                match self.door_mode {
+                    DoorMode::Edge => {
+                        ui.label("Hover an edge (highlighted), click to gate it.")
+                    }
+                    DoorMode::Segment => {
+                        ui.label("Click two points across a passage. Right-click cancels.")
+                    }
+                };
+            }
+            // Snapshot the rows so the list isn't borrowing `self.doors`
+            // while a button click wants to mutate it.
+            let door_rows: Vec<(DoorId, bool, usize)> = self
+                .doors
+                .doors()
+                .iter()
+                .map(|d| (d.id, d.is_closed(), d.edge_count()))
+                .collect();
+            let mut to_toggle: Option<DoorId> = None;
+            for (i, (id, closed, edges)) in door_rows.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let state = if *closed { "closed" } else { "open" };
+                    ui.label(format!("#{i}: {state} · {edges} edge(s)"));
+                    if ui.button(if *closed { "Open" } else { "Close" }).clicked() {
+                        to_toggle = Some(*id);
+                    }
+                });
+            }
+            if let Some(id) = to_toggle {
+                self.doors.toggle(id);
+                self.rebuild_walls();
+                self.repath();
+            }
+            if !door_rows.is_empty() && ui.button("Clear doors").clicked() {
+                self.doors.clear();
+                self.door_first = None;
+                self.rebuild_walls();
+                self.repath();
             }
 
             ui.add_space(8.0);
@@ -637,6 +797,21 @@ impl DemoApp {
                     .changed()
                 {
                     self.visibility_samples = samples_i.max(8) as usize;
+                }
+            }
+
+            ui.add_space(8.0);
+            ui.label("Zones (metadata demo)");
+            ui.checkbox(&mut self.show_zones, "west / east of mesh center");
+            if self.show_zones {
+                ui.label("Tints triangles by zone; a path is annotated where");
+                ui.label("it crosses the boundary (NavMetadata::zone_crossings).");
+                if let Some(path) = &self.last_path {
+                    if let Some(nav) = &self.navmesh {
+                        let mid = zone_mid_x(nav);
+                        let crossings = zone_crossings(nav, path, |t| Some(zone_of(nav, mid, t)));
+                        ui.label(format!("path crosses {} boundary(ies)", crossings.len()));
+                    }
                 }
             }
         }
@@ -855,6 +1030,29 @@ impl DemoApp {
     // -- exploration ---------------------------------------------------
 
     fn handle_exploration_mouse(&mut self, response: &egui::Response, rect: egui::Rect) {
+        // Door authoring takes over the clicks while active. Edge mode: one
+        // click gates the highlighted edge. Segment mode: two clicks set the
+        // door segment; right-click cancels a half-drawn one.
+        if self.place_door {
+            if response.secondary_clicked() {
+                self.door_first = None;
+                return;
+            }
+            if response.clicked() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let world = self.screen_to_world(rect, pos);
+                    match self.door_mode {
+                        DoorMode::Edge => self.place_edge_door(world),
+                        DoorMode::Segment => match self.door_first.take() {
+                            None => self.door_first = Some(world),
+                            Some(first) => self.place_door(first, world),
+                        },
+                    }
+                }
+            }
+            return;
+        }
+
         if response.secondary_clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let world = self.screen_to_world(rect, pos);
@@ -927,8 +1125,84 @@ impl DemoApp {
         }
     }
 
+    /// Draw each door's authoring segment (closed = solid red, open = thin
+    /// translucent green) plus the in-progress door rubber-banding to the
+    /// cursor.
+    fn draw_doors(&self, painter: &egui::Painter, rect: egui::Rect) {
+        for door in self.doors.doors() {
+            let a = self.world_to_screen(rect, door.line.0);
+            let b = self.world_to_screen(rect, door.line.1);
+            let (stroke, cap) = if door.is_closed() {
+                (
+                    Stroke::new(4.0, Color32::from_rgb(225, 70, 70)),
+                    Color32::from_rgb(225, 70, 70),
+                )
+            } else {
+                (
+                    Stroke::new(2.0, Color32::from_rgba_unmultiplied(90, 200, 120, 160)),
+                    Color32::from_rgb(90, 200, 120),
+                )
+            };
+            painter.line_segment([a, b], stroke);
+            painter.circle_filled(a, 3.0, cap);
+            painter.circle_filled(b, 3.0, cap);
+        }
+
+        // In-progress door: first endpoint dropped, rubber-band to cursor.
+        if let Some(first) = self.door_first {
+            let a = self.world_to_screen(rect, first);
+            painter.circle_filled(a, 4.0, Color32::from_rgb(240, 200, 80));
+            if let Some(h) = self.hover_canvas {
+                painter.line_segment(
+                    [a, self.world_to_screen(rect, h)],
+                    Stroke::new(2.0, Color32::from_rgba_unmultiplied(240, 200, 80, 180)),
+                );
+            }
+        }
+    }
+
     fn draw_exploration_overlays(&self, painter: &egui::Painter, rect: egui::Rect) {
-        let (Some(nav), Some(bsp)) = (&self.navmesh, &self.bsp) else { return };
+        let (Some(nav), Some(bsp), Some(walls)) =
+            (&self.navmesh, &self.bsp, &self.walls)
+        else {
+            return;
+        };
+
+        // Zone tint (metadata demo): shade each triangle by its zone, drawn
+        // under everything else.
+        if self.show_zones {
+            let mid = zone_mid_x(nav);
+            for (i, tri) in nav.triangles.iter().enumerate() {
+                let z = zone_of(nav, mid, TriangleId::new(i as u32));
+                let pts = vec![
+                    self.world_to_screen(rect, nav.vertex(tri.vertices[0])),
+                    self.world_to_screen(rect, nav.vertex(tri.vertices[1])),
+                    self.world_to_screen(rect, nav.vertex(tri.vertices[2])),
+                ];
+                painter.add(Shape::convex_polygon(
+                    pts,
+                    zone_color(z).gamma_multiply(0.30),
+                    Stroke::NONE,
+                ));
+            }
+        }
+
+        // Doors — drawn under the path/LOS overlays. Closed = solid red bar,
+        // open = dashed green. The in-progress door (first endpoint placed)
+        // rubber-bands to the cursor.
+        self.draw_doors(painter, rect);
+
+        // Edge-pick preview: highlight the portal edge the next click would
+        // gate, so it's unambiguous which crossing the door cuts.
+        if self.place_door && self.door_mode == DoorMode::Edge {
+            if let Some(h) = self.hover_canvas {
+                if let Some((va, vb)) = nearest_portal_edge(nav, bsp, h) {
+                    let pa = self.world_to_screen(rect, nav.vertex(va));
+                    let pb = self.world_to_screen(rect, nav.vertex(vb));
+                    painter.line_segment([pa, pb], Stroke::new(4.0, Color32::from_rgb(240, 210, 90)));
+                }
+            }
+        }
 
         // Visibility overlay — drawn FIRST so other overlays sit on top.
         //
@@ -945,6 +1219,7 @@ impl DemoApp {
                 if let Some(vr) = visibility_region(
                     nav,
                     bsp,
+                    walls,
                     h,
                     self.visibility_radius,
                     self.visibility_samples,
@@ -995,6 +1270,7 @@ impl DemoApp {
         // Path polyline — bright green.
         if let Some(path) = &self.last_path {
             let pts: Vec<Pos2> = path
+                .points
                 .iter()
                 .map(|v| self.world_to_screen(rect, *v))
                 .collect();
@@ -1003,6 +1279,23 @@ impl DemoApp {
             }
             if let Some(last) = pts.last() {
                 painter.circle_filled(*last, 5.0, Color32::from_rgb(80, 220, 80));
+            }
+
+            // Zone-crossing annotations: mark where the path leaves one zone
+            // and enters another — "now leaving town".
+            if self.show_zones {
+                let mid = zone_mid_x(nav);
+                for c in zone_crossings(nav, path, |t| Some(zone_of(nav, mid, t))) {
+                    let at = self.world_to_screen(rect, c.point);
+                    painter.circle_filled(at, 4.0, Color32::WHITE);
+                    painter.text(
+                        at + Vec2::new(6.0, -6.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        format!("→ {}", c.into.unwrap_or("?")),
+                        egui::FontId::proportional(12.0),
+                        Color32::WHITE,
+                    );
+                }
             }
         }
 
@@ -1017,7 +1310,7 @@ impl DemoApp {
                 );
                 if let Some(src) = self.path_src {
                     if let Some(src_tri) = bsp.locate(nav, src) {
-                        let los = line_of_sight(nav, src_tri, src, np.point);
+                        let los = line_of_sight(nav, walls, src_tri, src, np.point);
                         let (color, end) = match los {
                             LineOfSightResult::Clear => {
                                 (Color32::from_rgb(120, 200, 120), np.point)
@@ -1140,6 +1433,27 @@ fn expand_tilde(s: &str) -> PathBuf {
 
 /// Deterministic per-region color so disconnected regions are visually
 /// distinguishable.
+/// Demo metadata: split the mesh into two zones at its horizontal center.
+/// In a real app this is whatever `NavMetadata::zone` you implement.
+fn zone_mid_x(nav: &NavMesh) -> f64 {
+    (nav.aabb.min.x + nav.aabb.max.x) * 0.5
+}
+
+fn zone_of(nav: &NavMesh, mid_x: f64, tri: TriangleId) -> &'static str {
+    if nav.triangle(tri).centroid.x < mid_x {
+        "west"
+    } else {
+        "east"
+    }
+}
+
+fn zone_color(zone: &str) -> Color32 {
+    match zone {
+        "west" => Color32::from_rgb(90, 140, 220),
+        _ => Color32::from_rgb(220, 150, 80),
+    }
+}
+
 fn region_color(region: u32, total: u32) -> Color32 {
     if total <= 1 {
         return Color32::from_rgb(160, 180, 220);

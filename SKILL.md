@@ -58,9 +58,16 @@ crates/
   rtsim/           rsnav-rtsim           RTS-style dynamic-obstacles testbed
   crowd-demo/      rsnav-crowd-demo      multi-agent peon-economy testbed
                                          (FSM + slot reservation + forest)
-  door-demo/       rsnav-door-demo       togglable-doors testbed
-                                         (walls + doors + patrolling actors)
+  door-demo/       rsnav-door-demo       togglable-doors testbed (bitfield
+                                         obstacle doors via NavWorker rebuild)
+  world-demo/      rsnav-world-demo      multi-tile world editor (place +
+                                         drag tiles, stitch seams, path / LOS)
 ```
+
+`rsnav-navigation` also ships the in-mesh runtime features used above:
+**doors** (`DoorSet` edge-cuts + `WallInfo` oracle — no rebuild, distinct
+from the bitfield-rebuild `door-demo`), **`NavWorld<M>`** (owning container +
+`NavMetadata`), and **`TiledWorld`** (multi-tile worlds).
 
 Every library crate ships a runnable example in `crates/<name>/examples/`.
 Run `cargo run -p <crate> --example <name>`.
@@ -160,14 +167,60 @@ Pathing + queries, `rsnav_navigation`:
 
 | Type / fn | Notes |
 | --- | --- |
-| `find_path(&nav, &bsp, start, goal, &PathOptions) -> Result<PathResult, PathError>` | A* + funnel. `start`/`goal` must already be inside the mesh — `nearest_point` first if you might be off-mesh. |
+| `find_path(&nav, &bsp, start, goal, &PathOptions) -> Result<PathResult, PathError>` | A* + funnel. `start`/`goal` must already be inside the mesh — `nearest_point` first if you might be off-mesh. Builds a door-free `WallInfo` internally each call. |
+| `find_path_with_walls(&nav, &bsp, &walls, start, goal, &PathOptions) -> Result<PathResult, PathError>` | Same, against a caller-provided `WallInfo`. Pass one built with `WallInfo::from_navmesh_with_doors` to route around closed doors; or reuse one `WallInfo` across many queries instead of rebuilding it per call. |
 | `PathOptions { distance_from_wall }` | `0.0` = point agent. `> 0`: A* rejects portals shorter than this, and funnel pulls portal endpoints on wall vertices inward by this amount. Models an agent radius. |
 | `PathResult { points: Vec<Vertex>, triangles: Vec<TriangleId> }` | Polyline includes `start` and `goal`; `triangles` is the A* corridor. |
 | `PathError::{StartOutsideMesh, GoalOutsideMesh, Unreachable}` | `Unreachable` covers both "different region" and "every connecting portal too narrow". |
-| `line_of_sight(&nav, start_tri, from, to) -> LineOfSightResult` | Walks the segment triangle-by-triangle. `start_tri` must contain `from`. Returns `Clear`, `Blocked { point }`, or `SourceOutsideMesh`. |
-| `path_clear(&nav, &bsp, &[Vertex]) -> bool` | Segment-by-segment line-of-sight check over a polyline — `true` if every leg can be walked on the current mesh. The cheap way to revalidate a planned path after the navmesh changed: pass `[agent_pos, remaining_corners..]`; `false` ⇒ replan. Catches a new obstacle that landed *between* two still-on-mesh corners, which a corner-only test misses. |
+| `line_of_sight(&nav, &walls, start_tri, from, to) -> LineOfSightResult` | Walks the segment triangle-by-triangle, stopping at the first wall the `&WallInfo` reports (static walls, plus closed doors when `walls` was built with them). `start_tri` must contain `from`. Returns `Clear`, `Blocked { point }`, `SourceOutsideMesh`, or `Indeterminate` (a numerical-degeneracy walk — treat as "not clear"). |
+| `path_clear(&nav, &bsp, &walls, &[Vertex]) -> bool` | Segment-by-segment line-of-sight check over a polyline — `true` if every leg can be walked on the current mesh. The cheap way to revalidate a planned path after the navmesh (or a door) changed: pass `[agent_pos, remaining_corners..]`; `false` ⇒ replan. Catches a new obstacle that landed *between* two still-on-mesh corners, which a corner-only test misses. |
 | `nearest_point(&nav, &bsp, p) -> Option<NearestPoint>` | Convenience wrapper over `Bsp::nearest`. |
-| `visibility_region(&nav, &bsp, source, max_radius, samples) -> Option<VisibilityRegion>` | Ray-cast `samples` directions (clamped ≥ 8; 180 is a good default). Boundary is in CCW angular order; draw as a fan from `source`. |
+| `visibility_region(&nav, &bsp, &walls, source, max_radius, samples) -> Option<VisibilityRegion>` | Ray-cast `samples` directions (clamped ≥ 8; 180 is a good default). Boundary is in CCW angular order; draw as a fan from `source`. Rays are occluded by closed doors when `walls` carries them. |
+
+> **Signature note.** `line_of_sight`, `path_clear`, and `visibility_region` each take a `&WallInfo` — the shared "what is impassable?" oracle. Build it once per mesh+door-state: `WallInfo::from_navmesh(&nav)` (no doors) or `WallInfo::from_navmesh_with_doors(&nav, &doors)`. `find_path` is the exception — it builds a door-free one internally; use `find_path_with_walls` to make pathing door-aware.
+
+Doors — runtime edge-cuts, `rsnav_navigation` (no mesh or BSP rebuild):
+
+| Type / fn | Notes |
+| --- | --- |
+| `WallInfo` | The shared wall oracle consumed by A*, the funnel, LOS, visibility, and `WallClearance`. `WallInfo::from_navmesh(&nav)` = static walls only; `WallInfo::from_navmesh_with_doors(&nav, &doors)` folds every *closed* door's edges in. `O(triangles)`; rebuild whenever the mesh or any door state changes. |
+| `DoorSet` | The doors in a world, and the source of truth for which edges are gated shut. `add(&nav, &bsp, a, b, state)` resolves an authoring **segment** to the internal portal edges it crosses; `add_edge(&nav, va, vb, state)` gates one named edge (unambiguous — use with `nearest_portal_edge`). `open/close/toggle/set_state(id)`, `remove(id)`, `clear()`. `generation()` bumps on every change — your repath signal. |
+| `DoorState::{Open, Closed}` | Closed = the cut edges behave as walls; open = ordinary portals. |
+| `Door { id, line, state, .. }` | `is_closed()`, `edge_count()` (0 ⇒ the segment cut no portal — drawn off-mesh or only over walls). |
+| `nearest_portal_edge(&nav, &bsp, p) -> Option<(VertexId, VertexId)>` | The internal portal edge nearest a world point — for "click the edge under the cursor" door authoring. Never returns a wall/boundary edge. |
+| `resolve_door_edges(&nav, &bsp, a, b) -> Vec<(u32,u32)>` | The internal portal edges a segment crosses, as canonical vertex-pair keys. The resolver `DoorSet::add` uses internally; exposed for inspection. |
+
+A door is **not** a region of triangles or a geometry patch — it's a set of internal portal *edges* a closed door promotes to walls. The mesh, triangle IDs, and BSP never change; opening/closing only flips which edges the traversal code treats as impassable. Insetting (`distance_from_wall`) keeps working: the door endpoints are wall vertices while closed, so the funnel insets around them. Existing paths are never mutated — clients compare `DoorSet::generation()` and repath when it differs.
+
+`NavWorld<M>` — the owning container, `rsnav_navigation`:
+
+| Type / fn | Notes |
+| --- | --- |
+| `NavWorld<M = NoMetadata>` | Owns `(NavMesh, Bsp, DoorSet, WallInfo)` + your metadata `M`. `new(nav, meta)` builds the BSP and oracle; `without_metadata(nav)` for `M = NoMetadata`. Removes the "rebuild `walls` when a door changes" footgun — every door mutator does it for you. |
+| `add_door / add_door_edge / open_door / close_door / toggle_door / set_door / remove_door / clear_doors` | Door authoring + toggling; each rebuilds the wall oracle internally. |
+| `find_path / line_of_sight / path_clear / visibility / nearest_point / locate` | Door-aware queries against the owned oracle. `line_of_sight(from, to)` locates the start triangle for you. |
+| `generation()` | Mirrors the door generation — a path planned at `g` is stale once this differs. |
+| `meta() / meta_mut()` | Access your metadata store. |
+| `metadata_at(p) -> Option<&M::Value>` / `zone_at(p) -> Option<M::Zone>` | Point queries: locate the triangle, ask the metadata. |
+| `zone_crossings(&path) -> Vec<ZoneCrossing<M::Zone>>` | Zone boundaries crossed along a `PathResult` — "entered/left zone" events. Each `ZoneCrossing { point, from, into }`. |
+| `NavMetadata` trait | Implement on your own store: `type Zone: Clone + PartialEq; type Value; fn zone(&self, tri) -> Option<Zone>; fn value_at(&self, tri, p) -> Option<&Value>;`. rsnav only hands you a `TriangleId`. `NoMetadata` is the no-op default. |
+| `zone_crossings(&nav, &path, zone_of)` (free fn) | The same walk without a `NavWorld` — pass any `Fn(TriangleId) -> Option<Z>`. |
+
+`TiledWorld` — multi-tile worlds, `rsnav_navigation`:
+
+| Type / fn | Notes |
+| --- | --- |
+| `TiledWorld` | A set of independent navmesh tiles placed in one world space, plus links stitched between them. Tiles are never merged or re-triangulated. |
+| `add_tile(nav, offset) -> TileId` | Emplace `nav` at a world translation. Call `stitch_all` afterward. |
+| `stitch_all(tol)` | (Re)build every cross-tile link by finding boundary edges that are **collinear and overlap** in world space. Vertices need not match — one long edge links to the several short ones it overlaps. `tol` is the world-space slack (e.g. `1e-6` for exact grids). |
+| `set_tile_offset(tile, offset)` | Move a tile; invalidates links — re-`stitch_all`. |
+| `find_path(start, goal) -> Option<Vec<Vertex>>` | Cross-tile A* (intra-tile adjacency + links) in world space, then world-space funnel. |
+| `line_of_sight(from, to) -> LineOfSightResult` | Walks across tiles, crossing open seam links, stopping at the first wall or *unlinked* boundary. |
+| `locate(p) -> Option<GlobalTri>` | Which tile + triangle a world point lands in. |
+| `tile_count() / links() / tile_world_aabb / tile_nav / tile_offset` | Inspection + rendering accessors. |
+| `GlobalTri { tile: TileId, tri: TriangleId }`, `Link { a, b, portal }` | Namespaced triangle handle; a cross-tile connection with its world-space portal segment. |
+
+v1 limits: translation-only offsets, links always open (no per-seam doors yet), no cross-seam clearance, and a slight funnel soft-corner where one edge links to two (aligned grids are exact). A door is conceptually "a link you can close" — the planned unification of the two overlays.
 
 Polyline follower, `rsnav_pathing` (zero dependency on the navmesh):
 
@@ -348,13 +401,15 @@ returns `false` immediately when the two triangles' `region` IDs differ.
 ### 5. Line of sight
 
 ```rust
-use rsnav_navigation::{line_of_sight, LineOfSightResult};
+use rsnav_navigation::{line_of_sight, LineOfSightResult, WallInfo};
 
-let start_tri = bsp.locate(&nav, from).unwrap();  // `from` must be in-mesh
-match line_of_sight(&nav, start_tri, from, to) {
+let walls = WallInfo::from_navmesh(&nav);          // or _with_doors(&nav, &doors)
+let start_tri = bsp.locate(&nav, from).unwrap();   // `from` must be in-mesh
+match line_of_sight(&nav, &walls, start_tri, from, to) {
     LineOfSightResult::Clear              => { /* visible */ }
-    LineOfSightResult::Blocked { point }  => { /* wall at `point` */ }
+    LineOfSightResult::Blocked { point }  => { /* wall (or closed door) at `point` */ }
     LineOfSightResult::SourceOutsideMesh  => unreachable!("we just located"),
+    LineOfSightResult::Indeterminate      => { /* degenerate walk — treat as not clear */ }
 }
 ```
 
@@ -365,9 +420,10 @@ visibility-region sweep landing on a triangulation vertex.
 ### 6. Visibility region (visibility polygon)
 
 ```rust
-use rsnav_navigation::visibility_region;
+use rsnav_navigation::{visibility_region, WallInfo};
 
-let vr = visibility_region(&nav, &bsp, source, /* max_radius */ 50.0, /* samples */ 180)?;
+let walls = WallInfo::from_navmesh(&nav);   // closed doors occlude rays if built _with_doors
+let vr = visibility_region(&nav, &bsp, &walls, source, /* max_radius */ 50.0, /* samples */ 180)?;
 // vr.boundary is CCW around vr.source. Draw as a triangle fan from
 // source through consecutive boundary points (wrap last back to first).
 ```
@@ -535,6 +591,83 @@ priority bias for chokepoints, resource gathering loops) is application
 concern — `rsnav-crowd-demo` shows one full implementation of that
 layer on top of the primitive.
 
+### 11. Runtime doors (no rebuild)
+
+A door gates one or more internal portal *edges*; closing it makes A*/LOS/
+visibility treat them as walls, with no mesh or BSP rebuild. Build the
+wall oracle from the current door state and pass it to the door-aware
+query functions.
+
+```rust
+use rsnav_navigation::{find_path_with_walls, nearest_portal_edge, DoorSet, DoorState, PathOptions, WallInfo};
+
+let bsp = rsnav_bsp::Bsp::build(&nav);
+let mut doors = DoorSet::new();
+
+// Author a door across a passage (segment), or on a specific edge:
+let d1 = doors.add(&nav, &bsp, Vertex::new(5.0, -1.0), Vertex::new(5.0, 5.0), DoorState::Closed);
+if let Some((va, vb)) = nearest_portal_edge(&nav, &bsp, Vertex::new(5.0, 5.0)) {
+    let _d2 = doors.add_edge(&nav, va, vb, DoorState::Open);
+}
+
+// Rebuild the oracle whenever a door changes, then query through it.
+let walls = WallInfo::from_navmesh_with_doors(&nav, &doors);
+let _ = find_path_with_walls(&nav, &bsp, &walls, start, goal, &PathOptions::default());
+
+doors.open(d1);                          // toggle; generation() bumped
+let walls = WallInfo::from_navmesh_with_doors(&nav, &doors);  // rebuild ($O(tris)$)
+// clients holding a path compare doors.generation() and repath when it differs
+```
+
+### 12. NavWorld + metadata ("now leaving town")
+
+`NavWorld<M>` owns the mesh, BSP, doors, and oracle so you stop juggling
+them, and resolves world-position metadata through your `NavMetadata`.
+
+```rust
+use rsnav_common::{TriangleId, Vertex};
+use rsnav_navigation::{NavMetadata, NavWorld, PathOptions};
+
+struct Zones { centroids: Vec<Vertex> }   // your store, indexed by triangle
+impl NavMetadata for Zones {
+    type Zone = &'static str;
+    type Value = &'static str;
+    fn zone(&self, t: TriangleId) -> Option<&'static str> {
+        Some(if self.centroids[t.index()].x < 10.0 { "town" } else { "wild" })
+    }
+    fn value_at(&self, t: TriangleId, _p: Vertex) -> Option<&&'static str> { self.zone(t).map(|_| &"x") }
+}
+
+let meta = Zones { centroids: nav.triangles.iter().map(|t| t.centroid).collect() };
+let mut world = NavWorld::new(nav, meta);          // builds BSP + oracle
+let _door = world.add_door(Vertex::new(10.0, -1.0), Vertex::new(10.0, 5.0), rsnav_navigation::DoorState::Open);
+
+let path = world.find_path(start, goal, &PathOptions::default()).unwrap();
+for c in world.zone_crossings(&path) {             // emit "left town / entered wild"
+    println!("at {:?}: {:?} -> {:?}", c.point, c.from, c.into);
+}
+let here = world.metadata_at(start);               // point query
+```
+
+### 13. Multi-tile world (place + stitch + path across)
+
+Place independent navmeshes in one world space and let `stitch_all`
+connect overlapping borders — no manual welds, no merged mega-mesh.
+
+```rust
+use rsnav_common::Vertex;
+use rsnav_navigation::TiledWorld;
+
+let mut world = TiledWorld::new();
+world.add_tile(tile_a, Vertex::new(0.0, 0.0));
+world.add_tile(tile_b, Vertex::new(10.0, 0.0));   // east neighbor — borders touch at x=10
+world.stitch_all(1e-6);                            // links the overlapping seam edges
+
+let path = world.find_path(Vertex::new(3.0, 5.0), Vertex::new(17.0, 5.0));  // crosses the seam
+let los  = world.line_of_sight(Vertex::new(3.0, 5.0), Vertex::new(17.0, 5.0));
+// stream a tile in/out: add_tile / drop + re-stitch_all — never a full mesh rebuild
+```
+
 ---
 
 ## Gotchas and idioms
@@ -600,6 +733,34 @@ layer on top of the primitive.
 
 - **Boundary check before A*:** `nav.reachable(a, b)` (O(1) region-ID
   compare) avoids running the full search across an unreachable region.
+  Note this is a *static* check — it does not know about closed doors, so a
+  door that fully separates two areas still reports `reachable == true` and
+  A* runs and returns `Unreachable`. Correct result, just no fast-fail.
+
+- **`find_path` ignores doors; `find_path_with_walls` respects them.** The
+  bare `find_path` builds a door-free `WallInfo` internally. To route around
+  closed doors, build `WallInfo::from_navmesh_with_doors(&nav, &doors)` and
+  call `find_path_with_walls` (the same applies to `line_of_sight`,
+  `path_clear`, `visibility_region` — all take a `&WallInfo`). `NavWorld`
+  does this plumbing for you.
+
+- **Rebuild `WallInfo` after any door change.** It's a snapshot of the
+  current door state, `O(triangles)`. Forgetting means stale routing. Raw
+  `DoorSet` users rebuild manually; `NavWorld`'s door mutators rebuild
+  automatically. Compare `DoorSet::generation()` / `NavWorld::generation()`
+  to decide when to repath — doors never mutate paths you already hold.
+
+- **A door cuts *edges*, not a passage.** Gating one internal portal edge
+  separates a two-triangle doorway, but a *wide* passage has walkable
+  triangles flanking that edge — A* just routes around it. Use `nearest_portal_edge`
+  to author by the highlighted edge, and gate every portal across a wide gap
+  (or draw a segment with `DoorSet::add`, which cuts all the edges it crosses).
+
+- **`TiledWorld`: re-`stitch_all` after `add_tile` / `set_tile_offset`.**
+  Links are derived from current tile positions; moving or adding a tile
+  invalidates them. Re-stitching is cheap (no mesh rebuild) and the BSPs are
+  per-tile and untouched. Border edges only link where they *overlap* in
+  world space within `tol`.
 
 - **`Bitfield` is y-up.** Row 0 is the bottom row. Most image / tile-map
   formats are y-down — flip when you load.
@@ -709,7 +870,16 @@ layer on top of the primitive.
   revalidates each actor's remaining `[pos, corners…]` route by
   line-of-sight and replans only the blocked ones. `Door::rect` /
   `horizontal` / `vertical` author the doors; all of this lives in the
-  demo's `main.rs`, not the library.
+  demo's `main.rs`, not the library. (This is the *bitfield-rebuild* door;
+  the in-mesh edge-cut `DoorSet` in `rsnav-navigation` is the other approach
+  — no rebuild, demoed inside `rsnav-demo`'s exploration mode.)
+- `cargo run -p rsnav-world-demo --release` — multi-tile world editor.
+  Spawn navmesh tiles (Open / Holed / Pillars), drag them edge-to-edge
+  with the **Move** tool (seams re-stitch live, links drawn green), then
+  **Path** (right-click source, left-click goal → cross-tile route) or
+  **Vis** (right-click source, move cursor → cross-tile line-of-sight,
+  green clear / red blocked). Links are placement-driven — no manual weld.
+  Built on `rsnav_navigation::TiledWorld`.
 
 ---
 
@@ -723,6 +893,7 @@ layer on top of the primitive.
 | `rsnav-bsp` | `locate_and_nearest` | `locate` vs `nearest` on the donut fixture. |
 | `rsnav-navigation` | `find_path` | A* + funnel with and without `distance_from_wall`. |
 | `rsnav-navigation` | `visibility_region` | 180-sample sweep from a room with a pillar. |
+| `rsnav-navigation` | `tiled_world` | 3 tiles in a row, stitch seams, path across all of them around an obstacle. |
 | `rsnav-pathing` | `follow_path` | L-shape walk with anti-shortcut on/off. |
 | `rsnav-dynamic` | `live_worker` | Spawn a `NavWorker` with a printing `NavListener`, place a building, demolish it; print stats at the end. |
 | `rsnav-crowd` | `two_agents_pass` | Two agents head-on on an open arena; print positions every 30 ticks and a final summary verifying the discs never overlapped. |
@@ -746,7 +917,14 @@ All run as `cargo run -p <crate> --example <name>`.
   conversion, serialization.
 - `crates/navmesh/FORMAT.md` — normative binary spec.
 - `crates/navigation/src/{path,los,visibility,astar,funnel,wall}.rs` —
-  pathing + queries.
+  pathing + queries. `wall.rs` is the `WallInfo` oracle (the single
+  "is this edge impassable?" chokepoint all traversal routes through).
+- `crates/navigation/src/doors.rs` — `DoorSet`, the segment/edge resolver,
+  `nearest_portal_edge`. Runtime edge-cut doors, no rebuild.
+- `crates/navigation/src/world.rs` — `NavWorld<M>` owning container,
+  `NavMetadata` trait, `zone_crossings`.
+- `crates/navigation/src/tiled.rs` — `TiledWorld`: tiles, auto-stitch link
+  discovery, cross-tile A* + world-space funnel + LOS.
 - `crates/bsp/src/lib.rs` — BVH index.
 - `crates/pathing/src/lib.rs` — steering follower.
 - `crates/crowd/src/lib.rs` — `Agent` / `Crowd` / `CrowdConfig`,

@@ -88,7 +88,7 @@ the corridor while side-stepping other agents.
 cargo run -p rsnav-demo --release
 ```
 
-Author polygons with the mouse, press **Create navmesh**, then probe with right-click (set source) / left-click (set goal) for paths. The left panel has a *Fixtures* browser; the path field is pre-filled with `./testdata` and is editable — point it at any directory of `.json` maps.
+Author polygons with the mouse, press **Create navmesh**, then probe with right-click (set source) / left-click (set goal) for paths. The left panel has a *Fixtures* browser; the path field is pre-filled with `./testdata` and is editable — point it at any directory of `.json` maps. Also in exploration mode: **Doors** (place a runtime door by clicking the highlighted edge, or by drawing a segment across a passage; toggle open/closed and watch paths/LOS/visibility react with no rebuild) and **Zones** (a `NavMetadata` demo that tints triangles and annotates where a path crosses a zone boundary).
 
 ### Batch-run fixtures from the CLI
 
@@ -123,6 +123,14 @@ cargo run -p rsnav-door-demo --release
 
 A 76×48 bitfield split into four rooms by a cross of walls, each wall holding two **doors**. A door is a pure obstacle: open, its cells are walkable; closed, they are carved out of the bitfield and the `NavWorker` rebuilds the mesh without the gap. A handful of actors patrol back and forth between two fixed points (`home ⇄ away`); **click a door** on the map — or use the side-panel checkboxes — to open or close it. When a door toggles mid-route, `Crowd::set_nav` revalidates each actor's *remaining* path by line-of-sight: actors the door just blocked drop the stale corridor and replan, unaffected actors keep walking. A fully closed-off actor gets a red ring and retries every tick until a route reopens. `Door::rect` / `Door::horizontal` / `Door::vertical` are the demo's door-authoring helpers.
 
+### Multi-tile world demo
+
+```
+cargo run -p rsnav-world-demo --release
+```
+
+Place independent navmesh tiles in a shared world and path across the seams. Spawn tiles from the palette (Open / Holed / Pillars), then with the **Move** tool drag them edge-to-edge — seams re-stitch live, links shown as green segments. The **Path** tool (right-click source, left-click goal) routes across tiles; the **Vis** tool (right-click source, move cursor) draws a cross-tile line-of-sight ray, green clear / red blocked. Links are created purely by placement (overlapping border edges auto-connect) — there's no manual weld. Built on `rsnav_navigation::TiledWorld`.
+
 ### Programmatic use
 
 Each crate ships a runnable example (`cargo run -p <crate> --example <name>`):
@@ -135,6 +143,7 @@ Each crate ships a runnable example (`cargo run -p <crate> --example <name>`):
 | `rsnav-bsp` | `locate_and_nearest` | BVH point-in-mesh + nearest-point queries. |
 | `rsnav-navigation` | `find_path` | A* + funnel with `distance_from_wall`. |
 | `rsnav-navigation` | `visibility_region` | Star-shaped visibility polygon from a point (sampled). |
+| `rsnav-navigation` | `tiled_world` | Place 3 tiles in a row, stitch the seams, path across all of them around an obstacle. |
 | `rsnav-pathing` | `follow_path` | Simulated agent walking a polyline with lookahead + anti-shortcut. |
 | `rsnav-dynamic` | `live_worker` | Spawn a `NavWorker`, place + demolish an obstacle, print telemetry events. |
 | `rsnav-crowd` | `two_agents_pass` | Two agents head-on on an open arena; print per-tick positions and verify the sampled-VO never overlapped them. |
@@ -148,7 +157,7 @@ Each crate ships a runnable example (`cargo run -p <crate> --example <name>`):
 | `rsnav-polygon-extract` | Bitfield → `PolygonWithHoles`. 4-connectivity region detection, optional collinear-vertex removal, optional zigzag → diagonal smoothing, min-area culling. |
 | `rsnav-navmesh` | Runtime mesh: flat vertices + triangles, per-triangle adjacency, edge constraint markers, area, centroid, connected-component region IDs. Per-region accessors (triangles / area / centroid / bounds), area-weighted `random_point` sampling for spawns, `boundary_edges` outline iteration. Versioned little-endian binary format ([FORMAT.md](crates/navmesh/FORMAT.md)). |
 | `rsnav-bsp` | BVH (AABB-tree) over a `NavMesh`. `locate(point)` and `nearest(point)`, both `O(log n)` average, plus `query_aabb` broad-phase range queries. |
-| `rsnav-navigation` | A* across triangle adjacency, Simple Stupid Funnel string-pull, triangle-walk line-of-sight, nearest-point. `distance_from_wall` rejects narrow portals and pulls portal endpoints inward at wall vertices. |
+| `rsnav-navigation` | A* across triangle adjacency, Simple Stupid Funnel string-pull, triangle-walk line-of-sight, nearest-point. `distance_from_wall` rejects narrow portals and pulls portal endpoints inward at wall vertices. **Doors**: runtime edge-cuts (`DoorSet`) — closing a door promotes internal portal edges to walls via one shared `WallInfo` oracle, so A*/LOS/visibility/clearance all react with no mesh or BSP rebuild. **`NavWorld<M>`**: owns `(NavMesh, Bsp, DoorSet, WallInfo)` + user metadata (`NavMetadata` trait, `zone_crossings` for "entered/left zone" path events). **`TiledWorld`**: multi-tile worlds — independent navmeshes placed by world offset, seams auto-stitched by overlapping border edges, cross-tile A* + LOS. |
 | `rsnav-pathing` | `PathFollower`: lookahead + monotone arc-progress projection + anti-shortcut bias at corners. No navmesh dependency — operates on any polyline. |
 | `rsnav-dynamic` | `NavWorker`: background-thread navmesh updates driven by `Bitfield` snapshots, with lock-free `poll_swap` for game loops. Typed `NavListener` events (`BuildStarted` / `Completed` / `Failed`) and a polling `NavStats` accessor for HUDs and ops dashboards. Coalesces rapid submissions — only the newest snapshot is built. |
 | `rsnav-crowd` | Multi-agent crowd primitive: per-agent funnel-pulled corridor + sampled velocity-obstacle local avoidance with per-agent radius. `Crowd::set_nav` keeps still-valid paths across navmesh swaps instead of replanning the whole population. Snaps agents back to the mesh if avoidance pushes them off. No FSM, no formation logic, no slot reservation — those live in user code. |
@@ -157,6 +166,7 @@ Each crate ships a runnable example (`cargo run -p <crate> --example <name>`):
 | `rsnav-rtsim` | RTS-style dynamic-obstacles testbed (the *Dynamic-obstacles* app above). |
 | `rsnav-crowd-demo` | Multi-agent peon-economy testbed (the *Multi-agent crowd* app above). |
 | `rsnav-door-demo` | Togglable-doors testbed (the *Doors* app above). |
+| `rsnav-world-demo` | Multi-tile world editor: place navmesh tiles, drag them to stitch seams, path / line-of-sight across tiles (the *Multi-tile world* app below). |
 
 ## File format
 
@@ -166,11 +176,13 @@ Required sections: `META`, `VERTICES`, `TRIANGLES`. Optional (recomputed if abse
 
 ## Status
 
-Working and tested (~160 tests pass workspace-wide):
+Working and tested (~205 tests pass workspace-wide):
 
 - ✅ CDT round-trip against `triangle.c` reference (`A.poly` → 29 triangles, byte-exact)
 - ✅ 200-point random Delaunay stress passes the empty-circumcircle test
 - ✅ Wall-distance clearance pathing (rejects narrow portals, pulls funnel endpoints off walls)
+- ✅ Runtime doors: closing an edge-cut blocks A*/LOS at the door, opening restores it, mesh & BSP never rebuilt
+- ✅ Multi-tile worlds: independent tiles auto-stitch on overlapping borders (incl. mismatched seam triangulations) and path/LOS across seams
 - ✅ Real gonav-format fixtures (representative loads: ~1900 tris / 6 regions and ~1250 tris / 23 regions) build clean when pointed at via `--testdata`
 
 Deliberate v1 omissions:
@@ -180,6 +192,7 @@ Deliberate v1 omissions:
 - Conforming-Delaunay midpoint splitting (`conformingedge` in `triangle`).
 - Visibility-region exact (Asano/Suri sweep). The shipped `visibility_region` uses uniform angular sampling — exact enough for visualization at typical resolutions.
 - Interactive pan/zoom in the demo (only auto-fit + Fit-view button).
+- `TiledWorld` v1: translation-only tile offsets (no rotation), links always open (no per-seam doors yet), no agent clearance across seams, and a slight funnel soft-corner at T-junction seams where one tile's edge links to two of its neighbor's (aligned grids are exact; the fix is merging collinear link portals).
 
 ## References
 

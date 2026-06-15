@@ -6,7 +6,7 @@ use rsnav_common::geom::{point_in_triangle, segment_intersection};
 use rsnav_common::{TriangleId, Vertex};
 use rsnav_navmesh::NavMesh;
 
-use crate::wall::is_wall_edge_local;
+use crate::wall::WallInfo;
 
 /// Outcome of a line-of-sight query.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -40,8 +40,13 @@ pub enum LineOfSightResult {
 ///
 /// `from` must lie inside `start_tri`. Callers typically obtain
 /// `start_tri` via `bsp.locate(from)`.
+///
+/// `walls` is the wall oracle — pass one built with
+/// [`WallInfo::from_navmesh_with_doors`] and the ray will stop at a *closed*
+/// door exactly as it stops at a static wall.
 pub fn line_of_sight(
     nav: &NavMesh,
+    walls: &WallInfo,
     start_tri: TriangleId,
     from: Vertex,
     to: Vertex,
@@ -99,7 +104,7 @@ pub fn line_of_sight(
             }
         };
 
-        if is_wall_edge_local(tri, edge) {
+        if walls.is_wall_edge(tri, edge) {
             return LineOfSightResult::Blocked { point: hit };
         }
 

@@ -120,7 +120,10 @@ fn oriented_portal(
 
 /// Classic Simple Stupid Funnel (Mononen). `portals[i] = (left, right)`
 /// in travel order. Returns the string-pulled polyline.
-fn string_pull(portals: &[(Vertex, Vertex)]) -> Vec<Vertex> {
+///
+/// Pure geometry — no mesh, no coordinate space — so the tiled pathfinder
+/// ([`crate::tiled`]) reuses it over world-space portals.
+pub(crate) fn string_pull(portals: &[(Vertex, Vertex)]) -> Vec<Vertex> {
     if portals.is_empty() {
         return Vec::new();
     }

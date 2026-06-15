@@ -75,7 +75,7 @@ use std::sync::Arc;
 
 use rsnav_common::Vertex;
 use rsnav_dynamic::NavBuild;
-use rsnav_navigation::{find_path, path_clear, PathOptions};
+use rsnav_navigation::{find_path, path_clear, PathOptions, WallInfo};
 
 // =========================================================================
 // Public types
@@ -355,6 +355,10 @@ impl Crowd {
     /// late replan it would save.
     pub fn set_nav(&mut self, nav: Arc<NavBuild>) {
         self.nav = nav.clone();
+        // One static wall oracle for the whole revalidation sweep. The crowd
+        // has no doors yet; when it gains them this becomes the door-aware
+        // overlay rebuilt on door changes.
+        let walls = WallInfo::from_navmesh(&nav.navmesh);
         for slot in self.slots.iter_mut().flatten() {
             if slot.path.is_empty() {
                 continue;
@@ -366,7 +370,7 @@ impl Crowd {
             let mut route = Vec::with_capacity(slot.path.len() - start + 1);
             route.push(slot.agent.pos);
             route.extend_from_slice(&slot.path[start..]);
-            if !path_clear(&nav.navmesh, &nav.bsp, &route) {
+            if !path_clear(&nav.navmesh, &nav.bsp, &walls, &route) {
                 slot.invalidate_path();
             }
         }

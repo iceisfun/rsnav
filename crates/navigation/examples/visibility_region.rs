@@ -6,7 +6,7 @@
 
 use rsnav_bsp::Bsp;
 use rsnav_common::Vertex;
-use rsnav_navigation::visibility_region;
+use rsnav_navigation::{visibility_region, WallInfo};
 use rsnav_navmesh::build_from_cdt;
 use rsnav_triangle::{
     carve_holes, delaunay,
@@ -52,13 +52,15 @@ fn main() {
 
     println!("10×10 room with a 2×2 hole centered at (5, 5)\n");
 
+    let walls = WallInfo::from_navmesh(&nav);
+
     // Three observer positions to compare.
     for (label, source) in [
         ("center of north corridor    ", Vertex::new(5.0, 8.0)),
         ("south-west corner           ", Vertex::new(1.0, 1.0)),
         ("right next to the pillar    ", Vertex::new(3.9, 5.0)),
     ] {
-        let vr = visibility_region(&nav, &bsp, source, 20.0, 64)
+        let vr = visibility_region(&nav, &bsp, &walls, source, 20.0, 64)
             .expect("source should be inside the mesh");
         // Compute the bounding box of the visible region as a quick
         // proxy for "how far can the observer see?".

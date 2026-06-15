@@ -40,7 +40,8 @@ use std::collections::HashSet;
 use rsnav_common::{geom::nearest_point_on_segment, Vertex};
 use rsnav_navmesh::NavMesh;
 
-use crate::wall::is_wall_edge_local;
+use crate::doors::DoorSet;
+use crate::wall::WallInfo;
 
 /// Number of relaxation passes [`WallClearance::clamp`] runs. A single pass
 /// resolves a flat wall; the extra passes settle an agent jammed into a
@@ -68,8 +69,20 @@ pub struct WallClearance {
 }
 
 impl WallClearance {
-    /// Collect every wall segment of `nav`. `O(triangles)`.
+    /// Collect every static wall segment of `nav`. `O(triangles)`.
     pub fn from_navmesh(nav: &NavMesh) -> Self {
+        Self::from_walls(nav, &WallInfo::from_navmesh(nav))
+    }
+
+    /// Collect every wall segment of `nav`, including edges cut by *closed*
+    /// doors so a hand-moved agent is held off a shut door exactly as it is
+    /// held off a static wall. Rebuild whenever a door state changes.
+    pub fn from_navmesh_with_doors(nav: &NavMesh, doors: &DoorSet) -> Self {
+        Self::from_walls(nav, &WallInfo::from_navmesh_with_doors(nav, doors))
+    }
+
+    /// Collect every wall segment `walls` reports impassable. `O(triangles)`.
+    pub fn from_walls(nav: &NavMesh, walls: &WallInfo) -> Self {
         // A constrained edge shared by two triangles is reported by both (with
         // opposite endpoint order); a boundary edge by its single owner. Key on
         // the canonical (min, max) vertex-id pair so each physical wall lands in
@@ -78,7 +91,7 @@ impl WallClearance {
         let mut segments = Vec::new();
         for tri in &nav.triangles {
             for i in 0..3 {
-                if !is_wall_edge_local(tri, i) {
+                if !walls.is_wall_edge(tri, i) {
                     continue;
                 }
                 let (a, b) = tri.edge_vertices(i);

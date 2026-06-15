@@ -1791,6 +1791,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsnav-world-demo"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "egui",
+ "rsnav-common",
+ "rsnav-navigation",
+ "rsnav-navmesh",
+ "rsnav-triangle",
+]
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -7,7 +7,7 @@ use rsnav_common::geom::nearest_point_on_segment;
 use rsnav_common::{TriangleId, Vertex};
 use rsnav_navmesh::NavMesh;
 
-use crate::wall::{is_wall_edge_local, WallInfo};
+use crate::wall::WallInfo;
 
 #[derive(Copy, Clone, Debug)]
 struct Frontier {
@@ -122,7 +122,7 @@ pub fn astar(
         let cur_entry = entry[triangle.index()];
 
         for edge in 0..3 {
-            if is_wall_edge_local(tri, edge) {
+            if walls.is_wall_edge(tri, edge) {
                 continue;
             }
             let va = tri.vertices[(edge + 1) % 3];

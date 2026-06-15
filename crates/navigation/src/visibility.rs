@@ -21,6 +21,7 @@ use rsnav_common::Vertex;
 use rsnav_navmesh::NavMesh;
 
 use crate::los::{line_of_sight, LineOfSightResult};
+use crate::wall::WallInfo;
 
 #[derive(Clone, Debug)]
 pub struct VisibilityRegion {
@@ -41,9 +42,14 @@ pub struct VisibilityRegion {
 /// `samples` is clamped to a minimum of 8. 180 (=2° per sample) is a
 /// good default for hover rendering at typical zoom; bump higher for
 /// tighter corners or zoomed-in screenshots.
+///
+/// `walls` is the wall oracle — pass one built with
+/// [`WallInfo::from_navmesh_with_doors`] and rays are occluded by *closed*
+/// doors just as they are by static walls.
 pub fn visibility_region(
     nav: &NavMesh,
     bsp: &Bsp,
+    walls: &WallInfo,
     source: Vertex,
     max_radius: f64,
     samples: usize,
@@ -58,7 +64,7 @@ pub fn visibility_region(
             source.x + max_radius * theta.cos(),
             source.y + max_radius * theta.sin(),
         );
-        let hit = match line_of_sight(nav, src_tri, source, endpoint) {
+        let hit = match line_of_sight(nav, walls, src_tri, source, endpoint) {
             LineOfSightResult::Clear => endpoint,
             LineOfSightResult::Blocked { point } => point,
             // Unreachable in practice — we just located src_tri.
@@ -138,15 +144,17 @@ mod tests {
     #[test]
     fn outside_mesh_returns_none() {
         let (nav, bsp) = build_open_square();
-        assert!(visibility_region(&nav, &bsp, Vertex::new(-1.0, -1.0), 5.0, 64).is_none());
+        let walls = WallInfo::from_navmesh(&nav);
+        assert!(visibility_region(&nav, &bsp, &walls, Vertex::new(-1.0, -1.0), 5.0, 64).is_none());
     }
 
     #[test]
     fn open_room_visibility_is_full_circle() {
         let (nav, bsp) = build_open_square();
+        let walls = WallInfo::from_navmesh(&nav);
         // Source at the center; max_radius small enough to stay inside
         // the room. Every ray should reach `max_radius` (no walls hit).
-        let vr = visibility_region(&nav, &bsp, Vertex::new(5.0, 5.0), 2.0, 64).unwrap();
+        let vr = visibility_region(&nav, &bsp, &walls, Vertex::new(5.0, 5.0), 2.0, 64).unwrap();
         for p in &vr.boundary {
             let d = vr.source.distance(*p);
             assert!(
@@ -160,8 +168,9 @@ mod tests {
     #[test]
     fn ray_to_wall_clamps_at_wall() {
         let (nav, bsp) = build_open_square();
+        let walls = WallInfo::from_navmesh(&nav);
         // Source near the left wall; rays going west should clamp at x=0.
-        let vr = visibility_region(&nav, &bsp, Vertex::new(2.0, 5.0), 10.0, 64).unwrap();
+        let vr = visibility_region(&nav, &bsp, &walls, Vertex::new(2.0, 5.0), 10.0, 64).unwrap();
         // Find the ray closest to "due west" (angle π).
         let west_ix = vr
             .boundary
@@ -189,11 +198,12 @@ mod tests {
 
     #[test]
     fn hole_occludes_far_side_of_room() {
-        let (nav, bsp) = build_square_with_hole() ;
+        let (nav, bsp) = build_square_with_hole();
+        let walls = WallInfo::from_navmesh(&nav);
         // Source at (1, 5); the central hole occupies x ∈ [4, 6].
         // A ray going due east should NOT make it past the hole's near
         // wall (x = 4).
-        let vr = visibility_region(&nav, &bsp, Vertex::new(1.0, 5.0), 20.0, 128).unwrap();
+        let vr = visibility_region(&nav, &bsp, &walls, Vertex::new(1.0, 5.0), 20.0, 128).unwrap();
         // Find the ray closest to "due east" (angle 0).
         let east_ix = vr
             .boundary

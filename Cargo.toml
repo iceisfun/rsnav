@@ -13,6 +13,7 @@ members = [
     "crates/crowd-demo",
     "crates/door-demo",
     "crates/demo",
+    "crates/world-demo",
     "crates/fixtures",
     "crates/rtsim",
     "crates/smoothing-demo",
