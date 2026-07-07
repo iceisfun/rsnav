@@ -1,18 +1,16 @@
-//! Cross-layer pathfinding: world A* plus per-layer funnel stitching.
+//! Cross-layer pathfinding: world A* plus the cross-seam funnel.
 //!
 //! The corridor comes from [`crate::astar`], which crosses seams as
-//! ordinary portals. String-pulling currently runs **per layer run**:
-//! the corridor is split at seam crossings and each run is funneled
-//! from its entry point to the next crossing point with the ordinary 2D
-//! funnel. That renders correct, wall-respecting paths, but the path is
-//! pinned to the exact crossing point A* happened to enter each layer
-//! at — expect a small kink at seams until the concatenated cross-seam
-//! funnel (hinge unfolding) replaces this splice.
+//! ordinary portals. String-pulling runs **once over the whole
+//! corridor** ([`crate::funnel`]): portals from every layer concatenate
+//! in the shared horizontal frame, self-overlapping stretches (stacked
+//! floors, switchbacks) are hinge-unfolded first, and the single pull
+//! crosses every seam without a kink or restart.
 
 use rsnav_common::{TriangleId, Vertex};
-use rsnav_navigation::funnel::funnel;
 
-use crate::astar::{world_astar, CorridorStep, WorldAstarError};
+use crate::astar::{world_astar, WorldAstarError};
+use crate::funnel::cross_seam_funnel;
 use crate::{LayerId, World};
 
 /// A position on one layer of the world.
@@ -117,87 +115,9 @@ impl World {
             }
         })?;
 
-        let points = self.stitch_funnel(&corridor, start, goal, opts.distance_from_wall);
+        let points = cross_seam_funnel(self, &corridor, start, goal, opts.distance_from_wall);
         let triangles = corridor.iter().map(|s| (s.layer, s.tri)).collect();
         Ok(WorldPath { points, triangles })
-    }
-
-    /// Split the corridor into per-layer runs at seam crossings and
-    /// funnel each run independently.
-    fn stitch_funnel(
-        &self,
-        corridor: &[CorridorStep],
-        start: WorldPoint,
-        goal: WorldPoint,
-        distance_from_wall: f64,
-    ) -> Vec<WorldPathPoint> {
-        let mut points: Vec<WorldPathPoint> = Vec::new();
-        let mut run_start = 0usize;
-        let mut leg_from = start.pos;
-
-        for i in 0..corridor.len() {
-            let last_of_run =
-                i + 1 == corridor.len() || corridor[i + 1].layer != corridor[i].layer;
-            if !last_of_run {
-                continue;
-            }
-            let layer_id = corridor[run_start].layer;
-            let layer = self.layer(layer_id);
-            // The run's exit point: the entry point of the next run's
-            // first triangle (a seam crossing), or the goal.
-            let leg_to = if i + 1 == corridor.len() {
-                goal.pos
-            } else {
-                corridor[i + 1].entry
-            };
-            let tris: Vec<TriangleId> =
-                corridor[run_start..=i].iter().map(|s| s.tri).collect();
-            let leg = funnel(
-                &layer.navmesh,
-                &layer.walls,
-                &tris,
-                leg_from,
-                leg_to,
-                distance_from_wall,
-            );
-            // First leg keeps its start point; later legs already have
-            // the crossing point as their predecessor's last point.
-            let skip = usize::from(run_start != 0);
-            let leg_len = leg.len();
-            for (k, p) in leg.into_iter().enumerate().skip(skip) {
-                // The leg's last point at a seam is the next run's entry
-                // point — A* already knows its height exactly.
-                let z = if k + 1 == leg_len && i + 1 < corridor.len() {
-                    corridor[i + 1].entry_z
-                } else {
-                    let tri = layer
-                        .bsp
-                        .locate(&layer.navmesh, p)
-                        .unwrap_or(corridor[run_start].tri);
-                    layer.navmesh.z_at(tri, p)
-                };
-                points.push(WorldPathPoint {
-                    layer: layer_id,
-                    pos: p,
-                    z,
-                });
-            }
-            leg_from = leg_to;
-            run_start = i + 1;
-        }
-        if corridor.is_empty() {
-            points.push(WorldPathPoint {
-                layer: start.layer,
-                pos: start.pos,
-                z: 0.0,
-            });
-            points.push(WorldPathPoint {
-                layer: goal.layer,
-                pos: goal.pos,
-                z: 0.0,
-            });
-        }
-        points
     }
 }
 

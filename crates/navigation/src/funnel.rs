@@ -120,7 +120,14 @@ fn oriented_portal(
 
 /// Classic Simple Stupid Funnel (Mononen). `portals[i] = (left, right)`
 /// in travel order. Returns the string-pulled polyline.
-fn string_pull(portals: &[(Vertex, Vertex)]) -> Vec<Vertex> {
+///
+/// Public building block: multi-mesh callers (rsnav-world) assemble
+/// their own portal sequences — concatenated across seams, hinge-
+/// unfolded where the corridor's projection self-overlaps — and reuse
+/// this exact pull. Every output point is a *copy* of a portal endpoint
+/// (or the first portal's start), never derived arithmetic, so callers
+/// may map results back through a bit-exact lookup.
+pub fn string_pull(portals: &[(Vertex, Vertex)]) -> Vec<Vertex> {
     if portals.is_empty() {
         return Vec::new();
     }

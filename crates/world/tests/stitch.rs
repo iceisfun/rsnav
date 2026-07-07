@@ -164,17 +164,14 @@ fn path_crosses_the_seam_with_true_3d_cost() {
         }
     }
 
-    // Length: at least the 3D straight line (16 across, 4 up — the
-    // seam is transparent, so nothing should force a detour). The
-    // per-run splice still pins the crossing to A*'s greedy entry
-    // point, so allow its kink here; the concatenated cross-seam
-    // funnel is what removes it.
-    let lower = (16.0f64 * 16.0 + 4.0 * 4.0).sqrt(); // ≈ 16.49
+    // Length: exactly the surface geodesic — 8 flat, then √(8² + 4²)
+    // up the ramp. The cross-seam funnel pulls one string over the
+    // whole corridor, so the seam adds no kink.
+    let expect = 8.0 + (8.0f64 * 8.0 + 4.0 * 4.0).sqrt();
     let len = path.length();
-    assert!(len >= lower - 1e-9, "path length {len} beats the 3D straight line");
     assert!(
-        len < lower + 2.0,
-        "path length {len} far above the straight line {lower}: {:?}",
+        (len - expect).abs() < 1e-9,
+        "path length {len} != surface geodesic {expect}: {:?}",
         path.points
     );
 }

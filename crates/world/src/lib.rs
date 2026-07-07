@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 mod astar;
+mod funnel;
 mod path;
 
 pub use astar::WorldAstarError;
