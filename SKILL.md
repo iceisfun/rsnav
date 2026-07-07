@@ -53,6 +53,10 @@ crates/
   crowd/           rsnav-crowd           multi-agent crowd primitive
                                          (per-agent corridor + sampled-VO
                                          local avoidance + spatial hash)
+  world/           rsnav-world           multi-layer 3D world: seam
+                                         stitching, cross-layer A* +
+                                         cross-seam funnel (hinge unfold),
+                                         z-disambiguated locate/nearest
   demo/            rsnav-demo            egui authoring + probing app
   fixtures/        rsnav-fixtures        CLI runner for JSON fixtures
   rtsim/           rsnav-rtsim           RTS-style dynamic-obstacles testbed
@@ -109,6 +113,67 @@ smaller nonzero wall marker), and iterates until no more ears qualify.
 Cost: a sliver of walkable area per clipped ear, bounded by the
 threshold. Skip it for hand-authored PSLGs where small ears are
 intentional geometry.
+
+---
+
+## Multi-layer 3D worlds (rsnav-world)
+
+A 3D walkable area is decomposed into N **layers** — planar-projectable
+charts sharing one global horizontal frame, each built by the ordinary
+2D pipeline above, with per-vertex heights in `NavMesh::vertex_z`
+(`nav.assign_vertex_z(|v| height_at(v))` after `build_from_cdt`;
+serialized in the optional `VERTEX_Z` binary section).
+
+Where two layers meet along *continuous walkable floor*, the cut is a
+**seam**: one 3D polyline inserted **verbatim into both layers' PSLGs**
+as constrained segments carrying the same connection marker
+(`rsnav_navmesh::connection_marker(id)`; ordinary wall markers must stay
+below `CONNECTION_MARKER_BASE`). The CDT inserts no Steiner points, so
+both meshes come out holding bit-identical seam vertices —
+`World::build` matches them by exact key, not tolerance. A dangling or
+ambiguous seam edge **fails the build** (`WorldBuildError`).
+
+Seams are *not* jump links: a seam is floor. A* crosses it as an
+ordinary portal (3D step costs and heuristic — slopes cost their true
+surface length), and the funnel pulls one string over the whole
+corridor. Self-overlapping corridors (stacked floors, switchback ramps)
+are hinge-unfolded — reflected across the seam line — before the pull,
+so the seam adds zero kink. Reserve actual jump links (ledge drops,
+ladders, teleports) for application-level connections with their own
+traversal semantics.
+
+```rust
+use rsnav_world::{World, WorldPoint, WorldPathOptions};
+
+// Each layer: Pslg (+ seam chains, marker = connection_marker(id))
+//   → delaunay → form_skeleton → carve_holes → build_from_cdt
+//   → nav.assign_vertex_z(..)
+let world = World::build(vec![layer0, layer1, /* … */])?;
+
+world.reachable((0, tri_a), (1, tri_b));          // O(1), crosses seams
+let (layer, tri) = world.locate(p, agent_z, max_dz)?; // stacked floors: min |Δz| wins
+let snap = world.nearest(p, agent_z)?;            // 3D-distance snap
+let path = world.find_path(
+    WorldPoint { layer: 0, pos: start },
+    WorldPoint { layer: 1, pos: goal },
+    &WorldPathOptions { distance_from_wall: 0.4 },
+)?; // path.points: Vec<WorldPathPoint { layer, pos, z }>
+```
+
+Related single-mesh switches: `WallInfo::from_navmesh_permeable` /
+`WallClearance::from_navmesh_permeable` treat connection-marked edges
+as seams (never wall vertices → clearance/funnel don't shrink seam
+portals; two-sided seam edges traversable; *boundary* seam edges still
+block single-mesh traversal — only the `World` router crosses them).
+
+Known artifact: A*'s greedy portal entries can pin a crossing to a
+seam-chain vertex when the optimum lies on the neighboring sub-edge
+(Detour-class tile-boundary pinning; excess bounded by the corner
+detour). A cross-seam LOS smoothing pass is the planned fix.
+
+Not yet wired for multi-layer: LOS/visibility across seams, crowd
+(needs per-agent layer + Δz neighbor filter), and rsnav-dynamic
+rebuilds of individual layers with connection re-matching.
 
 ---
 
