@@ -78,6 +78,19 @@ pub struct Connection {
     pub sub_edges: Vec<SubEdge>,
 }
 
+/// Result of [`World::nearest`]: the closest on-surface point across
+/// all layers, by 3D distance.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct WorldNearest {
+    pub layer: LayerId,
+    pub triangle: TriangleId,
+    pub point: Vertex,
+    /// Surface height at `point`.
+    pub z: f64,
+    /// 3D distance from the query point.
+    pub distance: f64,
+}
+
 /// Why [`World::build`] rejected its input.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WorldBuildError {
@@ -306,6 +319,60 @@ impl World {
     #[inline]
     pub fn seam_neighbor(&self, r: EdgeRef) -> Option<EdgeRef> {
         self.links.get(&r).copied()
+    }
+
+    /// Locate the triangle containing the 3D point `(pos, z)`.
+    ///
+    /// Stacked floors give a plain 2D locate several valid answers —
+    /// one per layer whose footprint covers `pos`. This collects every
+    /// layer's candidate and keeps the one whose interpolated surface
+    /// height is closest to `z`. `max_dz` bounds the vertical snap
+    /// (pass the agent's height, or `f64::INFINITY` to always take the
+    /// closest floor); a point vertically farther than `max_dz` from
+    /// every surface returns `None`.
+    pub fn locate(
+        &self,
+        pos: Vertex,
+        z: f64,
+        max_dz: f64,
+    ) -> Option<(LayerId, TriangleId)> {
+        let mut best: Option<(f64, LayerId, TriangleId)> = None;
+        for (li, layer) in self.layers.iter().enumerate() {
+            let Some(tri) = layer.bsp.locate(&layer.navmesh, pos) else {
+                continue;
+            };
+            let dz = (layer.navmesh.z_at(tri, pos) - z).abs();
+            if dz <= max_dz && best.map_or(true, |(bdz, _, _)| dz < bdz) {
+                best = Some((dz, li as LayerId, tri));
+            }
+        }
+        best.map(|(_, l, t)| (l, t))
+    }
+
+    /// Snap the 3D point `(pos, z)` to the closest point on any layer's
+    /// walkable surface, by full 3D distance (horizontal snap distance
+    /// and height difference both count). Returns the layer, triangle,
+    /// snapped position, its surface height, and the 3D distance.
+    /// `None` only when every layer is empty.
+    pub fn nearest(&self, pos: Vertex, z: f64) -> Option<WorldNearest> {
+        let mut best: Option<WorldNearest> = None;
+        for (li, layer) in self.layers.iter().enumerate() {
+            let Some(n) = layer.bsp.nearest(&layer.navmesh, pos) else {
+                continue;
+            };
+            let nz = layer.navmesh.z_at(n.triangle, n.point);
+            let d3 = (n.distance * n.distance + (nz - z) * (nz - z)).sqrt();
+            if best.as_ref().map_or(true, |b| d3 < b.distance) {
+                best = Some(WorldNearest {
+                    layer: li as LayerId,
+                    triangle: n.triangle,
+                    point: n.point,
+                    z: nz,
+                    distance: d3,
+                });
+            }
+        }
+        best
     }
 
     /// World-wide reachability: `true` if a path can exist between the
