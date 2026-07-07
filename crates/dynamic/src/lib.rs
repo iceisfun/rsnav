@@ -52,7 +52,7 @@ use rsnav_bsp::Bsp;
 use rsnav_navmesh::{build_from_cdt, NavMesh};
 use rsnav_polygon_extract::{extract, Bitfield, ExtractOptions};
 use rsnav_triangle::{
-    carve_holes, delaunay, form_skeleton,
+    carve_holes, clip_ears, delaunay, form_skeleton,
     pslg::{Pslg, PslgHole, PslgSegment, PslgVertex},
     CdtMesh, DivConqOptions, SegmentInsertError, VertexSlot,
 };
@@ -66,6 +66,13 @@ pub struct BuildOptions {
     pub perimeter_marker: i32,
     /// Marker assigned to hole-perimeter constraint segments.
     pub hole_marker: i32,
+    /// Post-carve cleanup: clip "ear" triangles (two wall edges + one
+    /// interior edge) whose area is `< clip_ears_max_area`. `0.0` disables
+    /// the pass. Default `0.6`, tuned for unit-cell bitfield inputs (half-
+    /// cell stair-step artifacts have area `0.5`). For hand-authored PSLGs
+    /// at a different scale, scale this in proportion (or set to `0.0` if
+    /// small ears are intentional geometry).
+    pub clip_ears_max_area: f64,
 }
 
 impl Default for BuildOptions {
@@ -74,6 +81,7 @@ impl Default for BuildOptions {
             extract: ExtractOptions::default(),
             perimeter_marker: 1,
             hole_marker: 2,
+            clip_ears_max_area: 0.6,
         }
     }
 }
@@ -293,6 +301,9 @@ pub fn build_navmesh_from_bitfield(
     delaunay(&mut cdt, DivConqOptions::default());
     form_skeleton(&mut cdt, &pslg, None).map_err(BuildError::SegmentInsertion)?;
     carve_holes(&mut cdt, &pslg, false);
+    if opts.clip_ears_max_area > 0.0 {
+        clip_ears(&mut cdt, opts.clip_ears_max_area);
+    }
 
     let navmesh = build_from_cdt(&cdt);
     if navmesh.triangle_count() == 0 {
@@ -592,6 +603,39 @@ mod tests {
         assert!(build.navmesh.triangle_count() > 0);
         assert!(build.build_ms >= 0.0);
         assert_eq!(build.generation, 0); // direct callers see 0
+    }
+
+    /// Stair-shaped walkable region in a bitfield. Enabling
+    /// `clip_ears_max_area` should leave the same or fewer triangles, and
+    /// the same number of connected regions (clipping never splits a
+    /// region).
+    #[test]
+    fn clip_ears_option_reduces_triangle_count() {
+        // 8x8 triangular walkable area (cells where col + row < 8).
+        let w = 8u32;
+        let h = 8u32;
+        let mut data = vec![false; (w as usize) * (h as usize)];
+        for row in 0..h {
+            for col in 0..w {
+                if col + row < w {
+                    data[(row as usize) * (w as usize) + col as usize] = true;
+                }
+            }
+        }
+        let bf = Bitfield::new(w, h, data).expect("dims");
+
+        // Explicit baseline (defaults are now smoothing-on, clip-on).
+        let mut opts_off = BuildOptions::default();
+        opts_off.extract.diagonal_smoothing = false;
+        opts_off.clip_ears_max_area = 0.0;
+        let opts_on = BuildOptions::default();
+
+        let off = build_navmesh_from_bitfield(&bf, &opts_off).expect("baseline");
+        let on = build_navmesh_from_bitfield(&bf, &opts_on).expect("with clip");
+
+        assert!(on.navmesh.triangle_count() <= off.navmesh.triangle_count());
+        // The region should remain a single connected component either way.
+        assert_eq!(on.navmesh.region_count, off.navmesh.region_count);
     }
 
     #[test]

@@ -17,6 +17,7 @@ members = [
     "crates/rtsim",
     "crates/voxel",
     "crates/voxel-demo",
+    "crates/smoothing-demo",
 ]
 
 [workspace.package]
