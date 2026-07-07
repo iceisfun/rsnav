@@ -393,6 +393,125 @@ fn build_navmesh_model(
     (filled, wire)
 }
 
+/// Build the rsnav-layers layered-world view: every layer's navmesh as
+/// flat-shaded triangles at their true heights (one color per layer),
+/// plus the matched seam sub-edges as bright cylinders. This is the
+/// conformed-seam decomposition the `rsnav-world` runtime consumes —
+/// contrast it with the watershed navmesh view.
+#[allow(clippy::type_complexity)]
+fn build_layers_models(
+    ctx: &Context,
+    soup: &PolySoup,
+    voxel_cell_size: f64,
+    walkability: &WalkabilityConfig,
+) -> (
+    Option<(Gm<Mesh, ColorMaterial>, Wireframe, Gm<InstancedMesh, ColorMaterial>)>,
+    String,
+) {
+    if walkability.max_step_layers(voxel_cell_size) < 2 {
+        return (
+            None,
+            format!(
+                "voxel {voxel_cell_size} too coarse: need ≤ step/2 = {}",
+                walkability.max_step_height * 0.5
+            ),
+        );
+    }
+    let cfg = rsnav_layers::LayersConfig {
+        voxel_size: voxel_cell_size,
+        walkability: walkability.clone(),
+        ..Default::default()
+    };
+    let built = match rsnav_layers::build_layered_world(soup, &cfg) {
+        Ok(b) => b,
+        Err(e) => return (None, format!("build failed: {e}")),
+    };
+    let world = &built.world;
+    let (ox, oy) = (built.origin.x as f32, built.origin.y as f32);
+    let lift = (voxel_cell_size * 0.20) as f32;
+
+    let mut positions: Vec<three_d::Vec3> = Vec::new();
+    let mut colors: Vec<Srgba> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    for li in 0..world.layer_count() as u32 {
+        let nav = &world.layer(li).navmesh;
+        let color = region_color(RegionId(li));
+        for tri in &nav.triangles {
+            for &vi in &tri.vertices {
+                let v = nav.vertex(vi);
+                indices.push(positions.len() as u32);
+                positions.push(three_d::vec3(
+                    v.x as f32 + ox,
+                    v.y as f32 + oy,
+                    nav.vertex_z(vi) as f32 + lift,
+                ));
+                colors.push(color);
+            }
+        }
+    }
+    let cpu_mesh = CpuMesh {
+        positions: Positions::F32(positions),
+        indices: Indices::U32(indices),
+        colors: Some(colors),
+        ..Default::default()
+    };
+    let mut material = ColorMaterial {
+        color: Srgba::WHITE,
+        ..Default::default()
+    };
+    material.render_states.cull = three_d::Cull::None;
+    let filled = Gm::new(Mesh::new(ctx, &cpu_mesh), material);
+    let wire = Wireframe::new_from_cpu_mesh(ctx, &cpu_mesh, 1.0, Srgba::new_opaque(20, 20, 30));
+
+    // Seam sub-edges: hot magenta cylinders — these are the transparent
+    // portals the cross-layer A*/funnel walk straight through.
+    let radius = (voxel_cell_size * 0.10) as f32;
+    let seam_lift = lift + (voxel_cell_size * 0.10) as f32;
+    let mut transformations: Vec<Mat4> = Vec::new();
+    let mut seam_colors: Vec<Srgba> = Vec::new();
+    for conn in world.connections() {
+        for se in &conn.sub_edges {
+            let nav = &world.layer(se.a.layer).navmesh;
+            let tri = nav.triangle(se.a.tri);
+            let (va, vb) = tri.edge_vertices(se.a.edge as usize);
+            let (pa, pb) = (nav.vertex(va), nav.vertex(vb));
+            let a3 = three_d::vec3(
+                pa.x as f32 + ox,
+                pa.y as f32 + oy,
+                nav.vertex_z(va) as f32 + seam_lift,
+            );
+            let b3 = three_d::vec3(
+                pb.x as f32 + ox,
+                pb.y as f32 + oy,
+                nav.vertex_z(vb) as f32 + seam_lift,
+            );
+            transformations.push(edge_transform(a3, b3, radius));
+            seam_colors.push(Srgba::new_opaque(255, 40, 200));
+        }
+    }
+    let cyl = CpuMesh::cylinder(8);
+    let instances = Instances {
+        transformations,
+        colors: Some(seam_colors),
+        ..Default::default()
+    };
+    let mut seam_material = ColorMaterial {
+        color: Srgba::WHITE,
+        ..Default::default()
+    };
+    seam_material.render_states.cull = three_d::Cull::Back;
+    let seams = Gm::new(InstancedMesh::new(ctx, &instances, &cyl), seam_material);
+
+    let status = format!(
+        "{} layers, {} connections ({} seam links), {} spans",
+        built.stats.per_layer.len(),
+        built.stats.connections,
+        built.stats.seam_links,
+        built.stats.walkable_spans,
+    );
+    (Some((filled, wire, seams)), status)
+}
+
 /// Build an instanced-cylinder model showing portal polylines between
 /// regions. Each portal is colored by a hash of its (a, b) pair so
 /// adjacent portals look distinct.
@@ -966,6 +1085,14 @@ fn main() {
     let mut show_navmesh = false;
     let mut show_portals = true;
     let mut show_path = true;
+    let mut show_layers = false;
+    let mut layers_dirty = true;
+    let mut layers_status = String::from("(enable to build)");
+    let mut layers_models: Option<(
+        Gm<Mesh, ColorMaterial>,
+        Wireframe,
+        Gm<InstancedMesh, ColorMaterial>,
+    )> = None;
     let mut fly_speed: f32 = 5.0;
     let mut pending_pick: Option<PickTarget> = None;
     let mut show_pick_debug: bool = false;
@@ -1074,6 +1201,10 @@ fn main() {
                         ui.checkbox(&mut show_walkable, "Walkable surfaces");
                         ui.checkbox(&mut show_contours, "Region contours");
                         ui.checkbox(&mut show_navmesh, "Navmesh (CDT, 3D)");
+                        ui.checkbox(&mut show_layers, "Layered world (rsnav-layers)");
+                        if show_layers {
+                            ui.label(egui::RichText::new(layers_status.as_str()).small());
+                        }
                         ui.checkbox(&mut show_portals, "Portals");
                         ui.checkbox(&mut show_path, "Path");
                         ui.checkbox(&mut show_pick_debug, "Pick debug (hover sphere)")
@@ -1375,6 +1506,16 @@ fn main() {
             current_path = p;
             path_model = m;
         }
+        if scene_changed || voxel_changed || walkable_changed {
+            layers_dirty = true;
+        }
+        if show_layers && layers_dirty {
+            let (m, s) =
+                build_layers_models(&ctx, &current_soup, voxel_cell_size, &walkability);
+            layers_models = m;
+            layers_status = s;
+            layers_dirty = false;
+        }
 
         camera.set_viewport(frame_input.viewport);
 
@@ -1522,6 +1663,13 @@ fn main() {
         if show_navmesh {
             renderables.push(&navmesh_model);
             renderables.push(&navmesh_wire);
+        }
+        if show_layers {
+            if let Some((filled, wire, seams)) = &layers_models {
+                renderables.push(filled);
+                renderables.push(wire);
+                renderables.push(seams);
+            }
         }
         if show_portals {
             renderables.push(&portals_model);

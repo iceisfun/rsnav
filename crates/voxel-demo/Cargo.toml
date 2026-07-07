@@ -14,4 +14,6 @@ path = "src/main.rs"
 [dependencies]
 rsnav-common.workspace = true
 rsnav-voxel.workspace = true
+rsnav-layers.workspace = true
+rsnav-world.workspace = true
 three-d = { version = "0.19", features = ["egui-gui"] }

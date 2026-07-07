@@ -2450,7 +2450,9 @@ name = "rsnav-voxel-demo"
 version = "0.1.0"
 dependencies = [
  "rsnav-common",
+ "rsnav-layers",
  "rsnav-voxel",
+ "rsnav-world",
  "three-d",
 ]
 

@@ -57,6 +57,11 @@ crates/
                                          stitching, cross-layer A* +
                                          cross-seam funnel (hinge unfold),
                                          z-disambiguated locate/nearest
+  layers/          rsnav-layers          automatic 3D front end: triangle
+                                         soup -> span heightfield ->
+                                         layer discovery (cuts on the
+                                         overlap rim) -> conformed PSLGs
+                                         -> World; ships layers-cli
   demo/            rsnav-demo            egui authoring + probing app
   fixtures/        rsnav-fixtures        CLI runner for JSON fixtures
   rtsim/           rsnav-rtsim           RTS-style dynamic-obstacles testbed
@@ -174,6 +179,37 @@ detour). A cross-seam LOS smoothing pass is the planned fix.
 Not yet wired for multi-layer: LOS/visibility across seams, crowd
 (needs per-agent layer + Δz neighbor filter), and rsnav-dynamic
 rebuilds of individual layers with connection re-matching.
+
+### Automatic decomposition (rsnav-layers)
+
+When no hand decomposition exists, `rsnav-layers` builds the whole
+thing from a raw triangle soup: voxelize (rsnav-voxel, z-up) → stacked
+walkable spans with step links → layer assignment → tagged outlines →
+conformed per-layer PSLGs → `World::build`. Layer assignment is
+three-phase (plain-floor base layers atomically; a multi-source BFS
+wave adopting contested spans into the *nearest* accepting layer; then
+leftovers + a merge pass), with a conflict rule stronger than column
+injectivity: spans in 8-adjacent cells out of vertical step reach also
+conflict (their charts would share a 2D vertex needing two heights).
+Cuts therefore land on the rim of the vertical-overlap set — bridge
+abutments, ramp crests — never in open continuous ground.
+
+```rust
+use rsnav_layers::{build_layered_world, LayersConfig};
+let built = build_layered_world(&soup, &LayersConfig::default())?;
+// built.world (mesh XY local to built.origin, z world-absolute),
+// built.stats: layers, connections, per-layer spans/triangles/area.
+```
+
+Constraint: `voxel_size <= max_step_height / 2` (asserted) — coarser
+voxels make the two-voxel gap at a strip split exceed walk-link reach
+and rising surfaces isolate seamlessly.
+
+CLI: `cargo run -p rsnav-layers --bin layers-cli --release --
+<file.obj|stl> [--yup] [--voxel N] [--step N] [--clearance N]
+[--slope DEG] [--path]`. Viewer: `rsnav-voxel-demo` has a "Layered
+world (rsnav-layers)" checkbox rendering per-layer colored meshes at
+true heights with magenta seam sub-edges.
 
 ---
 
