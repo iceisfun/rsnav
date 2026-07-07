@@ -2,6 +2,42 @@
 
 use rsnav_common::{Aabb, Triangle, TriangleId, Vertex, VertexId};
 
+// --- Connection markers ----------------------------------------------------
+
+/// Start of the marker range reserved for cross-layer **connection**
+/// (seam) edges in multi-level worlds.
+///
+/// A connection edge is a constrained PSLG segment inserted verbatim
+/// into the two layers it joins; the marker `CONNECTION_MARKER_BASE + id`
+/// tags both copies with the same connection `id` so the stitcher can
+/// match them up bit-exactly. Ordinary wall markers must stay below this
+/// value (any `i32` in `1..CONNECTION_MARKER_BASE`).
+///
+/// Connection edges are *transparent* to navigation when the caller opts
+/// in (see `WallInfo` in rsnav-navigation): they are seams in continuous
+/// walkable floor, not walls.
+pub const CONNECTION_MARKER_BASE: i32 = 0x4000_0000;
+
+/// `true` if `marker` tags a cross-layer connection edge.
+#[inline]
+pub fn is_connection_marker(marker: i32) -> bool {
+    marker >= CONNECTION_MARKER_BASE
+}
+
+/// The marker value tagging connection `id`.
+#[inline]
+pub fn connection_marker(id: u32) -> i32 {
+    CONNECTION_MARKER_BASE
+        .checked_add(i32::try_from(id).expect("connection id fits i32"))
+        .expect("connection id overflows the marker range")
+}
+
+/// The connection id carried by `marker`, or `None` for ordinary markers.
+#[inline]
+pub fn connection_id(marker: i32) -> Option<u32> {
+    is_connection_marker(marker).then(|| (marker - CONNECTION_MARKER_BASE) as u32)
+}
+
 /// One triangle in the navmesh, packed with its derived metadata.
 ///
 /// `vertices` is in CCW order (positive signed area).

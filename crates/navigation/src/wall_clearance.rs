@@ -70,6 +70,18 @@ pub struct WallClearance {
 impl WallClearance {
     /// Collect every wall segment of `nav`. `O(triangles)`.
     pub fn from_navmesh(nav: &NavMesh) -> Self {
+        Self::build(nav, false)
+    }
+
+    /// Like [`from_navmesh`](Self::from_navmesh), but connection-marked
+    /// seam edges ([`rsnav_navmesh::is_connection_marker`]) are *not*
+    /// walls: the walkable floor continues on the neighboring layer, so
+    /// an agent must not be shoved away from a seam.
+    pub fn from_navmesh_permeable(nav: &NavMesh) -> Self {
+        Self::build(nav, true)
+    }
+
+    fn build(nav: &NavMesh, connections_permeable: bool) -> Self {
         // A constrained edge shared by two triangles is reported by both (with
         // opposite endpoint order); a boundary edge by its single owner. Key on
         // the canonical (min, max) vertex-id pair so each physical wall lands in
@@ -79,6 +91,11 @@ impl WallClearance {
         for tri in &nav.triangles {
             for i in 0..3 {
                 if !is_wall_edge_local(tri, i) {
+                    continue;
+                }
+                if connections_permeable
+                    && rsnav_navmesh::is_connection_marker(tri.edge_markers[i])
+                {
                     continue;
                 }
                 let (a, b) = tri.edge_vertices(i);

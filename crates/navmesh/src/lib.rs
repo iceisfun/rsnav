@@ -12,4 +12,7 @@ pub mod navmesh;
 
 pub use binary::{LoadError, SaveError, FORMAT_VERSION, MAGIC};
 pub use build::build_from_cdt;
-pub use navmesh::{BoundaryEdge, NavMesh, NavTriangle};
+pub use navmesh::{
+    connection_id, connection_marker, is_connection_marker, BoundaryEdge, NavMesh, NavTriangle,
+    CONNECTION_MARKER_BASE,
+};
