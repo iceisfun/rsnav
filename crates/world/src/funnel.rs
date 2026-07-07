@@ -31,7 +31,6 @@ use std::collections::HashMap;
 use rsnav_common::geom::orient2d;
 use rsnav_common::{TriangleId, Vertex};
 use rsnav_navigation::funnel::string_pull;
-use rsnav_navmesh::NavMesh;
 
 use crate::astar::{interp_edge_z, CorridorStep};
 use crate::path::{WorldPathPoint, WorldPoint};
@@ -193,7 +192,7 @@ pub(crate) fn cross_seam_funnel(
     let mut hinges: Vec<UnfoldedHinge> = Vec::new();
     // Bit-exact inverse map from unfolded corner → world point.
     let mut back: HashMap<(u64, u64), WorldPathPoint> = HashMap::new();
-    let mut remember = |map: &mut HashMap<(u64, u64), WorldPathPoint>,
+    let remember = |map: &mut HashMap<(u64, u64), WorldPathPoint>,
                         unfolded_p: Vertex,
                         world_p: WorldPathPoint| {
         map.entry((unfolded_p.x.to_bits(), unfolded_p.y.to_bits()))

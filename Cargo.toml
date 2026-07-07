@@ -19,6 +19,7 @@ members = [
     "crates/voxel-demo",
     "crates/smoothing-demo",
     "crates/world",
+    "crates/layers",
 ]
 
 [workspace.package]
@@ -39,6 +40,7 @@ rsnav-dynamic = { path = "crates/dynamic" }
 rsnav-crowd = { path = "crates/crowd" }
 rsnav-voxel = { path = "crates/voxel" }
 rsnav-world = { path = "crates/world" }
+rsnav-layers = { path = "crates/layers" }
 arc-swap = "1"
 
 [profile.release]

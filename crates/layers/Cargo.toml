@@ -1,0 +1,19 @@
+[package]
+name = "rsnav-layers"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Span-heightfield layer discovery: triangle soup -> conformed multi-layer World for rsnav"
+
+[dependencies]
+rsnav-common = { workspace = true }
+rsnav-navmesh = { workspace = true }
+rsnav-triangle = { workspace = true }
+rsnav-voxel = { workspace = true }
+rsnav-world = { workspace = true }
+
+[dev-dependencies]
+rsnav-bsp = { workspace = true }
+rsnav-navigation = { workspace = true }

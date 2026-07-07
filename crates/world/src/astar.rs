@@ -19,14 +19,11 @@ use rsnav_navmesh::NavMesh;
 
 use crate::{EdgeRef, LayerId, World};
 
-/// One step of the corridor A* walks: a triangle plus the point/height
-/// at which the route enters it.
+/// One step of the corridor A* walks.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct CorridorStep {
     pub layer: LayerId,
     pub tri: TriangleId,
-    pub entry: Vertex,
-    pub entry_z: f64,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -82,8 +79,6 @@ pub(crate) fn world_astar(
         return Ok(vec![CorridorStep {
             layer: start.0,
             tri: start.1,
-            entry: start_point,
-            entry_z: start_z,
         }]);
     }
 
@@ -109,7 +104,7 @@ pub(crate) fn world_astar(
 
     while let Some(Frontier { node, .. }) = heap.pop() {
         if node == goal_node {
-            return Ok(reconstruct(world, &came_from, &entry, &entry_z, start_node, goal_node));
+            return Ok(reconstruct(world, &came_from, start_node, goal_node));
         }
         if closed[node] {
             continue;
@@ -191,8 +186,6 @@ pub(crate) fn world_astar(
 fn reconstruct(
     world: &World,
     came_from: &[usize],
-    entry: &[Vertex],
-    entry_z: &[f64],
     start_node: usize,
     goal_node: usize,
 ) -> Vec<CorridorStep> {
@@ -200,12 +193,7 @@ fn reconstruct(
     let mut cur = goal_node;
     loop {
         let (layer, tri) = world.node_to_tri(cur);
-        steps.push(CorridorStep {
-            layer,
-            tri,
-            entry: entry[cur],
-            entry_z: entry_z[cur],
-        });
+        steps.push(CorridorStep { layer, tri });
         if cur == start_node {
             break;
         }
