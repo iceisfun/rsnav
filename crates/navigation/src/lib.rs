@@ -29,4 +29,5 @@ pub use path::{
     find_path, nearest_point, path_clear, NearestPoint, PathError, PathOptions, PathResult,
 };
 pub use visibility::{visibility_region, VisibilityRegion};
+pub use wall::WallInfo;
 pub use wall_clearance::WallClearance;

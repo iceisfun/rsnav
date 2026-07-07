@@ -18,6 +18,7 @@ members = [
     "crates/voxel",
     "crates/voxel-demo",
     "crates/smoothing-demo",
+    "crates/world",
 ]
 
 [workspace.package]
@@ -37,6 +38,7 @@ rsnav-pathing = { path = "crates/pathing" }
 rsnav-dynamic = { path = "crates/dynamic" }
 rsnav-crowd = { path = "crates/crowd" }
 rsnav-voxel = { path = "crates/voxel" }
+rsnav-world = { path = "crates/world" }
 arc-swap = "1"
 
 [profile.release]
