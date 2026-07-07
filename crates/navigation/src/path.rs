@@ -516,6 +516,109 @@ mod tests {
         );
     }
 
+    /// A 30×20 arena with a 10×10 hole offset below centre. From (5,9)
+    /// to (25,9) the under-the-hole channel (~22.8) beats the
+    /// over-the-top channel (~25.6) in the plane. Vertices at y <= 5 are
+    /// lifted to `ridge_z`, so the under channel additionally climbs and
+    /// descends that much. The flat interior points along y = 9 keep the
+    /// height interpolation local: without them a single huge triangle
+    /// would span from the elevated strip to the start point and lift
+    /// the start itself, flattening the very cost difference the test
+    /// needs to observe.
+    fn build_ridge_navmesh(ridge_z: f64) -> (NavMesh, Bsp) {
+        let pts = [
+            (0.0, 0.0),   // 0  outer
+            (30.0, 0.0),  // 1
+            (30.0, 20.0), // 2
+            (0.0, 20.0),  // 3
+            (10.0, 5.0),  // 4  hole, CCW
+            (20.0, 5.0),  // 5
+            (20.0, 15.0), // 6
+            (10.0, 15.0), // 7
+            (2.0, 9.0),   // 8  flat anchors, left band
+            (5.0, 9.0),   // 9
+            (8.0, 9.0),   // 10
+            (22.0, 9.0),  // 11 flat anchors, right band
+            (25.0, 9.0),  // 12
+            (28.0, 9.0),  // 13
+        ];
+        let mut mesh = CdtMesh::new();
+        for (x, y) in pts {
+            mesh.push_vertex(VertexSlot::new(Vertex::new(x, y), 0));
+        }
+        delaunay(&mut mesh, DivConqOptions::default());
+        let pslg = Pslg {
+            vertices: pts
+                .iter()
+                .map(|(x, y)| PslgVertex::new(Vertex::new(*x, *y)))
+                .collect(),
+            segments: vec![
+                PslgSegment { a: 0, b: 1, marker: 1 },
+                PslgSegment { a: 1, b: 2, marker: 1 },
+                PslgSegment { a: 2, b: 3, marker: 1 },
+                PslgSegment { a: 3, b: 0, marker: 1 },
+                PslgSegment { a: 4, b: 5, marker: 2 },
+                PslgSegment { a: 5, b: 6, marker: 2 },
+                PslgSegment { a: 6, b: 7, marker: 2 },
+                PslgSegment { a: 7, b: 4, marker: 2 },
+            ],
+            holes: vec![PslgHole { point: Vertex::new(15.0, 10.0) }],
+        };
+        form_skeleton(&mut mesh, &pslg, None).unwrap();
+        carve_holes(&mut mesh, &pslg, false);
+        let mut nav = build_from_cdt(&mesh);
+        nav.assign_vertex_z(|v| if v.y <= 5.0 { ridge_z } else { 0.0 });
+        let bsp = Bsp::build(&nav);
+        (nav, bsp)
+    }
+
+    #[test]
+    fn flat_heights_keep_the_planar_channel_choice() {
+        // ridge_z = 0: heights present but flat — the search must behave
+        // exactly like the 2D one and take the shorter under channel.
+        let (nav, bsp) = build_ridge_navmesh(0.0);
+        let path = find_path(
+            &nav,
+            &bsp,
+            Vertex::new(5.0, 9.0),
+            Vertex::new(25.0, 9.0),
+            &PathOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            path.points.iter().any(|p| p.y < 5.5),
+            "expected the under-the-hole channel, got {:?}",
+            path.points
+        );
+    }
+
+    #[test]
+    fn tall_ridge_reroutes_over_the_top() {
+        // ridge_z = 30: the under channel now climbs 30 up and 30 down
+        // (≥ ~60 extra in 3D), far more than the ~2.8 the top detour
+        // adds. A height-aware search must switch channels; a planar
+        // one would not.
+        let (nav, bsp) = build_ridge_navmesh(30.0);
+        let path = find_path(
+            &nav,
+            &bsp,
+            Vertex::new(5.0, 9.0),
+            Vertex::new(25.0, 9.0),
+            &PathOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            path.points.iter().any(|p| p.y > 13.0),
+            "expected the over-the-top channel, got {:?}",
+            path.points
+        );
+        assert!(
+            path.points.iter().all(|p| p.y >= 5.0),
+            "path dipped into the elevated strip despite the ridge: {:?}",
+            path.points
+        );
+    }
+
     #[test]
     fn nearest_point_snaps_outside_to_boundary() {
         let (nav, bsp) = build_square_with_hole_navmesh();

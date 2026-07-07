@@ -23,6 +23,7 @@ const SECTION_TRIANGLES: u32 = 3;
 const SECTION_ADJACENCY: u32 = 4;
 const SECTION_EDGE_MARKERS: u32 = 5;
 const SECTION_TRI_INFO: u32 = 6;
+const SECTION_VERTEX_Z: u32 = 7;
 
 // Sizes used in offset math.
 const FILE_HEADER_BYTES: u64 = 16; // magic(8) + version(4) + section_count(4)
@@ -130,8 +131,9 @@ impl NavMesh {
         let adjacency = self.section_adjacency_bytes();
         let edge_markers = self.section_edge_markers_bytes();
         let tri_info = self.section_tri_info_bytes();
+        let vertex_z = self.section_vertex_z_bytes();
 
-        let sections: [(u32, &[u8]); 6] = [
+        let mut sections: Vec<(u32, &[u8])> = vec![
             (SECTION_META, &meta),
             (SECTION_VERTICES, &vertices),
             (SECTION_TRIANGLES, &triangles),
@@ -139,6 +141,11 @@ impl NavMesh {
             (SECTION_EDGE_MARKERS, &edge_markers),
             (SECTION_TRI_INFO, &tri_info),
         ];
+        // Optional sections are emitted only when populated, so a plain
+        // 2D mesh writes byte-identical v1 files.
+        if !vertex_z.is_empty() {
+            sections.push((SECTION_VERTEX_Z, &vertex_z));
+        }
 
         // Layout: header (16) + table (24 * N) + section bodies.
         let table_bytes = SECTION_ENTRY_BYTES * sections.len() as u64;
@@ -243,6 +250,14 @@ impl NavMesh {
         }
         b
     }
+
+    fn section_vertex_z_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(self.vertex_z.len() * 8);
+        for z in &self.vertex_z {
+            b.extend_from_slice(&z.to_le_bytes());
+        }
+        b
+    }
 }
 
 // --- Load ----------------------------------------------------------------
@@ -282,6 +297,7 @@ impl NavMesh {
         let mut adjacency_range: Option<(usize, usize)> = None;
         let mut edge_markers_range: Option<(usize, usize)> = None;
         let mut tri_info_range: Option<(usize, usize)> = None;
+        let mut vertex_z_range: Option<(usize, usize)> = None;
 
         for i in 0..section_count {
             let entry_off = FILE_HEADER_BYTES as usize + i * SECTION_ENTRY_BYTES as usize;
@@ -299,6 +315,7 @@ impl NavMesh {
                 SECTION_ADJACENCY => &mut adjacency_range,
                 SECTION_EDGE_MARKERS => &mut edge_markers_range,
                 SECTION_TRI_INFO => &mut tri_info_range,
+                SECTION_VERTEX_Z => &mut vertex_z_range,
                 _ => continue, // unknown section type — skip per spec
             };
             *target = Some((off, len));
@@ -454,6 +471,23 @@ impl NavMesh {
             recompute_tri_info(&mut triangles, &vertices);
         }
 
+        // VERTEX_Z: optional; empty (no height data) if absent.
+        let mut vertex_z: Vec<f64> = Vec::new();
+        if let Some((off, len)) = vertex_z_range {
+            let expected = vcount * 8;
+            if len != expected {
+                return Err(LoadError::SectionLengthMismatch {
+                    section: "VERTEX_Z",
+                    expected: expected as u64,
+                    found: len as u64,
+                });
+            }
+            vertex_z.reserve(vcount);
+            for i in 0..vcount {
+                vertex_z.push(read_f64(bytes, off + i * 8)?);
+            }
+        }
+
         let region_count = if have_tri_info {
             rcount
         } else {
@@ -464,6 +498,7 @@ impl NavMesh {
             triangles,
             aabb,
             region_count,
+            vertex_z,
         })
     }
 }
@@ -687,6 +722,46 @@ mod tests {
         // Without TRI_INFO, region IDs are recomputed and should match.
         for (a, b) in nav.triangles.iter().zip(reloaded.triangles.iter()) {
             assert_eq!(a.region, b.region);
+        }
+    }
+
+    #[test]
+    fn vertex_z_round_trips_and_is_optional() {
+        let mut nav = build_test_navmesh();
+
+        // A plain 2D mesh writes no VERTEX_Z section and reloads with an
+        // empty sidecar.
+        let plain = NavMesh::from_bytes(&nav.to_bytes()).unwrap();
+        assert!(!plain.has_z());
+
+        // Populate heights and round-trip them exactly.
+        nav.assign_vertex_z(|v| v.x * 10.0 + v.y);
+        let bytes = nav.to_bytes();
+        let reloaded = NavMesh::from_bytes(&bytes).unwrap();
+        assert!(reloaded.has_z());
+        assert_eq!(nav.vertex_z, reloaded.vertex_z);
+
+        // Section count in the header grew by one.
+        let sections = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        assert_eq!(sections, 7);
+    }
+
+    #[test]
+    fn vertex_z_length_mismatch_is_rejected() {
+        let mut nav = build_test_navmesh();
+        nav.assign_vertex_z(|_| 1.0);
+        let bytes = nav.to_bytes();
+        // Truncate the VERTEX_Z section length in its table entry.
+        let mut tampered = bytes.clone();
+        let entry_off = FILE_HEADER_BYTES as usize + 6 * SECTION_ENTRY_BYTES as usize;
+        assert_eq!(
+            u32::from_le_bytes(tampered[entry_off..entry_off + 4].try_into().unwrap()),
+            7, // SECTION_VERTEX_Z is the 7th entry
+        );
+        tampered[entry_off + 16..entry_off + 24].copy_from_slice(&8u64.to_le_bytes());
+        match NavMesh::from_bytes(&tampered) {
+            Err(LoadError::SectionLengthMismatch { section: "VERTEX_Z", .. }) => {}
+            other => panic!("expected VERTEX_Z length mismatch, got {other:?}"),
         }
     }
 

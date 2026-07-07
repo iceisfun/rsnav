@@ -76,6 +76,16 @@ pub enum AstarError {
 ///   with [`crate::funnel`]'s clearance model: A* never commits to a
 ///   corridor the funnel would have to collapse to a sub-body-width gap.
 ///
+/// When the mesh carries a height sidecar ([`NavMesh::has_z`]), every
+/// step cost and the heuristic use 3D distances: entry-point heights are
+/// interpolated barycentrically inside the start/goal triangles and
+/// linearly along portal edges. A route over a hill then costs its true
+/// surface length instead of its foreshortened 2D projection, so A*
+/// stops preferring steep shortcuts over gentle detours. The heuristic
+/// stays admissible — no walkable path is shorter than the 3D straight
+/// line. Without height data every interpolated z is `0.0` and the
+/// behavior is bit-identical to the planar search.
+///
 /// The returned vector starts with `start` and ends with `goal`.
 pub fn astar(
     nav: &NavMesh,
@@ -99,14 +109,20 @@ pub fn astar(
     // Point at which the best-known route enters each triangle. The
     // start triangle is entered at the real `start_point`.
     let mut entry = vec![Vertex::ZERO; n];
+    // Height at each entry point (all 0.0 on a mesh without heights).
+    let mut entry_z = vec![0.0f64; n];
     let mut closed = vec![false; n];
     let mut heap: BinaryHeap<Frontier> = BinaryHeap::new();
 
+    let start_z = nav.z_at(start, start_point);
+    let goal_z = nav.z_at(goal, goal_point);
+
     g_score[start.index()] = 0.0;
     entry[start.index()] = start_point;
+    entry_z[start.index()] = start_z;
     heap.push(Frontier {
         triangle: start,
-        f_score: start_point.distance(goal_point),
+        f_score: dist3(start_point, start_z, goal_point, goal_z),
     });
 
     while let Some(Frontier { triangle, .. }) = heap.pop() {
@@ -120,6 +136,7 @@ pub fn astar(
 
         let tri = nav.triangle(triangle);
         let cur_entry = entry[triangle.index()];
+        let cur_z = entry_z[triangle.index()];
 
         for edge in 0..3 {
             if is_wall_edge_local(tri, edge) {
@@ -155,18 +172,20 @@ pub fn astar(
             // the final hop on to `goal_point`, and that triangle's
             // heuristic is then 0 (its `g` already covers the rest).
             let crossing = nearest_point_on_segment(pa, pb, cur_entry);
-            let mut step_cost = cur_entry.distance(crossing);
+            let crossing_z = interp_edge_z(nav, va, vb, pa, pb, crossing);
+            let mut step_cost = dist3(cur_entry, cur_z, crossing, crossing_z);
             let h = if neighbor == goal {
-                step_cost += crossing.distance(goal_point);
+                step_cost += dist3(crossing, crossing_z, goal_point, goal_z);
                 0.0
             } else {
-                crossing.distance(goal_point)
+                dist3(crossing, crossing_z, goal_point, goal_z)
             };
             let tentative_g = g_score[triangle.index()] + step_cost;
             if tentative_g < g_score[neighbor.index()] {
                 g_score[neighbor.index()] = tentative_g;
                 came_from[neighbor.index()] = triangle;
                 entry[neighbor.index()] = crossing;
+                entry_z[neighbor.index()] = crossing_z;
                 heap.push(Frontier {
                     triangle: neighbor,
                     f_score: tentative_g + h,
@@ -176,6 +195,40 @@ pub fn astar(
     }
 
     Err(AstarError::Unreachable)
+}
+
+/// Straight-line distance between two points with heights.
+#[inline]
+fn dist3(a: Vertex, az: f64, b: Vertex, bz: f64) -> f64 {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let dz = bz - az;
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+/// Height of `p` on the portal edge `(va, vb)`, by linear interpolation
+/// between the endpoint heights. `p` is expected on the segment (it comes
+/// from `nearest_point_on_segment`). `0.0` on a mesh without heights.
+#[inline]
+fn interp_edge_z(
+    nav: &NavMesh,
+    va: rsnav_common::VertexId,
+    vb: rsnav_common::VertexId,
+    pa: Vertex,
+    pb: Vertex,
+    p: Vertex,
+) -> f64 {
+    if !nav.has_z() {
+        return 0.0;
+    }
+    let za = nav.vertex_z(va);
+    let zb = nav.vertex_z(vb);
+    let len2 = pa.distance_sq(pb);
+    if len2 == 0.0 {
+        return 0.5 * (za + zb);
+    }
+    let t = ((p - pa).dot(pb - pa) / len2).clamp(0.0, 1.0);
+    za + t * (zb - za)
 }
 
 fn reconstruct(

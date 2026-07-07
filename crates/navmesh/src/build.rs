@@ -169,6 +169,7 @@ pub fn build_from_cdt(cdt: &CdtMesh) -> NavMesh {
         triangles,
         aabb,
         region_count,
+        vertex_z: Vec::new(),
     }
 }
 

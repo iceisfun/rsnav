@@ -68,6 +68,7 @@ match by order.
 | `4`  | `ADJACENCY`    | no        | Triangle neighbor indices.             |
 | `5`  | `EDGE_MARKERS` | no        | Per-edge constraint markers.           |
 | `6`  | `TRI_INFO`     | no        | Area, centroid, region ID per triangle.|
+| `7`  | `VERTEX_Z`     | no        | Per-vertex height sidecar.             |
 
 If an optional section is absent, the reader is expected to recompute its
 contents from the required sections (plus `EDGE_MARKERS` for region IDs).
@@ -166,6 +167,18 @@ If absent, the reader recomputes all three:
 Two triangles share a `region` ID iff a path exists between them through
 the navmesh without crossing a constrained edge. Use this as a cheap
 reachability pre-check (`a.region == b.region`) before running A*.
+
+### Section 7 — VERTEX_Z (`vertex_count × 8` bytes) — optional
+
+One `f64` height per vertex, indexed identically to `VERTICES`. The
+triangulation itself remains 2D (the planar projection); heights are
+carried metadata used for 3D-aware path costs and for stitching layers
+in multi-level worlds.
+
+The writer emits this section only when the in-memory mesh carries
+height data, so purely-2D meshes produce byte-identical files to
+writers that predate the section. If absent, the mesh has no height
+data and all height queries read `0.0`.
 
 ## What's intentionally not in the file
 

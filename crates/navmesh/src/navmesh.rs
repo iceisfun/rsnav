@@ -70,6 +70,17 @@ pub struct NavMesh {
     pub aabb: Aabb,
     /// Number of distinct regions; equivalently `1 + max(region)`.
     pub region_count: u32,
+    /// Optional per-vertex height sidecar, parallel to `vertices`.
+    ///
+    /// Empty means "no height data" — the mesh is purely 2D and every
+    /// height query returns `0.0`. When non-empty its length must equal
+    /// `vertices.len()`; [`set_vertex_z`](Self::set_vertex_z) and
+    /// [`assign_vertex_z`](Self::assign_vertex_z) enforce that.
+    ///
+    /// The triangulation itself stays 2D (the planar projection); z is
+    /// carried metadata used for 3D-aware path costs and for stitching
+    /// layers in multi-level worlds.
+    pub vertex_z: Vec<f64>,
 }
 
 impl NavMesh {
@@ -104,6 +115,68 @@ impl NavMesh {
     #[inline]
     pub fn reachable(&self, a: TriangleId, b: TriangleId) -> bool {
         self.triangle(a).region == self.triangle(b).region
+    }
+
+    // --- Height sidecar ----------------------------------------------------
+
+    /// `true` if this mesh carries per-vertex heights.
+    #[inline]
+    pub fn has_z(&self) -> bool {
+        !self.vertex_z.is_empty()
+    }
+
+    /// Height of a vertex. `0.0` when the mesh carries no height data.
+    /// **Panics** on an out-of-range ID, like [`vertex`](Self::vertex).
+    #[inline]
+    pub fn vertex_z(&self, id: VertexId) -> f64 {
+        if self.vertex_z.is_empty() {
+            0.0
+        } else {
+            self.vertex_z[id.index()]
+        }
+    }
+
+    /// Replace the height sidecar wholesale. **Panics** if `z` is
+    /// non-empty and its length differs from `vertices.len()`.
+    pub fn set_vertex_z(&mut self, z: Vec<f64>) {
+        assert!(
+            z.is_empty() || z.len() == self.vertices.len(),
+            "vertex_z length {} != vertex count {}",
+            z.len(),
+            self.vertices.len()
+        );
+        self.vertex_z = z;
+    }
+
+    /// Fill the height sidecar by evaluating `f` at every vertex
+    /// position. The CDT never invents vertices (no Steiner points), so
+    /// every navmesh vertex position is bit-exactly one of the input
+    /// positions — a position-keyed lookup is a reliable way to carry
+    /// heights across the 2D pipeline.
+    pub fn assign_vertex_z(&mut self, mut f: impl FnMut(Vertex) -> f64) {
+        self.vertex_z = self.vertices.iter().map(|&v| f(v)).collect();
+    }
+
+    /// Interpolated height at point `p` inside triangle `tri`, by
+    /// barycentric weights. Falls back to the triangle's mean vertex
+    /// height for a degenerate triangle, and returns `0.0` when the mesh
+    /// carries no height data. `p` outside the triangle extrapolates
+    /// linearly on the triangle's plane.
+    pub fn z_at(&self, tri: TriangleId, p: Vertex) -> f64 {
+        if !self.has_z() {
+            return 0.0;
+        }
+        let t = self.triangle(tri);
+        let z = [
+            self.vertex_z[t.vertices[0].index()],
+            self.vertex_z[t.vertices[1].index()],
+            self.vertex_z[t.vertices[2].index()],
+        ];
+        let tri_geom = Triangle::new(t.vertices[0], t.vertices[1], t.vertices[2]);
+        match tri_geom.barycentric(&self.vertices, p) {
+            Some([wa, wb, wc]) => wa * z[0] + wb * z[1] + wc * z[2],
+            None => (z[0] + z[1] + z[2]) / 3.0,
+        }
     }
 
     /// Convenience: convert a [`NavTriangle`] to the geometry-only
@@ -383,6 +456,35 @@ mod tests {
         let full = b0.union(&b1);
         assert_eq!(full.min, Vertex::new(0.0, 0.0));
         assert_eq!(full.max, Vertex::new(10.0, 4.0));
+    }
+
+    #[test]
+    fn z_sidecar_interpolates_barycentrically() {
+        let mut nav = divided_rectangle();
+        assert!(!nav.has_z());
+        // Without heights everything reads 0.0.
+        assert_eq!(nav.z_at(rsnav_common::TriangleId::new(0), Vertex::new(1.0, 1.0)), 0.0);
+
+        // Height = x plane: interpolation must reproduce it exactly at
+        // any interior point of any triangle.
+        nav.assign_vertex_z(|v| v.x);
+        assert!(nav.has_z());
+        for (i, t) in nav.triangles.iter().enumerate() {
+            let c = t.centroid;
+            let z = nav.z_at(rsnav_common::TriangleId::new(i as u32), c);
+            assert!(
+                (z - c.x).abs() < 1e-9,
+                "triangle {i}: z_at(centroid) = {z}, expected {}",
+                c.x
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "vertex_z length")]
+    fn set_vertex_z_rejects_wrong_length() {
+        let mut nav = divided_rectangle();
+        nav.set_vertex_z(vec![1.0, 2.0]);
     }
 
     #[test]

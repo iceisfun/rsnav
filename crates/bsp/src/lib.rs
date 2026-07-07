@@ -556,6 +556,7 @@ mod tests {
             triangles: Vec::new(),
             aabb: rsnav_common::Aabb::EMPTY,
             region_count: 0,
+            vertex_z: Vec::new(),
         };
         let bsp = Bsp::build(&nav);
         let mut count = 0;
@@ -573,6 +574,7 @@ mod tests {
             triangles: Vec::new(),
             aabb: rsnav_common::Aabb::EMPTY,
             region_count: 0,
+            vertex_z: Vec::new(),
         };
         let bsp = Bsp::build(&nav);
         assert!(bsp.is_empty());
