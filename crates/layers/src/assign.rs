@@ -319,45 +319,67 @@ fn merge_layers(
     books: &mut Vec<std::collections::HashMap<(u32, u32), u32>>,
     max_step_layers: u32,
 ) {
+    // Members and walk-adjacency are maintained incrementally — a scan
+    // per candidate pair would be O(pairs × spans) and dominates real
+    // scenes.
+    let mut members: Vec<Vec<u32>> = vec![Vec::new(); books.len()];
+    for (s, &l) in layer_of.iter().enumerate() {
+        if l != UNASSIGNED {
+            members[l as usize].push(s as u32);
+        }
+    }
+    let mut adjacent: std::collections::BTreeSet<(u32, u32)> = std::collections::BTreeSet::new();
+    for (s, span) in spans.iter().enumerate() {
+        let a = layer_of[s];
+        if a == UNASSIGNED {
+            continue;
+        }
+        for &t in span.links.iter().flatten() {
+            let b = layer_of[t as usize];
+            if b != UNASSIGNED && b != a {
+                adjacent.insert((a.min(b), a.max(b)));
+            }
+        }
+    }
+
     loop {
-        let mut merged_any = false;
-        for a in 0..books.len() {
-            if books[a].is_empty() {
+        let mut merged: Option<(u32, u32)> = None;
+        'search: for &(a, b) in &adjacent {
+            if members[a as usize].is_empty() || members[b as usize].is_empty() {
                 continue;
             }
-            for b in (a + 1)..books.len() {
-                if books[b].is_empty() {
-                    continue;
-                }
-                // Only merge walk-adjacent layers — merging disjoint
-                // fragments is harmless for correctness but produces
-                // confusing multi-region layers.
-                let adjacent = spans.iter().enumerate().any(|(s, span)| {
-                    layer_of[s] == a as u32
-                        && span.links.iter().flatten().any(|&t| layer_of[t as usize] == b as u32)
-                });
-                if !adjacent {
-                    continue;
-                }
-                let compatible = spans.iter().enumerate().all(|(s, span)| {
-                    layer_of[s] != b as u32 || !conflicts(&books[a], span, max_step_layers)
-                });
-                if !compatible {
-                    continue;
-                }
-                for (s, l) in layer_of.iter_mut().enumerate() {
-                    if *l == b as u32 {
-                        *l = a as u32;
-                        books[a].insert((spans[s].c, spans[s].r), spans[s].layer_idx);
-                    }
-                }
-                books[b].clear();
-                merged_any = true;
+            let compatible = members[b as usize]
+                .iter()
+                .all(|&s| !conflicts(&books[a as usize], &spans[s as usize], max_step_layers));
+            if compatible {
+                merged = Some((a, b));
+                break 'search;
             }
         }
-        if !merged_any {
-            break;
+        let Some((a, b)) = merged else { break };
+        let moved = std::mem::take(&mut members[b as usize]);
+        for &s in &moved {
+            layer_of[s as usize] = a;
+            books[a as usize].insert(
+                (spans[s as usize].c, spans[s as usize].r),
+                spans[s as usize].layer_idx,
+            );
         }
+        // Rewire b's adjacencies onto a.
+        let b_pairs: Vec<(u32, u32)> = adjacent
+            .iter()
+            .copied()
+            .filter(|&(x, y)| x == b || y == b)
+            .collect();
+        for (x, y) in b_pairs {
+            adjacent.remove(&(x, y));
+            let other = if x == b { y } else { x };
+            if other != a {
+                adjacent.insert((a.min(other), a.max(other)));
+            }
+        }
+        members[a as usize].extend(moved);
+        books[b as usize].clear();
     }
 }
 
