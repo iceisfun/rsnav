@@ -106,6 +106,35 @@ impl NavMesh {
         self.triangle(a).region == self.triangle(b).region
     }
 
+    /// Shift the whole mesh by `offset`, baking a local→world placement
+    /// into the coordinates: every vertex, every triangle centroid, and
+    /// the mesh AABB move; topology, areas, edge markers, and regions
+    /// are untouched. `O(V + T)`.
+    ///
+    /// The intended flow is to triangulate in local coordinates near the
+    /// origin (numerically the best place for the CDT) and translate the
+    /// finished mesh to its world origin once, **before** building the
+    /// [`Bsp`] — a BVH built earlier stores absolute AABBs and is
+    /// silently invalidated by this call.
+    ///
+    /// Don't combine with a `TiledWorld` offset for the same placement:
+    /// `TiledWorld` applies its per-tile offset at query time, so adding
+    /// a pre-translated mesh at a non-zero tile offset double-applies
+    /// the shift. Bake with `translate` *or* place with a tile offset,
+    /// not both.
+    ///
+    /// [`Bsp`]: https://docs.rs/rsnav-bsp
+    pub fn translate(&mut self, offset: Vertex) {
+        for v in &mut self.vertices {
+            *v = *v + offset;
+        }
+        for t in &mut self.triangles {
+            t.centroid = t.centroid + offset;
+        }
+        self.aabb.min = self.aabb.min + offset;
+        self.aabb.max = self.aabb.max + offset;
+    }
+
     /// Convenience: convert a [`NavTriangle`] to the geometry-only
     /// [`Triangle`] from rsnav-common, for use with shared predicates.
     pub fn as_triangle(&self, id: TriangleId) -> Triangle {
@@ -392,6 +421,41 @@ mod tests {
         assert_eq!(nav.region_area(99), 0.0);
         assert!(nav.region_centroid(99).is_none());
         assert!(nav.region_bounds(99).is_none());
+    }
+
+    #[test]
+    fn translate_moves_coordinates_and_preserves_everything_else() {
+        let local = divided_rectangle();
+        let offset = Vertex::new(10_000.0, 50_000.0);
+        let mut world = local.clone();
+        world.translate(offset);
+
+        assert_eq!(world.aabb.min, local.aabb.min + offset);
+        assert_eq!(world.aabb.max, local.aabb.max + offset);
+        for (w, l) in world.vertices.iter().zip(&local.vertices) {
+            assert_eq!(*w, *l + offset);
+        }
+
+        assert_eq!(world.region_count, local.region_count);
+        for (w, l) in world.triangles.iter().zip(&local.triangles) {
+            assert_eq!(w.centroid, l.centroid + offset);
+            assert_eq!(w.area, l.area);
+            assert_eq!(w.vertices, l.vertices);
+            assert_eq!(w.neighbors, l.neighbors);
+            assert_eq!(w.edge_markers, l.edge_markers);
+            assert_eq!(w.region, l.region);
+        }
+
+        // The translated centroid stays consistent with the translated
+        // vertices (identical inputs round identically under `+ offset`,
+        // so this holds to ~1 ULP at world magnitude).
+        for t in &world.triangles {
+            let recomputed = (world.vertex(t.vertices[0])
+                + world.vertex(t.vertices[1])
+                + world.vertex(t.vertices[2]))
+                * (1.0 / 3.0);
+            assert!(t.centroid.distance(recomputed) < 1e-8);
+        }
     }
 
     // --- random point sampling -------------------------------------------
