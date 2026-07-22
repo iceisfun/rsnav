@@ -10,6 +10,7 @@ pub mod aabb;
 pub mod geom;
 pub mod ids;
 pub mod mesh2d;
+pub mod par;
 pub mod polygon;
 pub mod triangle;
 pub mod vertex;

@@ -16,7 +16,8 @@
 
 #![forbid(unsafe_code)]
 
-use rsnav_common::{Polygon, PolygonWithHoles, Vertex, Winding, geom};
+use rsnav_common::par::{par_map_indexed, resolve_threads};
+use rsnav_common::{Aabb, Polygon, PolygonWithHoles, Vertex, Winding, geom};
 
 // --- Bitfield ------------------------------------------------------------
 
@@ -109,6 +110,11 @@ pub struct ExtractOptions {
     /// single diagonals. Default `true`; turning it off keeps the exact
     /// cell-aligned boundary at the cost of more triangles in the CDT.
     pub diagonal_smoothing: bool,
+    /// Worker threads for the parallelizable phases (border-edge scan,
+    /// hole parenting, per-region post-processing). `0` = one per
+    /// available core, `1` = fully serial. Output is identical for every
+    /// setting; small inputs stay serial regardless.
+    pub threads: usize,
 }
 
 impl Default for ExtractOptions {
@@ -117,6 +123,7 @@ impl Default for ExtractOptions {
             min_area: 0.0,
             remove_collinear: true,
             diagonal_smoothing: true,
+            threads: 0,
         }
     }
 }
@@ -125,43 +132,79 @@ impl Default for ExtractOptions {
 
 /// Trace all walkable regions in `bits` as polygons with holes.
 pub fn extract(bits: &Bitfield, opts: &ExtractOptions) -> Vec<PolygonWithHoles> {
-    let loops = trace_loops(bits);
+    let threads = resolve_threads(opts.threads);
+    let loops = trace_loops(bits, threads);
 
     // Classify into outers (CCW) and holes (CW).
     let (mut outers, holes): (Vec<Polygon>, Vec<Polygon>) =
         loops.into_iter().partition(|p| p.signed_area2() > 0.0);
 
     let mut outer_holes: Vec<Vec<Polygon>> = vec![Vec::new(); outers.len()];
-    for hole in holes {
-        let sample = hole.vertices[0];
-        if let Some(parent) = smallest_enclosing_outer(&outers, sample) {
-            outer_holes[parent].push(hole);
+    if !holes.is_empty() {
+        // Precompute per-outer data once instead of per (hole, outer) pair:
+        // the AABB (cheap reject), the area (tie-break), and a collinear-
+        // reduced copy of the ring for the exact containment test. Raw
+        // traced rings carry a vertex at every unit cell corner; reducing
+        // them shrinks contains() from O(perimeter) to O(corners) without
+        // changing its result — removal only merges straight runs (the
+        // trace cannot produce out-and-back spikes), so the boundary point
+        // set and the exact orient2d/ray-cast answers are identical.
+        let infos: Vec<OuterInfo> = outers
+            .iter()
+            .map(|o| {
+                let mut ring = o.clone();
+                ring.remove_collinear();
+                OuterInfo {
+                    aabb: o.aabb(),
+                    area: o.area(),
+                    ring,
+                }
+            })
+            .collect();
+        // Each hole's parent is a pure function of `infos`, so holes can
+        // be resolved on worker threads; the grouping stays serial in
+        // hole order, keeping per-parent hole order identical to a fully
+        // serial run. Gate on holes × outers — the actual work — so a
+        // thousand trivial lookups against one outer stay serial.
+        let work = holes.len().saturating_mul(infos.len());
+        let par = threads
+            .min(PARENT_MAX_THREADS)
+            .min(work / PARENT_WORK_PER_THREAD + 1);
+        let parents: Vec<Option<usize>> = if holes.len() >= PAR_MIN_HOLES && par > 1 {
+            par_map_indexed(&holes, par, |_, hole| {
+                smallest_enclosing_outer(&infos, hole.vertices[0])
+            })
+        } else {
+            holes
+                .iter()
+                .map(|hole| smallest_enclosing_outer(&infos, hole.vertices[0]))
+                .collect()
+        };
+        for (hole, parent) in holes.into_iter().zip(parents) {
+            if let Some(parent) = parent {
+                outer_holes[parent].push(hole);
+            }
+            // Holes with no parent must be tracing artifacts (e.g. the
+            // unbounded outside, which our trace doesn't actually produce
+            // since we only walk walkable-cell borders). Drop silently.
         }
-        // Holes with no parent must be tracing artifacts (e.g. the
-        // unbounded outside, which our trace doesn't actually produce
-        // since we only walk walkable-cell borders). Drop silently.
     }
 
-    let mut regions: Vec<PolygonWithHoles> = outers
-        .drain(..)
-        .zip(outer_holes.into_iter())
-        .map(|(mut outer, holes)| {
-            let smoothed_holes = holes
-                .into_iter()
-                .map(|h| post_process_hole(h, opts))
-                .collect();
-            if opts.diagonal_smoothing {
-                outer = diagonal_smooth(outer);
-            }
-            if opts.remove_collinear {
-                outer.remove_collinear();
-            }
-            PolygonWithHoles {
-                outer,
-                holes: smoothed_holes,
-            }
+    let pairs: Vec<(Polygon, Vec<Polygon>)> =
+        outers.drain(..).zip(outer_holes.into_iter()).collect();
+    let par = threads.min(POST_MAX_THREADS);
+    let mut regions: Vec<PolygonWithHoles> = if pairs.len() >= PAR_MIN_REGIONS && par > 1 {
+        // Smoothing is per-region-independent; the clone is one pass over
+        // ring memory, dwarfed by the smoothing it unlocks in parallel.
+        par_map_indexed(&pairs, par, |_, (outer, holes)| {
+            post_process_region(outer.clone(), holes.clone(), opts)
         })
-        .collect();
+    } else {
+        pairs
+            .into_iter()
+            .map(|(outer, holes)| post_process_region(outer, holes, opts))
+            .collect()
+    };
 
     if opts.min_area > 0.0 {
         regions.retain(|r| r.outer.area() >= opts.min_area);
@@ -179,14 +222,55 @@ fn post_process_hole(mut hole: Polygon, opts: &ExtractOptions) -> Polygon {
     hole
 }
 
-fn smallest_enclosing_outer(outers: &[Polygon], point: Vertex) -> Option<usize> {
+fn post_process_region(
+    mut outer: Polygon,
+    holes: Vec<Polygon>,
+    opts: &ExtractOptions,
+) -> PolygonWithHoles {
+    let holes = holes
+        .into_iter()
+        .map(|h| post_process_hole(h, opts))
+        .collect();
+    if opts.diagonal_smoothing {
+        outer = diagonal_smooth(outer);
+    }
+    if opts.remove_collinear {
+        outer.remove_collinear();
+    }
+    PolygonWithHoles { outer, holes }
+}
+
+/// Serial/parallel cutovers for [`extract`]'s phases: below these sizes
+/// thread spawn costs more than the work. Caps keep each phase from
+/// spawning more workers than its memory-bound scan can feed.
+const PAR_MIN_HOLES: usize = 64;
+const PAR_MIN_REGIONS: usize = 8;
+const PAR_MIN_CELLS: usize = 500_000;
+const PARENT_MAX_THREADS: usize = 32;
+/// Roughly one thread per this many (hole, outer) candidate pairs.
+const PARENT_WORK_PER_THREAD: usize = 4096;
+const POST_MAX_THREADS: usize = 16;
+const COLLECT_MAX_THREADS: usize = 16;
+
+/// Per-outer data precomputed for hole parenting: containment is tested
+/// against the reduced ring, but the AABB and area come from the raw ring
+/// (numerically identical either way — reduction preserves the boundary).
+struct OuterInfo {
+    aabb: Aabb,
+    area: f64,
+    ring: Polygon,
+}
+
+fn smallest_enclosing_outer(outers: &[OuterInfo], point: Vertex) -> Option<usize> {
     let mut best: Option<(usize, f64)> = None;
     for (i, o) in outers.iter().enumerate() {
-        if o.contains(point) {
-            let area = o.area();
-            if best.map_or(true, |(_, a)| area < a) {
-                best = Some((i, area));
-            }
+        // AABB reject: Polygon::contains is boundary-inclusive and the
+        // closed AABB covers the boundary, so this can never cull a hit.
+        if !o.aabb.contains(point) {
+            continue;
+        }
+        if o.ring.contains(point) && best.map_or(true, |(_, a)| o.area < a) {
+            best = Some((i, o.area));
         }
     }
     best.map(|(i, _)| i)
@@ -210,11 +294,35 @@ struct BorderEdge {
     cell: u32,
 }
 
-fn collect_border_edges(bits: &Bitfield) -> Vec<BorderEdge> {
+fn collect_border_edges(bits: &Bitfield, threads: usize) -> Vec<BorderEdge> {
+    let h = bits.height as usize;
+    let cells = bits.width as usize * h;
+    let threads = threads.min(COLLECT_MAX_THREADS).min(h.max(1));
+    if threads <= 1 || cells < PAR_MIN_CELLS {
+        return collect_border_edges_rows(bits, 0, h as i64);
+    }
+    // Row bands are independent (neighbor peeks are read-only), and
+    // concatenating the per-band results in band order reproduces the
+    // sequential row-major edge order exactly.
+    let chunk = h.div_ceil(threads);
+    let bands: Vec<(i64, i64)> = (0..threads)
+        .map(|i| ((i * chunk) as i64, ((i + 1) * chunk).min(h) as i64))
+        .filter(|(a, b)| a < b)
+        .collect();
+    let mut parts = par_map_indexed(&bands, bands.len(), |_, &(a, b)| {
+        collect_border_edges_rows(bits, a, b)
+    });
+    let mut edges = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+    for part in &mut parts {
+        edges.append(part);
+    }
+    edges
+}
+
+fn collect_border_edges_rows(bits: &Bitfield, row_start: i64, row_end: i64) -> Vec<BorderEdge> {
     let mut edges = Vec::new();
     let w = bits.width as i64;
-    let h = bits.height as i64;
-    for row in 0..h {
+    for row in row_start..row_end {
         for col in 0..w {
             if !bits.at(col, row) {
                 continue;
@@ -257,19 +365,114 @@ fn collect_border_edges(bits: &Bitfield) -> Vec<BorderEdge> {
     edges
 }
 
-fn trace_loops(bits: &Bitfield) -> Vec<Polygon> {
-    let edges = collect_border_edges(bits);
+/// "Start corner → outgoing border edges" lookup for [`trace_loops`].
+///
+/// Corners are dense — `(col, row)` in `[0, w] × [0, h]` — so the fast path
+/// is a flat per-corner array indexed by `row * (w + 1) + col`, which avoids
+/// the hashing that dominates the old `HashMap<(i64, i64), Vec<usize>>`
+/// build. Same-cell pairing means a corner has at most two outgoing border
+/// edges; a third is a structural-invariant failure (`debug_assert!`), and
+/// release builds spill it to `overflow` so lookups still see every edge in
+/// edge-index order — identical to the HashMap's push order.
+enum CornerIndex {
+    Flat {
+        /// Corners per row: `w + 1`.
+        stride: i64,
+        /// Two edge-index slots per corner; `u32::MAX` = empty.
+        slots: Vec<[u32; 2]>,
+        /// Third-and-later edges per corner (expected empty; see above).
+        overflow: Vec<((i64, i64), u32)>,
+    },
+    /// Fallback when the corner grid is too large to allocate densely.
+    Map(std::collections::HashMap<(i64, i64), Vec<usize>>),
+}
+
+/// Corner grids above this many corners keep the HashMap path (the flat
+/// array would cost 8 bytes per corner — ~512 MB at the threshold).
+const FLAT_CORNER_LIMIT: usize = 64_000_000;
+
+/// The flat array also loses when edges are sparse relative to the grid:
+/// zero-filling 8 bytes per corner swamps the hashing it saves (an open
+/// 2048² map has ~4.2M corners but only ~16k perimeter edges). Keep the
+/// HashMap unless edges populate at least 1/64 of the corners.
+const FLAT_CORNER_DENSITY: usize = 64;
+
+impl CornerIndex {
+    fn build(bits: &Bitfield, edges: &[BorderEdge]) -> Self {
+        let stride = bits.width as usize + 1;
+        let corners = stride * (bits.height as usize + 1);
+        if corners > FLAT_CORNER_LIMIT || corners > edges.len().saturating_mul(FLAT_CORNER_DENSITY) {
+            let mut by_start: std::collections::HashMap<(i64, i64), Vec<usize>> =
+                std::collections::HashMap::new();
+            for (i, e) in edges.iter().enumerate() {
+                by_start.entry(e.start).or_default().push(i);
+            }
+            return Self::Map(by_start);
+        }
+        let mut slots = vec![[u32::MAX; 2]; corners];
+        let mut overflow: Vec<((i64, i64), u32)> = Vec::new();
+        for (i, e) in edges.iter().enumerate() {
+            // Border-edge corners always lie in [0, w] × [0, h].
+            let id = e.start.1 as usize * stride + e.start.0 as usize;
+            let slot = &mut slots[id];
+            if slot[0] == u32::MAX {
+                slot[0] = i as u32;
+            } else if slot[1] == u32::MAX {
+                slot[1] = i as u32;
+            } else {
+                debug_assert!(
+                    false,
+                    "corner {:?} has more than two outgoing border edges",
+                    e.start
+                );
+                overflow.push((e.start, i as u32));
+            }
+        }
+        Self::Flat {
+            stride: stride as i64,
+            slots,
+            overflow,
+        }
+    }
+
+    /// Fills `out` with the edge indices starting at `corner`, in
+    /// edge-index order (matching the HashMap Vec's push order).
+    fn candidates_into(&self, corner: (i64, i64), out: &mut Vec<usize>) {
+        out.clear();
+        match self {
+            Self::Flat { stride, slots, overflow } => {
+                let id = (corner.1 * stride + corner.0) as usize;
+                for &s in &slots[id] {
+                    if s != u32::MAX {
+                        out.push(s as usize);
+                    }
+                }
+                // Slots fill before overflow, so appending keeps edge order.
+                for &(c, e) in overflow {
+                    if c == corner {
+                        out.push(e as usize);
+                    }
+                }
+            }
+            Self::Map(by_start) => {
+                if let Some(v) = by_start.get(&corner) {
+                    out.extend_from_slice(v);
+                }
+            }
+        }
+    }
+}
+
+fn trace_loops(bits: &Bitfield, threads: usize) -> Vec<Polygon> {
+    let edges = collect_border_edges(bits, threads);
     if edges.is_empty() {
         return Vec::new();
     }
 
-    // Build a "start corner → list of (edge index, cell)" map so we can
+    // Build a "start corner → list of (edge index, cell)" index so we can
     // continue a chain in O(1).
-    use std::collections::HashMap;
-    let mut by_start: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
-    for (i, e) in edges.iter().enumerate() {
-        by_start.entry(e.start).or_default().push(i);
-    }
+    let by_start = CornerIndex::build(bits, &edges);
+    let mut candidates: Vec<usize> = Vec::with_capacity(4);
 
     let mut visited = vec![false; edges.len()];
     let mut loops = Vec::new();
@@ -292,10 +495,11 @@ fn trace_loops(bits: &Bitfield) -> Vec<Polygon> {
             loop_verts.push(Vertex::new(e.start.0 as f64, e.start.1 as f64));
             // Find the next edge: among edges starting at e.end, pick the
             // one owned by the same cell.
-            let Some(candidates) = by_start.get(&e.end) else {
+            by_start.candidates_into(e.end, &mut candidates);
+            if candidates.is_empty() {
                 debug_assert!(false, "border-edge chain ended at unmatched corner");
                 break true;
-            };
+            }
             // One candidate → take it (continuation between adjacent cells,
             // even if the cell ID differs). Multiple candidates → diagonal-
             // touch case; prefer same-cell so each cell's boundary stays
@@ -515,6 +719,60 @@ mod tests {
         for r in &regions {
             assert_eq!(r.outer.area(), 1.0);
         }
+    }
+
+    /// Two hole cells touching only at a corner: the shared corner has two
+    /// outgoing border edges, so this pins the same-cell pairing in
+    /// `trace_loops` (and the 2-slot corner index) on the hole path. The
+    /// walkable cell at the pinch owns edges on both hole cells, so the
+    /// trace stitches them into a single pinched CW loop of area 2.
+    #[test]
+    fn diagonally_touching_hole_cells_trace_one_pinched_hole() {
+        let b = grid(5, &[
+            "#####",
+            "##.##",
+            "#.###",
+            "#####",
+        ]);
+        let regions = extract(&b, &ExtractOptions::default());
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].holes.len(), 1, "expected one pinched hole");
+        assert_eq!(regions[0].holes[0].area(), 2.0);
+        assert_eq!(regions[0].holes[0].winding(), Winding::Clockwise);
+        assert_eq!(regions[0].area(), 18.0);
+    }
+
+    /// An island with its own hole, nested inside a bigger region's hole.
+    /// The inner hole's sample point is contained by *both* outers, so this
+    /// pins the smallest-area tie-break in `smallest_enclosing_outer`.
+    #[test]
+    fn nested_island_hole_parents_to_smallest_outer() {
+        let b = grid(7, &[
+            "#######",
+            "#.....#",
+            "#.###.#",
+            "#.#.#.#",
+            "#.###.#",
+            "#.....#",
+            "#######",
+        ]);
+        let regions = extract(&b, &ExtractOptions::default());
+        assert_eq!(regions.len(), 2);
+        let big = regions
+            .iter()
+            .find(|r| r.outer.area() == 49.0)
+            .expect("outer ring region");
+        let island = regions
+            .iter()
+            .find(|r| r.outer.area() == 9.0)
+            .expect("island region");
+        // The big region's hole covers the moat *and* the island inside it.
+        assert_eq!(big.holes.len(), 1);
+        assert_eq!(big.holes[0].area(), 25.0);
+        // The island's unit hole must parent to the island, not the big
+        // outer that also contains it.
+        assert_eq!(island.holes.len(), 1);
+        assert_eq!(island.holes[0].area(), 1.0);
     }
 
     /// `diagonal_smooth` should collapse a stair adjacent to a long

@@ -135,6 +135,55 @@ impl NavMesh {
         self.aabb.max = self.aabb.max + offset;
     }
 
+    /// Append `other`'s geometry onto `self`, remapping every ID into
+    /// `self`'s index space: vertex ids shift by the old vertex count,
+    /// neighbor ids by the old triangle count (boundary edges keep
+    /// [`TriangleId::INVALID`] — the sentinel is never offset), and
+    /// region ids by the old `region_count`. Areas, centroids, and edge
+    /// markers are copied verbatim; the AABB becomes the union of the
+    /// two and `region_count` grows by `other.region_count`. `O(V + T)`
+    /// in `other`'s size.
+    ///
+    /// This is the merge primitive for building one navmesh per
+    /// extracted region in parallel and stitching the parts together.
+    /// The two meshes are assumed **disjoint**: no vertices are
+    /// deduplicated and no adjacency is created across the seam, so
+    /// triangles of `other` never become neighbors of — or share a
+    /// region with — pre-existing triangles, even if they touch
+    /// geometrically.
+    ///
+    /// Appending an empty mesh is a no-op; appending onto an empty mesh
+    /// yields a copy of `other` (including its AABB and region count).
+    pub fn append(&mut self, other: &NavMesh) {
+        let v_off = self.vertices.len() as u32;
+        let t_off = self.triangles.len() as u32;
+        let r_off = self.region_count;
+
+        self.vertices.extend_from_slice(&other.vertices);
+        self.triangles.reserve(other.triangles.len());
+        for src in &other.triangles {
+            let mut t = *src;
+            for v in &mut t.vertices {
+                *v = VertexId::new(v.get() + v_off);
+            }
+            for n in &mut t.neighbors {
+                if n.is_valid() {
+                    *n = TriangleId::new(n.get() + t_off);
+                }
+            }
+            t.region += r_off;
+            self.triangles.push(t);
+        }
+        // `Aabb::extend` with an EMPTY box's infinite corners would
+        // corrupt the bounds, so skip the union when `other` is empty;
+        // an empty *self* is handled naturally (extend from EMPTY
+        // adopts `other`'s bounds exactly).
+        if !other.aabb.is_empty() {
+            self.aabb = self.aabb.union(&other.aabb);
+        }
+        self.region_count += other.region_count;
+    }
+
     /// Convenience: convert a [`NavTriangle`] to the geometry-only
     /// [`Triangle`] from rsnav-common, for use with shared predicates.
     pub fn as_triangle(&self, id: TriangleId) -> Triangle {
@@ -331,7 +380,7 @@ impl NavMesh {
 #[cfg(test)]
 mod tests {
     use crate::build_from_cdt;
-    use rsnav_common::Vertex;
+    use rsnav_common::{Aabb, Vertex};
     use rsnav_triangle::pslg::{Pslg, PslgSegment, PslgVertex};
     use rsnav_triangle::{delaunay, form_skeleton, CdtMesh, DivConqOptions, VertexSlot};
 
@@ -455,6 +504,173 @@ mod tests {
                 + world.vertex(t.vertices[2]))
                 * (1.0 / 3.0);
             assert!(t.centroid.distance(recomputed) < 1e-8);
+        }
+    }
+
+    // --- append ----------------------------------------------------------
+
+    /// A 4×4 square with corner at `(dx, dy)` — one region, two
+    /// triangles. Coordinates are built in place (not translated), so
+    /// stored centroids match what a reader would recompute exactly.
+    fn square_at(dx: f64, dy: f64) -> NavMesh {
+        let pts = [
+            (dx, dy),
+            (dx + 4.0, dy),
+            (dx + 4.0, dy + 4.0),
+            (dx, dy + 4.0),
+        ];
+        let mut mesh = CdtMesh::new();
+        for (x, y) in pts {
+            mesh.push_vertex(VertexSlot::new(Vertex::new(x, y), 0));
+        }
+        delaunay(&mut mesh, DivConqOptions::default());
+        let pslg = Pslg {
+            vertices: pts
+                .iter()
+                .map(|(x, y)| PslgVertex::new(Vertex::new(*x, *y)))
+                .collect(),
+            segments: vec![
+                PslgSegment { a: 0, b: 1, marker: 1 },
+                PslgSegment { a: 1, b: 2, marker: 1 },
+                PslgSegment { a: 2, b: 3, marker: 1 },
+                PslgSegment { a: 3, b: 0, marker: 1 },
+            ],
+            holes: Vec::new(),
+        };
+        form_skeleton(&mut mesh, &pslg, None).unwrap();
+        build_from_cdt(&mesh)
+    }
+
+    fn empty_mesh() -> NavMesh {
+        NavMesh {
+            vertices: Vec::new(),
+            triangles: Vec::new(),
+            aabb: Aabb::EMPTY,
+            region_count: 0,
+        }
+    }
+
+    fn assert_mesh_eq(a: &NavMesh, b: &NavMesh) {
+        assert_eq!(a.vertices, b.vertices);
+        assert_eq!(a.triangles, b.triangles);
+        assert_eq!(a.aabb, b.aabb);
+        assert_eq!(a.region_count, b.region_count);
+    }
+
+    #[test]
+    fn append_offsets_ids_and_unions_bounds() {
+        let a = divided_rectangle(); // 2 regions
+        let b = square_at(100.0, 50.0); // 1 region
+        let mut merged = a.clone();
+        merged.append(&b);
+
+        assert_eq!(merged.vertex_count(), a.vertex_count() + b.vertex_count());
+        assert_eq!(
+            merged.triangle_count(),
+            a.triangle_count() + b.triangle_count()
+        );
+        assert_eq!(merged.region_count, a.region_count + b.region_count);
+        assert_eq!(merged.aabb, a.aabb.union(&b.aabb));
+
+        // The first part is byte-for-byte untouched.
+        assert_eq!(&merged.vertices[..a.vertex_count()], &a.vertices[..]);
+        assert_eq!(&merged.triangles[..a.triangle_count()], &a.triangles[..]);
+
+        // The second part is `b` with every ID shifted.
+        let v_off = a.vertex_count() as u32;
+        let t_off = a.triangle_count() as u32;
+        for (m, src) in merged.triangles[a.triangle_count()..]
+            .iter()
+            .zip(&b.triangles)
+        {
+            for k in 0..3 {
+                assert_eq!(m.vertices[k].get(), src.vertices[k].get() + v_off);
+                if src.neighbors[k].is_valid() {
+                    assert_eq!(m.neighbors[k].get(), src.neighbors[k].get() + t_off);
+                } else {
+                    assert!(!m.neighbors[k].is_valid(), "INVALID neighbor was offset");
+                }
+            }
+            assert_eq!(m.edge_markers, src.edge_markers);
+            assert_eq!(m.area, src.area);
+            assert_eq!(m.centroid, src.centroid);
+            // Region ids of the second part start at a.region_count.
+            assert_eq!(m.region, src.region + a.region_count);
+            assert!(m.region >= a.region_count);
+        }
+        assert_eq!(&merged.vertices[a.vertex_count()..], &b.vertices[..]);
+    }
+
+    #[test]
+    fn append_preserves_neighbor_symmetry() {
+        let a = divided_rectangle();
+        let split = a.triangle_count();
+        let mut merged = a;
+        merged.append(&square_at(100.0, 50.0));
+
+        for (i, t) in merged.triangles.iter().enumerate() {
+            for edge in 0..3 {
+                let n = t.neighbors[edge];
+                if !n.is_valid() {
+                    continue;
+                }
+                // No adjacency across the seam.
+                assert_eq!(
+                    i < split,
+                    n.index() < split,
+                    "triangle {i} links across the appended-part boundary",
+                );
+                // If t1 lists t2 as a neighbor, t2 lists t1 back.
+                let back = merged
+                    .triangle(n)
+                    .neighbors
+                    .iter()
+                    .any(|m| m.is_valid() && m.index() == i);
+                assert!(back, "triangle {i} -> {} not symmetric", n.get());
+            }
+        }
+    }
+
+    #[test]
+    fn append_empty_is_noop() {
+        let a = divided_rectangle();
+        let mut merged = a.clone();
+        merged.append(&empty_mesh());
+        assert_mesh_eq(&merged, &a);
+    }
+
+    #[test]
+    fn append_onto_empty_copies_other() {
+        let b = square_at(100.0, 50.0);
+        let mut merged = empty_mesh();
+        merged.append(&b);
+        assert_mesh_eq(&merged, &b);
+    }
+
+    #[test]
+    fn append_round_trips_through_binary() {
+        let mut merged = divided_rectangle();
+        merged.append(&square_at(100.0, 50.0));
+
+        let bytes = merged.to_bytes();
+        let reloaded = NavMesh::from_bytes(&bytes).unwrap();
+        assert_mesh_eq(&merged, &reloaded);
+
+        // Force the reader down its recompute path: retype the TRI_INFO
+        // section-table entry (writer emits it sixth; entries start at
+        // byte 16 and are 24 bytes each — see FORMAT.md / binary.rs) to
+        // an unknown id so the loader recomputes area, centroid, and
+        // region from geometry + adjacency. Appended meshes must
+        // satisfy that recompute invariant exactly.
+        let mut tampered = bytes;
+        let entry_off = 16 + 5 * 24;
+        tampered[entry_off..entry_off + 4].copy_from_slice(&9999u32.to_le_bytes());
+        let recomputed = NavMesh::from_bytes(&tampered).unwrap();
+        assert_eq!(recomputed.region_count, merged.region_count);
+        for (m, r) in merged.triangles.iter().zip(&recomputed.triangles) {
+            assert_eq!(m.area, r.area);
+            assert_eq!(m.centroid, r.centroid);
+            assert_eq!(m.region, r.region);
         }
     }
 

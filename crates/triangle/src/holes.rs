@@ -13,8 +13,11 @@
 //!    triangle whose hull edge is not protected by a constrained subseg
 //!    is marked "infected" — it sits outside the user's PSLG boundary.
 //! 2. **Seed each hole**: for each hole point in the PSLG, find the
-//!    triangle containing it (linear scan over live triangles), and mark
-//!    it infected.
+//!    triangle containing it and mark it infected. With a single hole
+//!    this is a linear scan over live triangles; with many holes the
+//!    points are bucketed into a uniform grid and all located in one
+//!    ascending triangle pass (same winner per hole, without the
+//!    O(holes × triangles) blowup).
 //! 3. **Plague (BFS)**: starting from infected triangles, spread
 //!    infection to neighbors that aren't separated by a constrained
 //!    subseg.
@@ -91,8 +94,20 @@ fn seed_holes(
     worklist: &mut VecDeque<u32>,
 ) {
     let positions = mesh.vertices_positions();
-    for hole in &pslg.holes {
-        if let Some(tri) = locate_triangle(mesh, &positions, hole.point) {
+    // Per-hole seed triangle, in `pslg.holes` order.
+    let seeds: Vec<Option<u32>> = if pslg.holes.len() <= 1 {
+        pslg.holes
+            .iter()
+            .map(|hole| locate_triangle(mesh, &positions, hole.point))
+            .collect()
+    } else {
+        locate_holes_gridded(mesh, &positions, pslg)
+    };
+    // Infect in original hole order so the plague worklist ends up
+    // identical to a per-hole locate_triangle pass, regardless of the
+    // order the gridded pass discovered the seeds in.
+    for seed in seeds {
+        if let Some(tri) = seed {
             if !infected[tri as usize] {
                 infected[tri as usize] = true;
                 worklist.push_back(tri);
@@ -122,6 +137,102 @@ fn locate_triangle(mesh: &CdtMesh, positions: &[Vertex], pt: Vertex) -> Option<u
         }
     }
     None
+}
+
+/// Batched point-in-triangle search for many holes at once. Buckets the
+/// hole points into a uniform grid (~sqrt(holes) cells per axis) over
+/// their bounding box, then makes one ascending pass over live, non-ghost
+/// triangles, testing each against only the not-yet-located holes in the
+/// grid cells its bounding box overlaps. Because the pass is ascending
+/// and a hole keeps its first hit, each hole gets exactly the triangle
+/// `locate_triangle` would return — but in O(triangles + holes) instead
+/// of O(holes × triangles).
+fn locate_holes_gridded(mesh: &CdtMesh, positions: &[Vertex], pslg: &Pslg) -> Vec<Option<u32>> {
+    let holes = &pslg.holes;
+    let mut seeds: Vec<Option<u32>> = vec![None; holes.len()];
+
+    // Non-finite points can't be bucketed (NaN falls out of every cell
+    // range, infinities poison the box), but `Triangle::contains` can
+    // still answer for them — route them through the linear scan so they
+    // seed exactly what a per-hole locate_triangle pass would.
+    for (i, hole) in holes.iter().enumerate() {
+        if !(hole.point.x.is_finite() && hole.point.y.is_finite()) {
+            seeds[i] = locate_triangle(mesh, positions, hole.point);
+        }
+    }
+
+    // Bounding box of the finite hole points.
+    let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+    let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for hole in holes.iter() {
+        if !(hole.point.x.is_finite() && hole.point.y.is_finite()) {
+            continue;
+        }
+        min_x = min_x.min(hole.point.x);
+        min_y = min_y.min(hole.point.y);
+        max_x = max_x.max(hole.point.x);
+        max_y = max_y.max(hole.point.y);
+    }
+    if min_x > max_x {
+        return seeds; // no finite holes
+    }
+
+    // Grid resolution: about sqrt(holes) cells per axis. Cell sizes are
+    // clamped to >= 1.0 so zero-extent boxes (coincident holes, or all
+    // holes on one row/column) still index cleanly.
+    let n = (holes.len() as f64).sqrt().ceil() as usize;
+    let cell_w = ((max_x - min_x) / n as f64).max(1.0);
+    let cell_h = ((max_y - min_y) / n as f64).max(1.0);
+    let cell_x = |x: f64| ((x - min_x) / cell_w).floor().clamp(0.0, (n - 1) as f64) as usize;
+    let cell_y = |y: f64| ((y - min_y) / cell_h).floor().clamp(0.0, (n - 1) as f64) as usize;
+
+    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); n * n];
+    let mut remaining = 0usize;
+    for (hole_idx, hole) in holes.iter().enumerate() {
+        if !(hole.point.x.is_finite() && hole.point.y.is_finite()) {
+            continue; // already seeded via the linear scan above
+        }
+        buckets[cell_y(hole.point.y) * n + cell_x(hole.point.x)].push(hole_idx as u32);
+        remaining += 1;
+    }
+
+    // One pass over the triangles, same liveness/ghost filters as
+    // locate_triangle.
+    for tri_idx in 1..mesh.triangles.len() as u32 {
+        if remaining == 0 {
+            break; // every hole located
+        }
+        let slot = mesh.triangle(tri_idx);
+        if slot.is_dead() {
+            continue;
+        }
+        // Skip ghosts (any vertex INVALID).
+        if !slot.vertices.iter().all(|v| v.is_valid()) {
+            continue;
+        }
+        let t = Triangle::new(slot.vertices[0], slot.vertices[1], slot.vertices[2]);
+        let [a, b, c] = t.positions(positions);
+        let tx0 = a.x.min(b.x).min(c.x);
+        let tx1 = a.x.max(b.x).max(c.x);
+        let ty0 = a.y.min(b.y).min(c.y);
+        let ty1 = a.y.max(b.y).max(c.y);
+        // Triangle can't contain a hole point if the boxes don't touch.
+        if tx1 < min_x || tx0 > max_x || ty1 < min_y || ty0 > max_y {
+            continue;
+        }
+        for iy in cell_y(ty0)..=cell_y(ty1) {
+            for ix in cell_x(tx0)..=cell_x(tx1) {
+                for &hole_idx in &buckets[iy * n + ix] {
+                    let seed = &mut seeds[hole_idx as usize];
+                    if seed.is_none() && t.contains(positions, holes[hole_idx as usize].point) {
+                        *seed = Some(tri_idx);
+                        remaining -= 1;
+                    }
+                }
+            }
+        }
+    }
+    seeds
 }
 
 // --- plague --------------------------------------------------------------
@@ -339,5 +450,109 @@ mod tests {
             29,
             "A.poly should produce 29 triangles to match triangle.c's reference output"
         );
+    }
+
+    /// Large square with an `n x n` grid of 1x1 square holes on a 4-unit
+    /// pitch — the many-holes analogue of the single-hole fixture above,
+    /// big enough to exercise the gridded seed path.
+    fn build_square_with_hole_grid(n: usize) -> (CdtMesh, Pslg) {
+        let side = n as f64 * 4.0;
+        let mut mesh = CdtMesh::new();
+        // outer
+        push(&mut mesh, 0.0, 0.0);
+        push(&mut mesh, side, 0.0);
+        push(&mut mesh, side, side);
+        push(&mut mesh, 0.0, side);
+        let mut segments = vec![
+            PslgSegment { a: 0, b: 1, marker: 10 },
+            PslgSegment { a: 1, b: 2, marker: 10 },
+            PslgSegment { a: 2, b: 3, marker: 10 },
+            PslgSegment { a: 3, b: 0, marker: 10 },
+        ];
+        let mut holes = Vec::new();
+        for gy in 0..n {
+            for gx in 0..n {
+                let (cx, cy) = (gx as f64 * 4.0 + 2.0, gy as f64 * 4.0 + 2.0);
+                let base = (4 + (gy * n + gx) * 4) as u32;
+                push(&mut mesh, cx - 0.5, cy - 0.5);
+                push(&mut mesh, cx + 0.5, cy - 0.5);
+                push(&mut mesh, cx + 0.5, cy + 0.5);
+                push(&mut mesh, cx - 0.5, cy + 0.5);
+                for k in 0..4u32 {
+                    segments.push(PslgSegment {
+                        a: base + k,
+                        b: base + (k + 1) % 4,
+                        marker: 20,
+                    });
+                }
+                holes.push(PslgHole {
+                    point: Vertex::new(cx, cy),
+                });
+            }
+        }
+
+        delaunay(&mut mesh, DivConqOptions::default());
+
+        let pslg = Pslg {
+            vertices: (0..mesh.vertices.len() as u32)
+                .map(|i| PslgVertex::new(mesh.vertex_pos(VertexId::new(i))))
+                .collect(),
+            segments,
+            holes,
+        };
+        form_skeleton(&mut mesh, &pslg, None).unwrap();
+        (mesh, pslg)
+    }
+
+    /// Cross-check the gridded seed path against a per-hole
+    /// locate_triangle oracle: identical seed triangle for every hole,
+    /// and an identical surviving triangle set after the full carve.
+    #[test]
+    fn gridded_seeds_match_locate_triangle_oracle() {
+        // Seed triangles: gridded batch vs the linear scan.
+        let (mesh, pslg) = build_square_with_hole_grid(5);
+        assert_eq!(pslg.holes.len(), 25);
+        let positions = mesh.vertices_positions();
+        let gridded = locate_holes_gridded(&mesh, &positions, &pslg);
+        for (i, hole) in pslg.holes.iter().enumerate() {
+            let oracle = locate_triangle(&mesh, &positions, hole.point);
+            assert!(oracle.is_some(), "hole {} not located by the oracle", i);
+            assert_eq!(gridded[i], oracle, "hole {} seed triangle mismatch", i);
+        }
+
+        // Full carve: the normal pipeline (gridded path, 25 holes) vs a
+        // carve seeded via locate_triangle. The fixture builds
+        // deterministically, so both meshes start identical and must end
+        // with the exact same surviving triangles.
+        let (mut mesh_grid, pslg) = build_square_with_hole_grid(5);
+        let (mut mesh_oracle, _) = build_square_with_hole_grid(5);
+        let killed_grid = carve_holes(&mut mesh_grid, &pslg, false);
+        let killed_oracle = {
+            let mut infected = vec![false; mesh_oracle.triangles.len()];
+            let mut worklist = VecDeque::new();
+            infect_hull(&mut mesh_oracle, &mut infected, &mut worklist);
+            let positions = mesh_oracle.vertices_positions();
+            for hole in &pslg.holes {
+                if let Some(tri) = locate_triangle(&mesh_oracle, &positions, hole.point) {
+                    if !infected[tri as usize] {
+                        infected[tri as usize] = true;
+                        worklist.push_back(tri);
+                    }
+                }
+            }
+            plague(&mut mesh_oracle, &mut infected, &mut worklist);
+            sweep(&mut mesh_oracle, &infected)
+        };
+        assert_eq!(killed_grid, killed_oracle, "carve killed different counts");
+
+        let survivors = |mesh: &CdtMesh| -> Vec<(u32, [VertexId; 3])> {
+            (1..mesh.triangles.len() as u32)
+                .filter(|&i| !mesh.triangle(i).is_dead())
+                .map(|i| (i, mesh.triangle(i).vertices))
+                .collect()
+        };
+        let s = survivors(&mesh_grid);
+        assert!(!s.is_empty());
+        assert_eq!(s, survivors(&mesh_oracle), "surviving triangle sets differ");
     }
 }

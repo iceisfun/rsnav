@@ -10,9 +10,11 @@
 //!
 //! [`NavListener::on_event`] callbacks are invoked on the worker thread.
 //! Any panic inside a listener is caught and swallowed — a buggy listener
-//! will not kill the worker thread. Use [`NavWorker::is_running`] to
-//! check whether the worker thread is still alive (it becomes `false` only
-//! on clean shutdown or if a panic in the build pipeline itself kills it).
+//! will not kill the worker thread. Panics in the build pipeline itself
+//! are caught too and surface as a failed build ([`BuildError::Panicked`]
+//! via [`NavWorker::last_error`]); the previous published build stays
+//! available. Use [`NavWorker::is_running`] to check whether the worker
+//! thread is still alive (it becomes `false` on clean shutdown).
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -49,6 +51,8 @@ use std::time::Instant;
 use arc_swap::ArcSwapOption;
 
 use rsnav_bsp::Bsp;
+use rsnav_common::par::{par_map_indexed, resolve_threads};
+use rsnav_common::PolygonWithHoles;
 use rsnav_navmesh::{build_from_cdt, NavMesh};
 use rsnav_polygon_extract::{extract, Bitfield, ExtractOptions};
 use rsnav_triangle::{
@@ -66,6 +70,14 @@ pub struct BuildOptions {
     pub perimeter_marker: i32,
     /// Marker assigned to hole-perimeter constraint segments.
     pub hole_marker: i32,
+    /// Worker threads for the build: the per-region CDT stages, plus
+    /// [`extract`]'s internal phases whenever `extract.threads` is left
+    /// at `0`. `0` = one per available core, `1` = fully serial (no
+    /// thread is spawned anywhere in the build). Output is identical for
+    /// every setting. Small inputs (few regions or little ring geometry)
+    /// stay serial regardless, so the default never spawns threads for
+    /// trivial bitfields.
+    pub threads: usize,
     /// Post-carve cleanup: clip "ear" triangles (two wall edges + one
     /// interior edge) whose area is `< clip_ears_max_area`. `0.0` disables
     /// the pass. Default `0.6`, tuned for unit-cell bitfield inputs (half-
@@ -81,6 +93,7 @@ impl Default for BuildOptions {
             extract: ExtractOptions::default(),
             perimeter_marker: 1,
             hole_marker: 2,
+            threads: 0,
             clip_ears_max_area: 0.6,
         }
     }
@@ -110,6 +123,11 @@ pub enum BuildError {
     SegmentInsertion(SegmentInsertError),
     /// Pipeline ran but produced zero live triangles after hole carving.
     EmptyMesh,
+    /// The pipeline panicked. Only produced by [`NavWorker`], which
+    /// catches the unwind so one poisoned snapshot degrades to a failed
+    /// build instead of silently killing the worker thread; direct
+    /// callers of [`build_navmesh_from_bitfield`] see the panic itself.
+    Panicked(String),
 }
 
 impl core::fmt::Display for BuildError {
@@ -118,6 +136,7 @@ impl core::fmt::Display for BuildError {
             Self::NoPerimeter => write!(f, "bitfield has no walkable regions"),
             Self::SegmentInsertion(e) => write!(f, "segment insertion failed: {e}"),
             Self::EmptyMesh => write!(f, "pipeline produced zero triangles"),
+            Self::Panicked(msg) => write!(f, "build pipeline panicked: {msg}"),
         }
     }
 }
@@ -236,64 +255,61 @@ struct TimingStats {
 // One-shot pipeline (also used by NavWorker internally).
 // =========================================================================
 
-/// Run the full `polygon-extract → CDT → NavMesh → BSP` pipeline against
-/// a single bitfield snapshot. Used by [`NavWorker`] and exposed for
-/// callers that want a synchronous build.
-pub fn build_navmesh_from_bitfield(
-    bf: &Bitfield,
-    opts: &BuildOptions,
-) -> Result<NavBuild, BuildError> {
-    let start = Instant::now();
-
-    let regions = extract(bf, &opts.extract);
-    if regions.is_empty() {
-        return Err(BuildError::NoPerimeter);
-    }
-
+/// Build the PSLG for one extracted region, with region-local 0-based
+/// vertex indices.
+fn region_pslg(region: &PolygonWithHoles, opts: &BuildOptions) -> Pslg {
     let mut pslg = Pslg::new();
     let mut next_idx: u32 = 0;
 
-    for region in &regions {
-        // Outer ring.
+    // Outer ring.
+    let start_idx = next_idx;
+    for v in &region.outer.vertices {
+        pslg.vertices.push(PslgVertex::new(*v));
+        next_idx += 1;
+    }
+    let n = region.outer.vertices.len() as u32;
+    if n >= 3 {
+        for i in 0..n {
+            pslg.segments.push(PslgSegment {
+                a: start_idx + i,
+                b: start_idx + (i + 1) % n,
+                marker: opts.perimeter_marker,
+            });
+        }
+    }
+
+    // Hole rings.
+    for hole in &region.holes {
         let start_idx = next_idx;
-        for v in &region.outer.vertices {
+        for v in &hole.vertices {
             pslg.vertices.push(PslgVertex::new(*v));
             next_idx += 1;
         }
-        let n = region.outer.vertices.len() as u32;
+        let n = hole.vertices.len() as u32;
         if n >= 3 {
             for i in 0..n {
                 pslg.segments.push(PslgSegment {
                     a: start_idx + i,
                     b: start_idx + (i + 1) % n,
-                    marker: opts.perimeter_marker,
+                    marker: opts.hole_marker,
                 });
             }
         }
-
-        // Hole rings.
-        for hole in &region.holes {
-            let start_idx = next_idx;
-            for v in &hole.vertices {
-                pslg.vertices.push(PslgVertex::new(*v));
-                next_idx += 1;
-            }
-            let n = hole.vertices.len() as u32;
-            if n >= 3 {
-                for i in 0..n {
-                    pslg.segments.push(PslgSegment {
-                        a: start_idx + i,
-                        b: start_idx + (i + 1) % n,
-                        marker: opts.hole_marker,
-                    });
-                }
-            }
-            if let Some(seed) = hole.interior_point() {
-                pslg.holes.push(PslgHole { point: seed });
-            }
+        if let Some(seed) = hole.interior_point() {
+            pslg.holes.push(PslgHole { point: seed });
         }
     }
 
+    pslg
+}
+
+/// Run the CDT stages (`delaunay → form_skeleton → carve_holes →
+/// clip_ears → build_from_cdt`) for one extracted region.
+fn build_region_navmesh(
+    region: &PolygonWithHoles,
+    opts: &BuildOptions,
+) -> Result<NavMesh, BuildError> {
+    let pslg = region_pslg(region, opts);
     let mut cdt = CdtMesh::new();
     for v in &pslg.vertices {
         cdt.push_vertex(VertexSlot::new(v.position, 0));
@@ -304,8 +320,93 @@ pub fn build_navmesh_from_bitfield(
     if opts.clip_ears_max_area > 0.0 {
         clip_ears(&mut cdt, opts.clip_ears_max_area);
     }
+    Ok(build_from_cdt(&cdt))
+}
 
-    let navmesh = build_from_cdt(&cdt);
+/// Below this much total ring geometry the whole build runs on the
+/// caller's thread — thread spawn/join would cost more than it saves.
+const PAR_MIN_REGIONS: usize = 4;
+const PAR_MIN_RING_VERTS: usize = 2048;
+/// Region skew means extra workers beyond this mostly just pay spawn
+/// cost — the makespan is pinned to the largest region regardless.
+const PAR_MAX_THREADS: usize = 16;
+
+/// Run the full `polygon-extract → CDT → NavMesh → BSP` pipeline against
+/// a single bitfield snapshot. Used by [`NavWorker`] and exposed for
+/// callers that want a synchronous build.
+///
+/// Extracted regions are geometrically disjoint, so each one runs the
+/// CDT stages independently — in parallel per [`BuildOptions::threads`]
+/// — and the per-region meshes are merged with [`NavMesh::append`] in
+/// extraction order, keeping the output deterministic for a given input
+/// regardless of thread count.
+pub fn build_navmesh_from_bitfield(
+    bf: &Bitfield,
+    opts: &BuildOptions,
+) -> Result<NavBuild, BuildError> {
+    let start = Instant::now();
+
+    // `BuildOptions::threads` governs the whole build: an extract knob
+    // left at 0 (auto) inherits it, so `threads: 1` really is serial
+    // end-to-end. An explicitly set `extract.threads` still wins.
+    let mut extract_opts = opts.extract;
+    if extract_opts.threads == 0 {
+        extract_opts.threads = opts.threads;
+    }
+    let regions = extract(bf, &extract_opts);
+    if regions.is_empty() {
+        return Err(BuildError::NoPerimeter);
+    }
+
+    let region_verts: Vec<usize> = regions
+        .iter()
+        .map(|r| {
+            r.outer.vertices.len()
+                + r.holes.iter().map(|h| h.vertices.len()).sum::<usize>()
+        })
+        .collect();
+    let ring_verts: usize = region_verts.iter().sum();
+    // The makespan can never drop below the largest region, so threads
+    // only pay off when the work *outside* it is worth overlapping.
+    let largest = region_verts.iter().copied().max().unwrap_or(0);
+    let threads = if regions.len() < PAR_MIN_REGIONS
+        || ring_verts - largest < PAR_MIN_RING_VERTS
+    {
+        1
+    } else {
+        resolve_threads(opts.threads)
+            .min(regions.len())
+            .min(PAR_MAX_THREADS)
+    };
+
+    // Region sizes are heavily skewed (a map is typically one huge region
+    // plus many islands), so schedule largest-first: the makespan then
+    // tracks the biggest region instead of whenever it happens to come up
+    // in discovery order. Results are scattered back to extraction order,
+    // so scheduling never affects output.
+    let mut order: Vec<usize> = (0..regions.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(region_verts[i]));
+    let scheduled = par_map_indexed(&order, threads, |_, &region_idx| {
+        (region_idx, build_region_navmesh(&regions[region_idx], opts))
+    });
+    let mut parts: Vec<Option<Result<NavMesh, BuildError>>> = Vec::new();
+    parts.resize_with(regions.len(), || None);
+    for (region_idx, part) in scheduled {
+        parts[region_idx] = Some(part);
+    }
+
+    // Merge in extraction order. `?` on the indexed results reports the
+    // lowest-index region's error, matching what a serial loop would hit
+    // first.
+    let mut merged: Option<NavMesh> = None;
+    for part in parts {
+        let part = part.expect("every region built exactly once")?;
+        match merged.as_mut() {
+            None => merged = Some(part),
+            Some(m) => m.append(&part),
+        }
+    }
+    let navmesh = merged.expect("regions is non-empty");
     if navmesh.triangle_count() == 0 {
         return Err(BuildError::EmptyMesh);
     }
@@ -541,7 +642,23 @@ fn run_worker(
         generation += 1;
         dispatch(&NavEvent::BuildStarted { generation });
 
-        match build_navmesh_from_bitfield(&latest, &opts) {
+        // Catch panics from the pipeline itself (not just listeners): a
+        // build that dies on one snapshot must report a failed build and
+        // keep serving, not silently kill the worker for the process
+        // lifetime.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            build_navmesh_from_bitfield(&latest, &opts)
+        }))
+        .unwrap_or_else(|payload| {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".into());
+            Err(BuildError::Panicked(msg))
+        });
+
+        match result {
             Ok(mut build) => {
                 build.generation = generation;
                 // Pull the fields we want for the completion event
@@ -603,6 +720,67 @@ mod tests {
         assert!(build.navmesh.triangle_count() > 0);
         assert!(build.build_ms >= 0.0);
         assert_eq!(build.generation, 0); // direct callers see 0
+    }
+
+    /// Nested regions: a walkable ring, a wall moat inside it, and a
+    /// walkable island ring inside the moat (with its own wall core).
+    /// Per-region carving must drop exactly the moat and the core and
+    /// keep both walkable bands — the old global-CDT pipeline could seed
+    /// the outer region's hole inside the nested island and leak moat
+    /// area, so this pins the corrected nesting behavior.
+    #[test]
+    fn nested_island_carves_moat_keeps_island() {
+        let rows = [
+            "#########",
+            "#.......#",
+            "#.#####.#",
+            "#.#...#.#",
+            "#.#.#.#.#",
+            "#.#...#.#",
+            "#.#####.#",
+            "#.......#",
+            "#########",
+        ];
+        let h = rows.len() as u32;
+        let w = rows[0].len() as u32;
+        let mut data = Vec::with_capacity((w * h) as usize);
+        let mut walkable = 0usize;
+        // Bitfield row 0 is the bottom row; the fixture is symmetric so
+        // the flip doesn't matter, but keep the mapping explicit.
+        for line in rows.iter().rev() {
+            for ch in line.chars() {
+                let open = ch == '.';
+                walkable += open as usize;
+                data.push(open);
+            }
+        }
+        let bf = Bitfield::new(w, h, data).expect("dims");
+        let build = build_navmesh_from_bitfield(&bf, &BuildOptions::default())
+            .expect("nested fixture builds");
+        let mesh = &build.navmesh;
+
+        // Both walkable bands survive as their own connected regions.
+        assert_eq!(mesh.region_count, 2, "outer ring + island ring");
+
+        // Triangulated area equals the walkable cell count exactly (all
+        // coordinates are integers, so the sums are exact in f64).
+        let total_area: f64 = (0..mesh.triangle_count())
+            .map(|i| mesh.triangle(rsnav_common::TriangleId::new(i as u32)).area)
+            .sum();
+        assert_eq!(total_area, walkable as f64);
+
+        // Moat and core cells are carved; both bands are covered.
+        let covers = |x: f64, y: f64| {
+            let pt = rsnav_common::Vertex::new(x, y);
+            mesh.triangles.iter().any(|t| {
+                rsnav_common::Triangle::new(t.vertices[0], t.vertices[1], t.vertices[2])
+                    .contains(&mesh.vertices, pt)
+            })
+        };
+        assert!(covers(1.5, 1.5), "outer ring is walkable");
+        assert!(covers(3.5, 3.5), "island band is walkable");
+        assert!(!covers(2.5, 4.5), "moat is carved");
+        assert!(!covers(4.5, 4.5), "island core is carved");
     }
 
     /// Stair-shaped walkable region in a bitfield. Enabling
