@@ -1731,7 +1731,9 @@ version = "0.1.0"
 dependencies = [
  "rsnav-bsp",
  "rsnav-common",
+ "rsnav-dynamic",
  "rsnav-navmesh",
+ "rsnav-polygon-extract",
  "rsnav-triangle",
 ]
 

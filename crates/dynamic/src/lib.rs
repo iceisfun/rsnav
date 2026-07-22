@@ -52,13 +52,15 @@ use arc_swap::ArcSwapOption;
 
 use rsnav_bsp::Bsp;
 use rsnav_common::par::{par_map_indexed, resolve_threads};
+use rsnav_common::planarize::PlanarizeError;
 use rsnav_common::PolygonWithHoles;
 use rsnav_navmesh::{build_from_cdt, NavMesh};
 use rsnav_polygon_extract::{extract, Bitfield, ExtractOptions};
 use rsnav_triangle::{
-    carve_holes, clip_ears, delaunay, form_skeleton,
+    build_cdt_with_inset, carve_holes, clip_ears, delaunay, form_skeleton,
     pslg::{Pslg, PslgHole, PslgSegment, PslgVertex},
-    CdtMesh, DivConqOptions, SegmentInsertError, VertexSlot,
+    CdtMesh, DivConqOptions, InsetError, InsetOptions, InsetRing, RingKind, SegmentInsertError,
+    VertexSlot,
 };
 
 /// Knobs the worker uses on every rebuild.
@@ -85,6 +87,43 @@ pub struct BuildOptions {
     /// at a different scale, scale this in proportion (or set to `0.0` if
     /// small ears are intentional geometry).
     pub clip_ears_max_area: f64,
+    /// Baked agent-radius erosion. `None` (default) = the legacy
+    /// carve_holes path, bit-identical to previous releases
+    /// (digest-stable). `Some(r)` = the offset/planarize/winding path
+    /// eroding walkable area by `r`; `Some(0.0)` erodes nothing but
+    /// still uses the crossing-tolerant classification. Units are
+    /// **bitfield cells** (a typical agent radius is well below 1.0,
+    /// e.g. 0.128 — unlike the demo's world-unit slider, which runs
+    /// 0–40). Erosion only ever shrinks a region, so per-region builds
+    /// stay disjoint and the deterministic merge is unaffected.
+    ///
+    /// Tiled builds ([`rsnav_navigation::TiledWorld`]) must keep `None`:
+    /// per-tile erosion recedes seam edges by `r` and breaks
+    /// `stitch_all`'s collinear-overlap matching. Use
+    /// [`rsnav_polygon_extract::Bitfield::eroded`] instead — it erodes the
+    /// *grid*, so it can run once globally before the grid is sliced into
+    /// tiles, leaving every seam edge exactly on the tile border line.
+    ///
+    /// The two are complements, not alternatives, and they **compose
+    /// additively**: grid-erode the integer part and contour-inset the
+    /// sub-cell remainder for a guaranteed clearance of `a + b`. This path
+    /// remains the only option for sub-cell radii (grid erosion quantizes
+    /// to whole cells, so the 0.128 default is not representable there)
+    /// and for authored, non-grid input.
+    ///
+    /// With a baked inset of `r`, pass `max(0, agent_radius - r)` to
+    /// `WallClearance` / `PathOptions::distance_from_wall` at query time
+    /// to avoid double-counting the clearance.
+    pub inset: Option<f64>,
+}
+
+impl BuildOptions {
+    /// Bake an agent-radius erosion into the build (see
+    /// [`BuildOptions::inset`]).
+    pub fn with_inset(mut self, r: f64) -> Self {
+        self.inset = Some(r);
+        self
+    }
 }
 
 impl Default for BuildOptions {
@@ -95,6 +134,7 @@ impl Default for BuildOptions {
             hole_marker: 2,
             threads: 0,
             clip_ears_max_area: 0.6,
+            inset: None,
         }
     }
 }
@@ -123,6 +163,12 @@ pub enum BuildError {
     SegmentInsertion(SegmentInsertError),
     /// Pipeline ran but produced zero live triangles after hole carving.
     EmptyMesh,
+    /// [`BuildOptions::inset`] was `Some(r)` with a negative, NaN, or
+    /// infinite `r`.
+    InvalidInset(f64),
+    /// The inset path's planarizer failed (adversarially degenerate
+    /// contours for the chosen snap grid).
+    Planarize(PlanarizeError),
     /// The pipeline panicked. Only produced by [`NavWorker`], which
     /// catches the unwind so one poisoned snapshot degrades to a failed
     /// build instead of silently killing the worker thread; direct
@@ -136,6 +182,8 @@ impl core::fmt::Display for BuildError {
             Self::NoPerimeter => write!(f, "bitfield has no walkable regions"),
             Self::SegmentInsertion(e) => write!(f, "segment insertion failed: {e}"),
             Self::EmptyMesh => write!(f, "pipeline produced zero triangles"),
+            Self::InvalidInset(r) => write!(f, "inset must be finite and >= 0, got {r}"),
+            Self::Planarize(e) => write!(f, "inset planarize failed: {e}"),
             Self::Panicked(msg) => write!(f, "build pipeline panicked: {msg}"),
         }
     }
@@ -303,20 +351,52 @@ fn region_pslg(region: &PolygonWithHoles, opts: &BuildOptions) -> Pslg {
     pslg
 }
 
-/// Run the CDT stages (`delaunay → form_skeleton → carve_holes →
-/// clip_ears → build_from_cdt`) for one extracted region.
+/// Run the CDT stages for one extracted region: the legacy
+/// `delaunay → form_skeleton → carve_holes` path when
+/// [`BuildOptions::inset`] is `None` (bit-identical to previous
+/// releases), or the offset/planarize/winding path when `Some(r)`.
+/// Both finish with `clip_ears → build_from_cdt`.
 fn build_region_navmesh(
     region: &PolygonWithHoles,
     opts: &BuildOptions,
 ) -> Result<NavMesh, BuildError> {
-    let pslg = region_pslg(region, opts);
-    let mut cdt = CdtMesh::new();
-    for v in &pslg.vertices {
-        cdt.push_vertex(VertexSlot::new(v.position, 0));
-    }
-    delaunay(&mut cdt, DivConqOptions::default());
-    form_skeleton(&mut cdt, &pslg, None).map_err(BuildError::SegmentInsertion)?;
-    carve_holes(&mut cdt, &pslg, false);
+    let mut cdt = match opts.inset {
+        None => {
+            let pslg = region_pslg(region, opts);
+            let mut cdt = CdtMesh::new();
+            for v in &pslg.vertices {
+                cdt.push_vertex(VertexSlot::new(v.position, 0));
+            }
+            delaunay(&mut cdt, DivConqOptions::default());
+            form_skeleton(&mut cdt, &pslg, None).map_err(BuildError::SegmentInsertion)?;
+            carve_holes(&mut cdt, &pslg, false);
+            cdt
+        }
+        Some(r) => {
+            let mut rings: Vec<InsetRing<'_>> =
+                Vec::with_capacity(1 + region.holes.len());
+            rings.push(InsetRing {
+                points: &region.outer.vertices,
+                kind: RingKind::Perimeter,
+                marker: opts.perimeter_marker,
+            });
+            for h in &region.holes {
+                rings.push(InsetRing {
+                    points: &h.vertices,
+                    kind: RingKind::Hole,
+                    marker: opts.hole_marker,
+                });
+            }
+            let built = build_cdt_with_inset(&rings, r, &InsetOptions::default())
+                .map_err(|e| match e {
+                    InsetError::Planarize(pe) => BuildError::Planarize(pe),
+                    InsetError::Segment(se) => BuildError::SegmentInsertion(se),
+                })?;
+            // A fully-eroded region is a legitimately empty part; the
+            // extraction-order merge appends it as a no-op.
+            built.mesh
+        }
+    };
     if opts.clip_ears_max_area > 0.0 {
         clip_ears(&mut cdt, opts.clip_ears_max_area);
     }
@@ -345,6 +425,12 @@ pub fn build_navmesh_from_bitfield(
     opts: &BuildOptions,
 ) -> Result<NavBuild, BuildError> {
     let start = Instant::now();
+
+    if let Some(r) = opts.inset {
+        if !r.is_finite() || r < 0.0 {
+            return Err(BuildError::InvalidInset(r));
+        }
+    }
 
     // `BuildOptions::threads` governs the whole build: an extract knob
     // left at 0 (auto) inherits it, so `threads: 1` really is serial
@@ -720,6 +806,115 @@ mod tests {
         assert!(build.navmesh.triangle_count() > 0);
         assert!(build.build_ms >= 0.0);
         assert_eq!(build.generation, 0); // direct callers see 0
+    }
+
+    /// Parse an ASCII map ('.' walkable, anything else wall). Row 0 of
+    /// the bitfield is the bottom row, so lines are consumed reversed.
+    fn ascii_bitfield(rows: &[&str]) -> Bitfield {
+        let h = rows.len() as u32;
+        let w = rows[0].len() as u32;
+        let mut data = Vec::with_capacity((w * h) as usize);
+        for line in rows.iter().rev() {
+            for ch in line.chars() {
+                data.push(ch == '.');
+            }
+        }
+        Bitfield::new(w, h, data).expect("test bitfield dims match")
+    }
+
+    fn mesh_area(mesh: &NavMesh) -> f64 {
+        (0..mesh.triangle_count())
+            .map(|i| mesh.triangle(rsnav_common::TriangleId::new(i as u32)).area)
+            .sum()
+    }
+
+    /// Inset on vs off: the eroded mesh is strictly smaller, the moat of
+    /// a nested-island fixture widens, and `Some(0.0)` matches the
+    /// legacy area exactly on clean bitfield input.
+    #[test]
+    fn inset_erodes_area() {
+        let rows = [
+            "#########",
+            "#.......#",
+            "#.#####.#",
+            "#.#...#.#",
+            "#.#.#.#.#",
+            "#.#...#.#",
+            "#.#####.#",
+            "#.......#",
+            "#########",
+        ];
+        let bf = ascii_bitfield(&rows);
+        // Disable clip_ears for exact area comparisons.
+        let mut base = BuildOptions::default();
+        base.clip_ears_max_area = 0.0;
+
+        let legacy = build_navmesh_from_bitfield(&bf, &base).expect("legacy builds");
+        let zero = build_navmesh_from_bitfield(&bf, &base.clone().with_inset(0.0))
+            .expect("inset 0 builds");
+        assert_eq!(
+            mesh_area(&legacy.navmesh),
+            mesh_area(&zero.navmesh),
+            "inset 0 must cover the same area as the legacy carve"
+        );
+        assert_eq!(legacy.navmesh.region_count, zero.navmesh.region_count);
+
+        let eroded = build_navmesh_from_bitfield(&bf, &base.clone().with_inset(0.25))
+            .expect("inset 0.25 builds");
+        assert!(
+            mesh_area(&eroded.navmesh) < mesh_area(&legacy.navmesh),
+            "erosion must shrink the mesh"
+        );
+    }
+
+    /// Cross-thread determinism at a nonzero inset: `threads: 1` and
+    /// `threads: 4` produce byte-identical meshes.
+    #[test]
+    fn inset_build_is_thread_deterministic() {
+        // Big enough to clear the serial-fallback thresholds: a grid of
+        // walkable rooms (many regions, plenty of ring vertices).
+        let mut rows: Vec<String> = Vec::new();
+        for _ in 0..6 {
+            for _ in 0..6 {
+                rows.push(".".repeat(120));
+            }
+            rows.push("#".repeat(120));
+        }
+        let row_refs: Vec<&str> = rows.iter().map(|s| s.as_str()).collect();
+        let bf = ascii_bitfield(&row_refs);
+
+        let mut serial = BuildOptions::default().with_inset(0.128);
+        serial.threads = 1;
+        let mut par = BuildOptions::default().with_inset(0.128);
+        par.threads = 4;
+
+        let a = build_navmesh_from_bitfield(&bf, &serial).expect("serial builds");
+        let b = build_navmesh_from_bitfield(&bf, &par).expect("parallel builds");
+        assert_eq!(
+            a.navmesh.to_bytes(),
+            b.navmesh.to_bytes(),
+            "inset build must be byte-identical across thread counts"
+        );
+    }
+
+    #[test]
+    fn invalid_inset_is_rejected() {
+        let bf = solid_bitfield(8, 8);
+        for bad in [-0.5, f64::NAN, f64::INFINITY] {
+            let err = build_navmesh_from_bitfield(&bf, &BuildOptions::default().with_inset(bad))
+                .expect_err("invalid inset must fail");
+            assert!(matches!(err, BuildError::InvalidInset(_)), "got {err}");
+        }
+    }
+
+    /// Over-erosion of every region is EmptyMesh, not a panic — empty
+    /// parts merge as no-ops and the existing post-merge check fires.
+    #[test]
+    fn inset_full_erosion_is_empty_mesh_error() {
+        let bf = solid_bitfield(8, 8);
+        let err = build_navmesh_from_bitfield(&bf, &BuildOptions::default().with_inset(10.0))
+            .expect_err("fully eroded build must fail cleanly");
+        assert!(matches!(err, BuildError::EmptyMesh), "got {err}");
     }
 
     /// Nested regions: a walkable ring, a wall moat inside it, and a

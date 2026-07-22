@@ -29,6 +29,52 @@
 //! v1 scope: translation-only offsets, links always open, agent clearance not
 //! yet applied across seams. Per-tile doors and `distance_from_wall` are the
 //! marked extension points (a door is just a link you can close).
+//!
+//! ## Agent radius across seams
+//!
+//! **Baked contour inset is incompatible with per-tile builds**: eroding a
+//! tile's mesh (`rsnav_dynamic::BuildOptions::inset = Some(r)`) recedes its
+//! seam edges by `r`, so `stitch_all`'s collinear-overlap matching finds no
+//! shared boundary and the tiles silently disconnect. Keep `inset: None`
+//! for tiled meshes (or exempt seam edges — a future extension).
+//!
+//! For grid-sourced worlds, bake the radius into the **bitfield** instead,
+//! with `rsnav_polygon_extract::Bitfield::eroded`. The ordering rule is the
+//! whole trick — **erode the global grid first, slice it into tiles
+//! second**:
+//!
+//! ```no_run
+//! # use rsnav_common::Vertex;
+//! # use rsnav_polygon_extract::{Bitfield, ErodeOptions};
+//! # use rsnav_navigation::TiledWorld;
+//! # fn demo(global: &Bitfield, tiles: &[(u32, u32)]) -> Result<(), Box<dyn std::error::Error>> {
+//! # let opts = ();
+//! const TS: u32 = 256;
+//! let eroded = global.eroded(&ErodeOptions { radius: 2.0, threads: 0 })?;
+//! let mut world = TiledWorld::new();
+//! for &(tx, ty) in tiles {
+//!     let tile_bits = eroded.subgrid(tx * TS, ty * TS, TS, TS); // erode FIRST
+//!     // let nav = build_navmesh_from_bitfield(&tile_bits, &opts /* inset: None */)?;
+//!     // world.add_tile(nav.navmesh, Vertex::new((tx * TS) as f64, (ty * TS) as f64));
+//! }
+//! world.stitch_all(1e-9);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Slicing an already-eroded grid puts each tile's boundary exactly on the
+//! tile border line, at identical integer coordinates in both neighbours,
+//! so `stitch_all` links them normally. **Eroding a tile** would treat the
+//! tile border as wall and eat `radius` cells at every seam — reproducing
+//! precisely the contour-inset failure above.
+//!
+//! Two pre-existing hazards get slightly likelier once erosion roughens
+//! seam-adjacent geometry, because both can act asymmetrically between
+//! neighbours: `ExtractOptions::min_area` can drop a seam-adjacent fragment
+//! in one tile only, and `BuildOptions::clip_ears_max_area` can shave a
+//! small sliver whose wall edge lies *on* a seam. For tiled builds prefer
+//! `min_area = 0.0`, and drop `clip_ears_max_area` to 0.0 if a seam ever
+//! fails to link.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};

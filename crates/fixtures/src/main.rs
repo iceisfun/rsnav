@@ -34,10 +34,10 @@ use serde::Deserialize;
 use rsnav_common::{Polygon, Vertex};
 use rsnav_navmesh::{build_from_cdt, NavMesh};
 use rsnav_triangle::{
-    carve_holes, delaunay,
+    build_cdt_with_inset, carve_holes, delaunay,
     form_skeleton,
     pslg::{Pslg, PslgHole, PslgSegment, PslgVertex},
-    CdtMesh, DivConqOptions, VertexSlot,
+    CdtMesh, DivConqOptions, InsetOptions, InsetRing, RingKind, VertexSlot,
 };
 
 // --- Fixture schema -----------------------------------------------------
@@ -147,6 +147,7 @@ fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut verbose = false;
     let mut testdata: Option<PathBuf> = None;
+    let mut inset: Option<f64> = None;
 
     let mut iter = raw.into_iter();
     while let Some(a) = iter.next() {
@@ -160,6 +161,14 @@ fn main() {
                 Some(path) => testdata = Some(PathBuf::from(path)),
                 None => {
                     eprintln!("error: --testdata requires a PATH argument");
+                    print_usage();
+                    std::process::exit(1);
+                }
+            },
+            "--inset" => match iter.next().and_then(|v| v.parse::<f64>().ok()) {
+                Some(r) if r.is_finite() && r >= 0.0 => inset = Some(r),
+                _ => {
+                    eprintln!("error: --inset requires a finite radius >= 0");
                     print_usage();
                     std::process::exit(1);
                 }
@@ -204,7 +213,7 @@ fn main() {
     print_header();
     let mut outcomes = Vec::with_capacity(paths.len());
     for p in &paths {
-        let outcome = run_fixture(p, verbose);
+        let outcome = run_fixture(p, verbose, inset);
         print_row(&outcome);
         outcomes.push(outcome);
     }
@@ -232,17 +241,21 @@ fn main() {
 }
 
 fn print_usage() {
-    eprintln!("usage: rsnav-fixtures [--testdata <PATH>] [-v|--verbose] [-h|--help]");
+    eprintln!("usage: rsnav-fixtures [--testdata <PATH>] [--inset <R>] [-v|--verbose] [-h|--help]");
     eprintln!();
     eprintln!("  --testdata <PATH>   File or directory of .json fixtures to run.");
     eprintln!("                      Defaults to ./testdata if not provided.");
+    eprintln!("  --inset <R>         Route the build through the inset pipeline");
+    eprintln!("                      (offset/planarize/winding) with erosion radius R.");
+    eprintln!("                      R = 0 still uses the crossing-tolerant path.");
+    eprintln!("                      Without this flag the legacy carve path runs.");
     eprintln!("  -v, --verbose       Print per-fixture diagnostics after the table.");
     eprintln!("  -h, --help          Show this help.");
 }
 
 // --- Run a single fixture ----------------------------------------------
 
-fn run_fixture(path: &Path, want_diagnostics: bool) -> Outcome {
+fn run_fixture(path: &Path, want_diagnostics: bool, inset: Option<f64>) -> Outcome {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -317,26 +330,31 @@ fn run_fixture(path: &Path, want_diagnostics: bool) -> Outcome {
         match seed {
             Some(s) => hole_seeds.push(s),
             None => {
-                return Outcome {
-                    file: name,
-                    n_perimeters,
-                    n_outer_verts,
-                    n_holes,
-                    n_hole_verts,
-                    bbox,
-                    status: Status::InteriorPointFailed { hole_index: i },
-                    triangles: None,
-                    regions: None,
-                    build_ms: None,
-                    hole_diagnostics: diagnostics,
-                };
+                // The winding path needs no seeds; only the legacy carve
+                // is blocked by a seedless hole.
+                if inset.is_none() {
+                    return Outcome {
+                        file: name,
+                        n_perimeters,
+                        n_outer_verts,
+                        n_holes,
+                        n_hole_verts,
+                        bbox,
+                        status: Status::InteriorPointFailed { hole_index: i },
+                        triangles: None,
+                        regions: None,
+                        build_ms: None,
+                        hole_diagnostics: diagnostics,
+                    };
+                }
             }
         }
     }
 
     // Build, catching panics so a single fixture never kills the run.
-    let build = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_pipeline(&perimeters, &holes, &hole_seeds)
+    let build = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match inset {
+        None => run_pipeline(&perimeters, &holes, &hole_seeds),
+        Some(r) => run_pipeline_inset(&perimeters, &holes, r),
     }));
 
     match build {
@@ -400,7 +418,7 @@ fn run_pipeline(
     perimeters: &[Vec<Vertex>],
     holes: &[Vec<Vertex>],
     hole_seeds: &[Vertex],
-) -> Result<(NavMesh, f64), rsnav_triangle::SegmentInsertError> {
+) -> Result<(NavMesh, f64), String> {
     let start = Instant::now();
     let mut pslg = Pslg::new();
     let mut next_idx = 0u32;
@@ -432,9 +450,31 @@ fn run_pipeline(
     }
 
     delaunay(&mut cdt, DivConqOptions::default());
-    form_skeleton(&mut cdt, &pslg, None)?;
+    form_skeleton(&mut cdt, &pslg, None).map_err(|e| format!("{e}"))?;
     carve_holes(&mut cdt, &pslg, false);
     let nav = build_from_cdt(&cdt);
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    Ok((nav, ms))
+}
+
+/// The inset pipeline (offset → planarize → winding cull) — no hole
+/// seeds, crossing-tolerant even at radius 0.
+fn run_pipeline_inset(
+    perimeters: &[Vec<Vertex>],
+    holes: &[Vec<Vertex>],
+    inset: f64,
+) -> Result<(NavMesh, f64), String> {
+    let start = Instant::now();
+    let mut rings: Vec<InsetRing<'_>> = Vec::with_capacity(perimeters.len() + holes.len());
+    for p in perimeters {
+        rings.push(InsetRing { points: p, kind: RingKind::Perimeter, marker: 1 });
+    }
+    for h in holes {
+        rings.push(InsetRing { points: h, kind: RingKind::Hole, marker: 2 });
+    }
+    let built = build_cdt_with_inset(&rings, inset, &InsetOptions::default())
+        .map_err(|e| format!("{e}"))?;
+    let nav = build_from_cdt(&built.mesh);
     let ms = start.elapsed().as_secs_f64() * 1000.0;
     Ok((nav, ms))
 }

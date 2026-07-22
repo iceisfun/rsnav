@@ -10,14 +10,21 @@ pub mod aabb;
 pub mod geom;
 pub mod ids;
 pub mod mesh2d;
+pub mod offset;
 pub mod par;
+pub mod planarize;
 pub mod polygon;
+pub mod rng;
 pub mod triangle;
 pub mod vertex;
 
 pub use aabb::Aabb;
 pub use ids::{PolygonId, TriangleId, VertexId};
 pub use mesh2d::Mesh2d;
+pub use offset::{offset_ring_left, OffsetOptions, SoupContour};
+pub use planarize::{
+    planarize, planarize_with, verify_planar, PlanarSegments, PlanarizeError, SnapGrid,
+};
 pub use polygon::{Polygon, PolygonWithHoles, Winding};
 pub use triangle::Triangle;
 pub use vertex::Vertex;

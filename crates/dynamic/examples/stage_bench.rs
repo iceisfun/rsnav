@@ -4,11 +4,18 @@
 //! ```text
 //! cargo run --release -p rsnav-dynamic --example stage_bench -- [testdata_dir]
 //! cargo run --release -p rsnav-dynamic --example stage_bench -- --digest [testdata_dir]
+//! cargo run --release -p rsnav-dynamic --example stage_bench -- --erode 2.0 [testdata_dir]
 //! ```
 //!
 //! `--digest` runs the real `build_navmesh_from_bitfield` pipeline and
 //! prints an FNV-1a hash of each serialized NavMesh — a change gate for
 //! refactors that must stay bit-identical.
+//!
+//! `--erode <r>` times `Bitfield::eroded` (grid erosion, `O(cells)`)
+//! against the rest of the build, which is `O(boundary)`. Putting the two
+//! in one table is the point: on a large mostly-open map erosion dominates
+//! a build whose output is a handful of triangles, which is exactly why it
+//! is opt-in at the call site and never a default.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -16,7 +23,7 @@ use std::time::Instant;
 use rsnav_bsp::Bsp;
 use rsnav_dynamic::BuildOptions;
 use rsnav_navmesh::build_from_cdt;
-use rsnav_polygon_extract::{extract, Bitfield};
+use rsnav_polygon_extract::{extract, Bitfield, ErodeOptions};
 use rsnav_triangle::{
     carve_holes, clip_ears, delaunay, form_skeleton, CdtMesh, DivConqOptions, Pslg, PslgHole,
     PslgSegment, PslgVertex, VertexSlot,
@@ -79,6 +86,31 @@ fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let digest = args.iter().any(|a| a == "--digest");
     args.retain(|a| a != "--digest");
+    // `--inset <r>` routes builds through the offset/planarize/winding
+    // path (BuildOptions::inset = Some(r)); without it the legacy path
+    // runs, keeping the recorded default digests comparable forever.
+    let mut inset: Option<f64> = None;
+    if let Some(i) = args.iter().position(|a| a == "--inset") {
+        let r = args
+            .get(i + 1)
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|r| r.is_finite() && *r >= 0.0)
+            .expect("--inset requires a finite radius >= 0");
+        inset = Some(r);
+        args.drain(i..=i + 1);
+    }
+    // `--erode <r>` times the grid erosion (rsnav_polygon_extract) that
+    // bakes an agent radius into the bitfield before extraction.
+    let mut erode: Option<f64> = None;
+    if let Some(i) = args.iter().position(|a| a == "--erode") {
+        let r = args
+            .get(i + 1)
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|r| r.is_finite() && *r >= 0.0)
+            .expect("--erode requires a finite radius >= 0");
+        erode = Some(r);
+        args.drain(i..=i + 1);
+    }
     let dir = args
         .first()
         .map(PathBuf::from)
@@ -91,20 +123,108 @@ fn main() {
         .collect();
     files.sort();
 
+    let base_opts = || {
+        let mut o = BuildOptions::default();
+        o.inset = inset;
+        o
+    };
+
+    if let Some(r) = erode {
+        // Erosion is O(cells) whatever the boundary looks like, so the
+        // interesting column is `cells` next to `erode` — not `build`.
+        println!(
+            "{:<24} {:>10} {:>9} {:>9} {:>9}",
+            "file", "cells", "erode", "extract", "build"
+        );
+        for f in &files {
+            let bytes = std::fs::read(f).expect("read pbm");
+            let (w, h, cells) = read_pbm(&bytes).expect("parse pbm");
+            let bf = Bitfield::new(w, h, cells).expect("bitfield");
+            let opts = base_opts();
+
+            // Warm the page cache / allocator so the first file is not
+            // penalized relative to the rest.
+            let _ = bf
+                .eroded(&ErodeOptions { radius: r, threads: 0 })
+                .expect("erode");
+            let t = Instant::now();
+            let er = bf
+                .eroded(&ErodeOptions { radius: r, threads: 0 })
+                .expect("erode");
+            let t_erode = t.elapsed();
+
+            let t = Instant::now();
+            let regions = extract(&er, &opts.extract);
+            let t_extract = t.elapsed();
+            let _ = regions;
+
+            let t = Instant::now();
+            let tris = match rsnav_dynamic::build_navmesh_from_bitfield(&er, &opts) {
+                Ok(b) => b.navmesh.triangle_count(),
+                // Full erosion legitimately leaves nothing to triangulate.
+                Err(_) => 0,
+            };
+            let t_build = t.elapsed();
+
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            println!(
+                "{:<24} {:>10} {:>8.1}m {:>8.1}m {:>8.1}m   ({} tris)",
+                f.file_name().unwrap().to_string_lossy(),
+                (w as usize) * (h as usize),
+                ms(t_erode),
+                ms(t_extract),
+                ms(t_build),
+                tris,
+            );
+        }
+        return;
+    }
+
     if digest {
         for f in &files {
             let bytes = std::fs::read(f).expect("read pbm");
             let (w, h, cells) = read_pbm(&bytes).expect("parse pbm");
             let bf = Bitfield::new(w, h, cells).expect("bitfield");
-            let build =
-                rsnav_dynamic::build_navmesh_from_bitfield(&bf, &BuildOptions::default())
-                    .expect("build");
+            let build = rsnav_dynamic::build_navmesh_from_bitfield(&bf, &base_opts())
+                .expect("build");
             let ser = build.navmesh.to_bytes();
             println!(
                 "{:<24} {:>9} tris {:>16x}",
                 f.file_name().unwrap().to_string_lossy(),
                 build.navmesh.triangle_count(),
                 fnv1a(&ser),
+            );
+        }
+        return;
+    }
+
+    // With --inset the CDT stages are fused inside build_cdt_with_inset,
+    // so the timing table collapses to whole-pipeline phases.
+    if inset.is_some() {
+        println!(
+            "{:<24} {:>9} {:>9}",
+            "file", "extract", "build"
+        );
+        for f in &files {
+            let bytes = std::fs::read(f).expect("read pbm");
+            let (w, h, cells) = read_pbm(&bytes).expect("parse pbm");
+            let bf = Bitfield::new(w, h, cells).expect("bitfield");
+            let opts = base_opts();
+            let t = Instant::now();
+            let regions = extract(&bf, &opts.extract);
+            let t_extract = t.elapsed();
+            let _ = regions;
+            let t = Instant::now();
+            let build =
+                rsnav_dynamic::build_navmesh_from_bitfield(&bf, &opts).expect("build");
+            let t_build = t.elapsed();
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            println!(
+                "{:<24} {:>8.1}m {:>8.1}m   ({} tris)",
+                f.file_name().unwrap().to_string_lossy(),
+                ms(t_extract),
+                ms(t_build),
+                build.navmesh.triangle_count(),
             );
         }
         return;

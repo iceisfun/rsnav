@@ -49,8 +49,21 @@ fn read_pbm(bytes: &[u8]) -> Option<(u32, u32, Vec<bool>)> {
 }
 
 fn main() {
-    let dir = std::env::args()
-        .nth(1)
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--inset <r>` runs the offset/planarize/winding path; the
+    // byte-identity check across thread counts applies to it unchanged.
+    let mut inset: Option<f64> = None;
+    if let Some(i) = args.iter().position(|a| a == "--inset") {
+        let r = args
+            .get(i + 1)
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|r| r.is_finite() && *r >= 0.0)
+            .expect("--inset requires a finite radius >= 0");
+        inset = Some(r);
+        args.drain(i..=i + 1);
+    }
+    let dir = args
+        .first()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("testdata"));
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -77,7 +90,7 @@ fn main() {
         for c in counts {
             // BuildOptions::threads governs extract too (its 0 = auto
             // inherits), so one knob covers the whole build.
-            let opts = BuildOptions { threads: c, ..BuildOptions::default() };
+            let opts = BuildOptions { threads: c, inset, ..BuildOptions::default() };
             // Best of 3 to shake scheduler noise out.
             let mut best = f64::MAX;
             let mut bytes = Vec::new();

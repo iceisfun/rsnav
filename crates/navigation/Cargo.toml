@@ -14,3 +14,5 @@ rsnav-bsp.workspace = true
 
 [dev-dependencies]
 rsnav-triangle.workspace = true
+rsnav-polygon-extract.workspace = true
+rsnav-dynamic.workspace = true

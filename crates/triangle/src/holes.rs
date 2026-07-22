@@ -290,7 +290,10 @@ fn plague(mesh: &mut CdtMesh, infected: &mut [bool], worklist: &mut VecDeque<u32
 
 /// Detach every infected triangle from its still-alive neighbors and free
 /// its slot. Returns the number of triangles killed.
-fn sweep(mesh: &mut CdtMesh, infected: &[bool]) -> usize {
+///
+/// Shared with the winding-based cull (`carve_by_winding`), which builds
+/// its infected set by classification instead of plague BFS.
+pub(crate) fn sweep(mesh: &mut CdtMesh, infected: &[bool]) -> usize {
     let mut killed = 0usize;
     for tri_idx in 1..mesh.triangles.len() as u32 {
         if !infected[tri_idx as usize] || mesh.triangle(tri_idx).is_dead() {
@@ -334,24 +337,24 @@ impl MeshPositions for CdtMesh {
 #[allow(dead_code)]
 fn _silence_vertex_id_warning(_: VertexId) {}
 
-// --- Tests --------------------------------------------------------------
+// --- Test fixtures (shared with winding.rs tests) ------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod testfix {
     use super::*;
     use crate::divconq::{delaunay, DivConqOptions};
     use crate::mesh::VertexSlot;
     use crate::pslg::{PslgHole, PslgSegment, PslgVertex};
     use crate::segment::form_skeleton;
 
-    fn push(m: &mut CdtMesh, x: f64, y: f64) -> VertexId {
+    pub(crate) fn push(m: &mut CdtMesh, x: f64, y: f64) -> VertexId {
         m.push_vertex(VertexSlot::new(Vertex::new(x, y), 0))
     }
 
     /// 4x4 square (4 outer verts) with a 1x1 hole in the middle bounded by
     /// 4 inner verts. After carve, only the 8 triangles between the rings
     /// should survive.
-    fn build_square_with_square_hole() -> (CdtMesh, Pslg) {
+    pub(crate) fn build_square_with_square_hole() -> (CdtMesh, Pslg) {
         let mut mesh = CdtMesh::new();
         // outer
         push(&mut mesh, 0.0, 0.0);
@@ -396,6 +399,18 @@ mod tests {
         form_skeleton(&mut mesh, &pslg, None).unwrap();
         (mesh, pslg)
     }
+}
+
+// --- Tests --------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::testfix::{build_square_with_square_hole, push};
+    use super::*;
+    use crate::divconq::{delaunay, DivConqOptions};
+    use crate::mesh::VertexSlot;
+    use crate::pslg::{PslgHole, PslgSegment, PslgVertex};
+    use crate::segment::form_skeleton;
 
     #[test]
     fn carve_a_square_hole() {

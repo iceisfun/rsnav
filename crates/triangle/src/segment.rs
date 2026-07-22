@@ -104,8 +104,9 @@ pub fn make_vertex_map(mesh: &mut CdtMesh) {
 /// Glue a fresh subseg onto the edge held by `tri`. If a subseg is already
 /// there, just promote its marker if it was unmarked.
 ///
-/// Port of `insertsubseg()`.
-fn insert_subseg(mesh: &mut CdtMesh, tri: Otri, subsegmark: i32) {
+/// Port of `insertsubseg()`. Also used by the winding cull's boundary
+/// backfill (`carve_by_winding`).
+pub(crate) fn insert_subseg(mesh: &mut CdtMesh, tri: Otri, subsegmark: i32) {
     let triorg = mesh.org(tri);
     let tridest = mesh.dest(tri);
     if triorg.is_valid() && mesh.vertex(triorg).marker == 0 {

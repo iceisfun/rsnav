@@ -13,10 +13,21 @@
 //! - Output polygons are wound **counter-clockwise** for outer rings and
 //!   **clockwise** for holes, matching the convention `rsnav-common::Polygon`
 //!   uses and that the CDT expects.
+//!
+//! ## Agent radius
+//!
+//! [`Bitfield::eroded`] bakes an agent radius into the *grid* before
+//! extraction — an exact Euclidean erosion, `O(cells)`, radii quantized to
+//! whole cells. It is opt-in and it is not a replacement for the contour
+//! inset (`rsnav_dynamic::BuildOptions::inset`), which handles sub-cell
+//! radii and authored polygons. Its one exclusive capability: because it
+//! runs on the global grid *before* tiling, it is the only erosion
+//! compatible with `rsnav_navigation::TiledWorld` seams. See that method's
+//! docs for the guarantees and the limitations.
 
 #![forbid(unsafe_code)]
 
-use rsnav_common::par::{par_map_indexed, resolve_threads};
+use rsnav_common::par::{par_bands_mut, par_map_indexed, resolve_threads};
 use rsnav_common::{Aabb, Polygon, PolygonWithHoles, Vertex, Winding, geom};
 
 // --- Bitfield ------------------------------------------------------------
@@ -595,6 +606,603 @@ fn mark_stair_middles(p: &Polygon) -> Vec<bool> {
         .collect()
 }
 
+// --- Grid erosion (agent radius, baked into the bitfield) ----------------
+//
+// `extract` traces the walkable set exactly. If an agent has a radius, you
+// want the *eroded* walkable set — the positions where a disc of that
+// radius fits. There are two places to do that:
+//
+//   * on the **contours**, after extraction (`rsnav_dynamic::BuildOptions::inset`
+//     / `rsnav_triangle::build_cdt_with_inset`): offset every ring inward,
+//     planarize, re-carve. Cost is O(boundary), it handles sub-cell radii,
+//     and it works on authored (non-grid) polygons.
+//   * on the **grid**, before extraction (this section): drop every cell an
+//     agent cannot fully occupy. Cost is O(cells) whatever the boundary
+//     looks like, radii are quantized to the grid, and it needs a bitfield.
+//
+// The reason to have both is [`rsnav_navigation::TiledWorld`]. Contour
+// inset recedes a tile's seam edges by `r`, so the collinear-overlap
+// matching in `stitch_all` finds no shared boundary and neighbouring tiles
+// silently disconnect. Grid erosion runs **once, globally, before the grid
+// is sliced into tiles**, so every tile's seam edge still lies exactly on
+// the tile border line, at identical integer coordinates in both
+// neighbours. That is the whole selling point; see [`Bitfield::eroded`].
+//
+// ## Why the seed mask is a 3×3 dilation
+//
+// The distance that matters is square-to-square, not center-to-center: an
+// agent standing anywhere in cell `c` must clear the wall, so the test is
+// "the *closest* point of `c` to the *closest* point of any wall cell".
+// For cells at index delta `(dx, dy)` that distance is
+//
+//     sqrt(max(0, |dx| - 1)^2 + max(0, |dy| - 1)^2)
+//
+// — the clamped metric, which is not what a distance transform computes.
+// But minimizing that clamped metric over the wall set is *identical* to
+// minimizing the plain center-to-center Euclidean metric over the 3×3
+// Chebyshev dilation of the wall set. So we dilate first and then run a
+// completely textbook exact squared EDT. That is the one non-obvious step
+// here; everything after it is standard Felzenszwalb–Huttenlocher.
+
+/// Rows of the grid handled by one band in the row-major phases, and
+/// columns per band in the transposed phases. 64 keeps a band's working
+/// set in L2 and matches the blocked transpose tile size.
+const ERODE_BAND: usize = 64;
+/// Erosion is memory-bandwidth-bound; past ~16 workers more threads buy
+/// nothing (measured: 2048² goes 81 ms serial → 19.6 ms at 8 → 15.3 ms at
+/// 16, already past the knee).
+const ERODE_MAX_THREADS: usize = 16;
+/// Saturation value for "no seed in this row". Large enough to lose every
+/// `min` against a real distance, small enough that `sentinel + h²` cannot
+/// overflow `i32` for any grid up to 32767 × 32767 (2.7e8 + 1.1e9 < 2.1e9).
+const DIST_SENTINEL: i32 = 1 << 28;
+
+/// Options for [`Bitfield::eroded`].
+#[derive(Copy, Clone, Debug)]
+pub struct ErodeOptions {
+    /// Agent radius in **bitfield cells** — the same units as
+    /// `rsnav_dynamic::BuildOptions::inset`, since one cell is 1.0 world
+    /// unit throughout this crate.
+    ///
+    /// Fractional values are accepted but **do not buy sub-cell
+    /// resolution**. Output cells are whole cells, so the achievable
+    /// clearances are exactly `{ sqrt(a² + b²) : a, b ∈ ℕ }` =
+    /// `{0, 1, √2, 2, √5, √8, 3, ...}` and the result is a step function
+    /// of `radius` that only jumps at those values: every radius in
+    /// `(0, 1]` gives the identical output (one 8-connected peel), every
+    /// radius in `(1, √2]` gives the next one, and so on. Fractions are
+    /// allowed only so a caller can pass a world-space agent radius
+    /// straight through without pre-quantizing.
+    ///
+    /// Concretely: `BuildOptions::inset` defaults to 0.128 cells, and
+    /// eroding at 0.128 removes the whole first ring of wall-adjacent
+    /// cells — a guaranteed clearance of 1.0, **7.8× more erosion than
+    /// asked for**. Sub-cell radii belong to the contour path,
+    /// permanently.
+    pub radius: f64,
+    /// Worker threads; `0` = one per available core, `1` = serial. Output
+    /// is byte-identical for every setting. Same convention as
+    /// [`ExtractOptions::threads`].
+    pub threads: usize,
+}
+
+impl Default for ErodeOptions {
+    fn default() -> Self {
+        Self {
+            radius: 0.0,
+            threads: 0,
+        }
+    }
+}
+
+/// Errors returned by [`Bitfield::eroded`] and [`ClearanceField::threshold`].
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum ErodeError {
+    /// The radius was NaN, infinite, or negative. Mirrors
+    /// `rsnav_dynamic::BuildError::InvalidInset`.
+    InvalidRadius(f64),
+}
+
+impl std::fmt::Display for ErodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRadius(r) => {
+                write!(f, "erode radius must be finite and >= 0, got {r}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ErodeError {}
+
+/// Squared clearance per cell, in cells².
+///
+/// `sq_at(c, r)` is the squared distance from cell `(c, r)`'s unit square
+/// to the nearest non-walkable region, counting **everything outside the
+/// grid as wall** (matching [`Bitfield::at`], which returns `false` out of
+/// range). It is `0` for wall cells and for walkable cells 8-adjacent to a
+/// wall, and `sqrt(sq_at)` is exactly the largest radius an agent may have
+/// while standing *anywhere* in that cell.
+///
+/// Values are exact integers — no floating point ever enters a distance —
+/// so `sq_at` is bit-reproducible across platforms and thread counts.
+///
+/// The field is separated from [`Bitfield::eroded`] because the transform
+/// is the expensive part and thresholding it is ~2% of the total: build
+/// one field, then [`threshold`](Self::threshold) it at several radii to
+/// get a small/medium/large agent navmesh for the price of one transform.
+/// It is also independently useful as a "how big an agent fits here" map.
+pub struct ClearanceField {
+    pub width: u32,
+    pub height: u32,
+    sq: Vec<i32>,
+}
+
+impl ClearanceField {
+    /// Squared clearance of cell `(col, row)` in cells². Returns `0` for
+    /// out-of-range coordinates (outside the grid is wall, clearance 0).
+    #[inline]
+    pub fn sq_at(&self, col: u32, row: u32) -> i32 {
+        if col >= self.width || row >= self.height {
+            return 0;
+        }
+        self.sq[(row as usize) * (self.width as usize) + (col as usize)]
+    }
+
+    /// The cells whose clearance is `>= radius`.
+    ///
+    /// Self-contained: wall cells always have `sq == 0`, so for any
+    /// `radius > 0` the walkability test is implied and no reference to
+    /// the source bitfield is needed.
+    ///
+    /// **`radius == 0.0` keeps every cell, walls included** — a clearance
+    /// of at least zero is vacuously true everywhere, and the field cannot tell a
+    /// wall cell from a wall-adjacent walkable one (both are `0`). Callers
+    /// who want "the original grid" want the original grid, or
+    /// [`Bitfield::eroded`] with radius 0, which clones.
+    ///
+    /// **Rounding.** The test is `sq >= radius²` with `sq` an exact
+    /// integer, so ties round toward *more* erosion — the safe direction.
+    /// One consequence worth knowing: `radius = sqrt(2)` evaluates in f64
+    /// to `2.0000000000000004`, so cells at exactly √2 clearance are
+    /// dropped, as if the radius were infinitesimally larger. That bias is
+    /// conservative and deliberate; it is not a bug to fix.
+    pub fn threshold(&self, radius: f64) -> Result<Bitfield, ErodeError> {
+        let thr = validate_radius(radius)?;
+        let data = self.sq.iter().map(|&d| i64::from(d) >= thr).collect();
+        Ok(Bitfield {
+            width: self.width,
+            height: self.height,
+            data,
+        })
+    }
+}
+
+/// Validate a radius and return the integer threshold `ceil(radius²)`.
+///
+/// Because the squared distances are exact integers, `d >= radius²` and
+/// `d >= ceil(radius²)` are the same predicate, and the integer form keeps
+/// the inner loop free of floating point. The `as i64` cast saturates, so
+/// an astronomically large (but finite) radius yields `i64::MAX` and
+/// erodes everything away rather than wrapping.
+///
+/// The `max(1)` for `radius > 0` is not a fudge factor: achievable
+/// clearances are integers, so `sq >= r²` with `r > 0` always excludes
+/// `sq == 0` (the wall cells), and `ceil(r²)` already encodes that for
+/// every radius large enough not to underflow. Below `r ≈ 2.2e-162` the
+/// product `radius * radius` flushes to `0.0` and `ceil` yields a
+/// threshold of 0, which would silently keep walls; clamping restores the
+/// exact predicate at no cost to any other radius.
+fn validate_radius(radius: f64) -> Result<i64, ErodeError> {
+    if !radius.is_finite() || radius < 0.0 {
+        return Err(ErodeError::InvalidRadius(radius));
+    }
+    if radius == 0.0 {
+        return Ok(0);
+    }
+    Ok(((radius * radius).ceil() as i64).max(1))
+}
+
+impl Bitfield {
+    /// Morphological erosion by `radius` cells: keep exactly the cells an
+    /// agent of that radius can occupy *anywhere within*.
+    ///
+    /// Exact Euclidean (the structuring element is the agent's disc, not a
+    /// square or a diamond), `O(cells)`, and conservative — it never keeps
+    /// a cell the agent cannot fit in. Feed the result to [`extract`] or
+    /// `rsnav_dynamic::build_navmesh_from_bitfield` with `inset: None` and
+    /// the clearance is baked into the mesh.
+    ///
+    /// # The point of this over `BuildOptions::inset`
+    ///
+    /// It runs on the **grid**, so it can run once globally *before* the
+    /// grid is sliced into tiles, which makes it the only erosion that
+    /// works with [`rsnav_navigation::TiledWorld`] seams:
+    ///
+    /// ```no_run
+    /// # use rsnav_polygon_extract::{Bitfield, ErodeOptions};
+    /// # fn demo(global: &Bitfield) -> Result<(), Box<dyn std::error::Error>> {
+    /// const TS: u32 = 256;
+    /// let eroded = global.eroded(&ErodeOptions { radius: 2.0, threads: 0 })?;
+    /// for (tx, ty) in [(0u32, 0u32), (1, 0)] {
+    ///     let tile = eroded.subgrid(tx * TS, ty * TS, TS, TS); // erode FIRST, slice SECOND
+    ///     // build_navmesh_from_bitfield(&tile, &opts /* inset: None */) ...
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// **Never erode a tile.** Per-tile erosion treats the tile border as
+    /// wall and eats `radius` cells at every seam — reproducing exactly
+    /// the failure the contour inset has. [`subgrid`](Self::subgrid) sits
+    /// next to this method so the correct order reads naturally.
+    ///
+    /// # Limitations, stated plainly
+    ///
+    /// * **Radii are cell-quantized.** See [`ErodeOptions::radius`]: every
+    ///   radius in `(0, 1]` produces the same one-cell peel. The 0.128-cell
+    ///   default inset is *not* representable here.
+    /// * **Grid input only.** Authored/vector polygons never become a
+    ///   `Bitfield`; they need the contour path.
+    /// * **`O(cells)` regardless of boundary complexity.** On a large,
+    ///   mostly-open grid you pay for every cell to move a handful of
+    ///   vertices — 2048² costs ~20 ms at 8 threads, comparable to a whole
+    ///   legacy build, to produce a two-triangle mesh. That is why this is
+    ///   opt-in at the call site and never a build option.
+    /// * **Any `radius > 0` removes the outermost ring of cells**, because
+    ///   outside the grid is wall (see [`Bitfield::at`]). Correct, but a
+    ///   visible difference for maps whose walkable area runs to the grid
+    ///   edge; pad your bitfield and it disappears.
+    ///
+    /// # Guarantees
+    ///
+    /// Let `S` be the union of walkable unit squares and `S ⊖ D_r` the
+    /// true Minkowski erosion by the disc of radius `r`. Writing `R` for
+    /// the kept set:
+    ///
+    /// 1. **Never over-claims:** `R ⊆ S ⊖ D_r`. Every point of every kept
+    ///    cell is at least `r` from the wall region.
+    /// 2. **Sandwich bound:** `S ⊖ D_(r + √2) ⊆ R ⊆ S ⊖ D_r`. The
+    ///    one-sided Hausdorff error versus true erosion is at most one
+    ///    cell diagonal, always conservative.
+    /// 3. **Conditional on [`ExtractOptions::diagonal_smoothing`] being
+    ///    `false`.** Smoothing runs *after* erosion, inside `extract`, and
+    ///    is not area-preserving: at reflex corners it replaces a stair
+    ///    pair with a diagonal that bulges into the wall, costing up to
+    ///    √2/2 ≈ 0.708 cells of clearance. With smoothing on the
+    ///    guaranteed clearance is `max(0, r - 0.708)`; disable it when the
+    ///    hard bound matters, or erode by `r + 0.708`. `clip_ears` and
+    ///    `min_area` only ever *remove* area, which can only increase
+    ///    clearance, so they are safe.
+    ///
+    /// # Composing with the contour inset
+    ///
+    /// They are complements, not alternatives, and the clearances add:
+    /// grid-erode the integer part and contour-inset the sub-cell
+    /// remainder for a guaranteed clearance of `a + b`. An agent of radius
+    /// 2.128 cells = `eroded(2.0)` then `inset: Some(0.128)`.
+    ///
+    /// # Downstream clearance
+    ///
+    /// With a baked grid erosion of `r`, pass `max(0, agent_radius - r)`
+    /// to `PathOptions::distance_from_wall` and
+    /// `rsnav_navigation::WallClearance::clamp`, or the clearance is
+    /// counted twice. Use `max(0, r - 0.708)` in place of `r` when
+    /// `diagonal_smoothing` is on.
+    ///
+    /// # Errors
+    ///
+    /// [`ErodeError::InvalidRadius`] if `radius` is NaN, infinite, or
+    /// negative. `radius == 0.0` is valid and clones.
+    pub fn eroded(&self, opts: &ErodeOptions) -> Result<Bitfield, ErodeError> {
+        let thr = validate_radius(opts.radius)?;
+        let (w, h) = (self.width as usize, self.height as usize);
+        // radius 0 is the identity, and an empty grid has nothing to do.
+        if opts.radius == 0.0 || w == 0 || h == 0 {
+            return Ok(self.clone());
+        }
+        let threads = erode_threads(w * h, opts.threads);
+
+        let seed = seed_mask(self, threads);
+        // Fast path: below one full cell the seed mask *is* the answer.
+        // Exact, not an approximation — the only achievable clearance
+        // strictly below 1 is 0, so `sq >= r²` collapses to `!seed` for
+        // every radius in (0, 1]. Skips four of the five passes.
+        if opts.radius <= 1.0 {
+            let mut data = vec![false; w * h];
+            par_bands_mut(&mut data, w * ERODE_BAND, threads, |bi, band| {
+                let base = bi * w * ERODE_BAND;
+                for (j, out) in band.iter_mut().enumerate() {
+                    *out = !seed[base + j];
+                }
+            });
+            return Ok(Bitfield {
+                width: self.width,
+                height: self.height,
+                data,
+            });
+        }
+
+        let g = row_pass(&seed, w, h, threads);
+        let gt = transpose(&g, w, h, threads);
+        // Fuse the threshold into the column pass so the full distance
+        // field is never materialized when only the mask is wanted. Wall
+        // cells are seeds, hence distance 0, hence dropped by any r > 0 —
+        // so no separate walkability mask is needed here.
+        let mut keep_t = vec![false; w * h];
+        column_envelope(&gt, h, threads, &mut keep_t, |d2| d2 >= thr);
+        let mut data = vec![false; w * h];
+        untranspose(&keep_t, w, h, threads, &mut data);
+        Ok(Bitfield {
+            width: self.width,
+            height: self.height,
+            data,
+        })
+    }
+
+    /// The exact squared clearance field alone, without thresholding it.
+    ///
+    /// Threshold it at several radii to build one navmesh per agent size
+    /// for the price of one transform — the transform is the expensive
+    /// part, the threshold is ~2% of it. See [`ClearanceField`] for the
+    /// precise definition of "clearance" (square-to-square, outside the
+    /// grid is wall) and [`Bitfield::eroded`] for the limitations, which
+    /// apply identically.
+    ///
+    /// `threads`: `0` = one per core, `1` = serial; output is identical
+    /// either way.
+    pub fn clearance(&self, threads: usize) -> ClearanceField {
+        let (w, h) = (self.width as usize, self.height as usize);
+        if w == 0 || h == 0 {
+            return ClearanceField {
+                width: self.width,
+                height: self.height,
+                sq: Vec::new(),
+            };
+        }
+        let threads = erode_threads(w * h, threads);
+        let seed = seed_mask(self, threads);
+        let g = row_pass(&seed, w, h, threads);
+        let gt = transpose(&g, w, h, threads);
+        let mut dt = vec![0i32; w * h];
+        column_envelope(&gt, h, threads, &mut dt, |d2| {
+            // Every column contains a seed (the top and bottom grid rows
+            // always are, since outside is wall), so d2 <= (h-1)² and the
+            // clamp below can only ever fire on absurd grid heights.
+            d2.min(i64::from(i32::MAX)) as i32
+        });
+        let mut sq = vec![0i32; w * h];
+        untranspose(&dt, w, h, threads, &mut sq);
+        ClearanceField {
+            width: self.width,
+            height: self.height,
+            sq,
+        }
+    }
+
+    /// Copy the `width × height` sub-rectangle whose lower-left cell is
+    /// `(col0, row0)` into a fresh `Bitfield`.
+    ///
+    /// Cells outside `self` read as wall, matching [`Bitfield::at`], so an
+    /// over-hanging request is padded with `false` rather than clipped —
+    /// the returned grid always has exactly the requested dimensions.
+    ///
+    /// This is the second half of the tiled workflow: **erode the global
+    /// grid, then `subgrid` it into tiles.** Slicing after eroding puts
+    /// each tile's boundary exactly on the tile border line, at identical
+    /// integer coordinates in both neighbours, so
+    /// `rsnav_navigation::TiledWorld::stitch_all` links them. Eroding
+    /// after slicing eats `radius` cells at every seam instead. See
+    /// [`Bitfield::eroded`].
+    pub fn subgrid(&self, col0: u32, row0: u32, width: u32, height: u32) -> Bitfield {
+        let mut out = Bitfield::empty(width, height);
+        for r in 0..height {
+            for c in 0..width {
+                let v = self.at(i64::from(col0) + i64::from(c), i64::from(row0) + i64::from(r));
+                out.set(c, r, v);
+            }
+        }
+        out
+    }
+}
+
+/// Resolve the worker count for an erosion pass: below [`PAR_MIN_CELLS`]
+/// the spawn costs more than the scan, and past [`ERODE_MAX_THREADS`] the
+/// memory bus is saturated anyway.
+fn erode_threads(cells: usize, requested: usize) -> usize {
+    if cells < PAR_MIN_CELLS {
+        return 1;
+    }
+    resolve_threads(requested).min(ERODE_MAX_THREADS)
+}
+
+/// Pass 1: the seed set = 3×3 Chebyshev dilation of the wall set, with
+/// out-of-range counting as wall.
+///
+/// Separable, so it is two linear passes rather than nine reads per cell:
+/// first a horizontal 3-window AND of walkability (`hz` = "this window
+/// contains a wall"), then a vertical 3-window OR of that.
+///
+/// The implicit one-ring padding is exact and needs no buffer: every
+/// out-of-range wall cell, clamped into the `[-1, W] × [-1, H]` ring, maps
+/// to a cell no farther from any in-grid cell, and that ring's dilated
+/// image is the grid's own border row/column — which is always seeded
+/// because the window peeks out of range there. So no distance is ever
+/// underestimated.
+fn seed_mask(bits: &Bitfield, threads: usize) -> Vec<bool> {
+    let (w, h) = (bits.width as usize, bits.height as usize);
+    let walk = &bits.data;
+
+    let mut hz = vec![false; w * h];
+    par_bands_mut(&mut hz, w * ERODE_BAND, threads, |bi, band| {
+        let r0 = bi * ERODE_BAND;
+        for (j, row) in band.chunks_mut(w).enumerate() {
+            let src = &walk[(r0 + j) * w..(r0 + j + 1) * w];
+            for c in 0..w {
+                let left = c > 0 && src[c - 1];
+                let right = c + 1 < w && src[c + 1];
+                // Out of range is wall, so a window touching the left or
+                // right edge always contains one.
+                row[c] = !(left && src[c] && right);
+            }
+        }
+    });
+
+    let mut seed = vec![false; w * h];
+    par_bands_mut(&mut seed, w * ERODE_BAND, threads, |bi, band| {
+        let r0 = bi * ERODE_BAND;
+        for (j, row) in band.chunks_mut(w).enumerate() {
+            let r = r0 + j;
+            let cur = &hz[r * w..(r + 1) * w];
+            for c in 0..w {
+                let up = r + 1 == h || hz[(r + 1) * w + c];
+                let down = r == 0 || hz[(r - 1) * w + c];
+                row[c] = up | down | cur[c];
+            }
+        }
+    });
+    seed
+}
+
+/// Pass 2: per row, the squared distance to the nearest seed *in that
+/// row*, via a forward then a backward sweep tracking the last seen seed
+/// column. Rows with no seed saturate at [`DIST_SENTINEL`] rather than
+/// overflowing; the column pass recovers the true value from other rows.
+fn row_pass(seed: &[bool], w: usize, h: usize, threads: usize) -> Vec<i32> {
+    let mut g = vec![0i32; w * h];
+    par_bands_mut(&mut g, w * ERODE_BAND, threads, |bi, band| {
+        let r0 = bi * ERODE_BAND;
+        for (j, row) in band.chunks_mut(w).enumerate() {
+            let s = &seed[(r0 + j) * w..(r0 + j + 1) * w];
+            let mut last: i64 = i64::MIN / 4;
+            for c in 0..w {
+                if s[c] {
+                    last = c as i64;
+                }
+                let d = c as i64 - last;
+                row[c] = d.saturating_mul(d).min(i64::from(DIST_SENTINEL)) as i32;
+            }
+            let mut last: i64 = i64::MAX / 4;
+            for c in (0..w).rev() {
+                if s[c] {
+                    last = c as i64;
+                }
+                let d = last - c as i64;
+                let v = d.saturating_mul(d).min(i64::from(DIST_SENTINEL)) as i32;
+                if v < row[c] {
+                    row[c] = v;
+                }
+            }
+        }
+    });
+    g
+}
+
+/// Pass 3: blocked transpose, `out[c * h + r] = g[r * w + c]`.
+///
+/// This exists purely for speed and it is the difference between fast and
+/// unusable: the naive strided column pass measured 135 ms at 2048²
+/// versus 38 ms transposed plus 32 ms contiguous. `i32` rather than `i64`
+/// halves the traffic (17 MB per buffer at 2048² instead of 34 MB).
+fn transpose(g: &[i32], w: usize, h: usize, threads: usize) -> Vec<i32> {
+    let mut out = vec![0i32; w * h];
+    par_bands_mut(&mut out, h * ERODE_BAND, threads, |bi, band| {
+        let c0 = bi * ERODE_BAND;
+        let ncols = band.len() / h;
+        let mut r0 = 0;
+        while r0 < h {
+            let r1 = (r0 + ERODE_BAND).min(h);
+            for k in 0..ncols {
+                for r in r0..r1 {
+                    band[k * h + r] = g[r * w + c0 + k];
+                }
+            }
+            r0 = r1;
+        }
+    });
+    out
+}
+
+/// Pass 4: the Felzenszwalb–Huttenlocher lower envelope down each column
+/// (contiguous, because pass 3 transposed), combining the per-row
+/// distances into the exact 2D squared EDT. `map` turns each squared
+/// distance into an output element — a bool for [`Bitfield::eroded`], the
+/// clamped value itself for [`Bitfield::clearance`] — so the full field is
+/// only materialized when it is actually wanted.
+///
+/// `out` is in transposed layout, same as `gt`.
+///
+/// Determinism: the parabola intersection is the one f64 division in the
+/// whole algorithm, but a column is processed start-to-finish by a single
+/// worker, so its operation sequence is identical regardless of thread
+/// count. There is no reduction and no accumulation across bands.
+fn column_envelope<T, F>(gt: &[i32], h: usize, threads: usize, out: &mut [T], map: F)
+where
+    T: Send + Copy,
+    F: Fn(i64) -> T + Sync,
+{
+    par_bands_mut(out, h * ERODE_BAND, threads, |bi, band| {
+        let c0 = bi * ERODE_BAND;
+        let ncols = band.len() / h;
+        // Hoisted out of the column loop: no allocation inside a pass.
+        let mut v = vec![0i64; h + 1];
+        let mut z = vec![0f64; h + 2];
+        for k in 0..ncols {
+            let f = &gt[(c0 + k) * h..(c0 + k + 1) * h];
+            let mut kk = 0usize;
+            v[0] = 0;
+            z[0] = f64::NEG_INFINITY;
+            z[1] = f64::INFINITY;
+            for q in 1..h as i64 {
+                loop {
+                    let p = v[kk];
+                    let s = ((i64::from(f[q as usize]) + q * q)
+                        - (i64::from(f[p as usize]) + p * p))
+                        as f64
+                        / (2 * (q - p)) as f64;
+                    if s <= z[kk] && kk > 0 {
+                        kk -= 1;
+                    } else {
+                        kk += 1;
+                        v[kk] = q;
+                        z[kk] = s;
+                        z[kk + 1] = f64::INFINITY;
+                        break;
+                    }
+                }
+            }
+            let mut kk = 0usize;
+            let col = &mut band[k * h..(k + 1) * h];
+            for r in 0..h as i64 {
+                while z[kk + 1] < r as f64 {
+                    kk += 1;
+                }
+                let p = v[kk];
+                let d = r - p;
+                col[r as usize] = map(i64::from(f[p as usize]) + d * d);
+            }
+        }
+    });
+}
+
+/// Pass 5: blocked un-transpose, `out[r * w + c] = t[c * h + r]`.
+fn untranspose<T: Send + Sync + Copy>(t: &[T], w: usize, h: usize, threads: usize, out: &mut [T]) {
+    par_bands_mut(out, w * ERODE_BAND, threads, |bi, band| {
+        let r0 = bi * ERODE_BAND;
+        let nrows = band.len() / w;
+        let mut c0 = 0;
+        while c0 < w {
+            let c1 = (c0 + ERODE_BAND).min(w);
+            for j in 0..nrows {
+                for c in c0..c1 {
+                    band[j * w + c] = t[c * h + r0 + j];
+                }
+            }
+            c0 = c1;
+        }
+    });
+}
+
 // --- Sanity --------------------------------------------------------------
 
 // `geom` is used implicitly via Polygon's helpers; keep the import alive.
@@ -840,5 +1448,395 @@ mod tests {
         // Note: the staircase actually loses area when smoothed (the unit
         // notches get cut). Just check that area is in a sensible range.
         assert!(smoothed[0].outer.area() > 0.0);
+    }
+
+    // --- Erosion ---------------------------------------------------------
+
+    use rsnav_common::rng::Lcg;
+
+    fn rand_grid(rng: &mut Lcg, w: u32, h: u32, density_pct: u64) -> Bitfield {
+        let data = (0..(w as usize) * (h as usize))
+            .map(|_| rng.next_u64() % 100 < density_pct)
+            .collect();
+        Bitfield::new(w, h, data).expect("dimensions match")
+    }
+
+    /// Independently written oracle: the seed mask from a naive 3×3 scan
+    /// through [`Bitfield::at`] (so "out of range is wall" comes from the
+    /// real accessor, not from a reimplementation of it), then a windowed
+    /// minimum over seeds. `O(cells · (2⌈r⌉+1)²)` — correctness only.
+    fn brute_erode(bits: &Bitfield, radius: f64) -> Bitfield {
+        let (w, h) = (bits.width as i64, bits.height as i64);
+        let mut seed = vec![false; (w * h) as usize];
+        for r in 0..h {
+            for c in 0..w {
+                let mut s = false;
+                for dr in -1..=1 {
+                    for dc in -1..=1 {
+                        if !bits.at(c + dc, r + dr) {
+                            s = true;
+                        }
+                    }
+                }
+                seed[(r * w + c) as usize] = s;
+            }
+        }
+        let rad = radius.ceil() as i64;
+        let r2 = (radius * radius).ceil() as i64;
+        let mut out = Bitfield::empty(bits.width, bits.height);
+        for r in 0..h {
+            for c in 0..w {
+                if !bits.at(c, r) {
+                    continue;
+                }
+                let mut best = i64::MAX;
+                for dr in -rad..=rad {
+                    for dc in -rad..=rad {
+                        let (rr, cc) = (r + dr, c + dc);
+                        // Out of range: the clamped one-ring image of the
+                        // outside wall, which is always a seed anyway.
+                        let s = if rr < 0 || cc < 0 || rr >= h || cc >= w {
+                            true
+                        } else {
+                            seed[(rr * w + cc) as usize]
+                        };
+                        if s {
+                            best = best.min(dr * dr + dc * dc);
+                        }
+                    }
+                }
+                out.set(c as u32, r as u32, best >= r2);
+            }
+        }
+        out
+    }
+
+    fn erode(bits: &Bitfield, radius: f64, threads: usize) -> Bitfield {
+        bits.eroded(&ErodeOptions { radius, threads })
+            .expect("valid radius")
+    }
+
+    /// The primary test: exact agreement with the brute-force oracle over
+    /// odd-sized grids (deliberately not multiples of the 64-cell band, to
+    /// catch band off-by-ones) at a spread of radii.
+    #[test]
+    fn erode_matches_brute_force_oracle() {
+        let mut rng = Lcg(4242);
+        let radii = [
+            0.0,
+            0.3,
+            0.5,
+            1.0,
+            std::f64::consts::SQRT_2,
+            1.5,
+            2.0,
+            2.5,
+            3.0,
+            5.0,
+        ];
+        for _ in 0..60 {
+            let w = 1 + (rng.next_u64() % 120) as u32;
+            let h = 1 + (rng.next_u64() % 120) as u32;
+            let density = 25 + rng.next_u64() % 70;
+            let bits = rand_grid(&mut rng, w, h, density);
+            for &r in &radii {
+                let want = brute_erode(&bits, r);
+                for &threads in &[1usize, 5] {
+                    let got = erode(&bits, r, threads);
+                    assert_eq!(
+                        got.data, want.data,
+                        "mismatch on {w}×{h} density={density} radius={r} threads={threads}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The separable seed mask is the trickiest pass; isolate it against a
+    /// naive 3×3 scan.
+    #[test]
+    fn seed_mask_matches_naive_3x3() {
+        let mut rng = Lcg(90210);
+        for _ in 0..40 {
+            let w = 1 + (rng.next_u64() % 90) as u32;
+            let h = 1 + (rng.next_u64() % 90) as u32;
+            let density = 30 + rng.next_u64() % 65;
+            let bits = rand_grid(&mut rng, w, h, density);
+            let got = seed_mask(&bits, 1);
+            let mut want = vec![false; (w as usize) * (h as usize)];
+            for r in 0..h as i64 {
+                for c in 0..w as i64 {
+                    let mut s = false;
+                    for dr in -1..=1 {
+                        for dc in -1..=1 {
+                            if !bits.at(c + dc, r + dr) {
+                                s = true;
+                            }
+                        }
+                    }
+                    want[(r as usize) * (w as usize) + c as usize] = s;
+                }
+            }
+            assert_eq!(got, want, "seed mask mismatch on {w}×{h}");
+        }
+    }
+
+    /// A bigger radius can only ever remove cells. Trivially true given a
+    /// single threshold on one field — which is exactly why it catches a
+    /// flipped comparison.
+    #[test]
+    fn erode_is_monotone_in_radius() {
+        let mut rng = Lcg(31337);
+        let bits = rand_grid(&mut rng, 200, 200, 80);
+        let radii = [0.0f64, 0.5, 1.0, 1.4, 1.5, 2.0, 2.3, 3.0, 4.0, 5.0, 7.0, 9.0];
+        for pair in radii.windows(2) {
+            let a = erode(&bits, pair[0], 1);
+            let b = erode(&bits, pair[1], 1);
+            for i in 0..a.data.len() {
+                assert!(
+                    !b.data[i] || a.data[i],
+                    "radius {} kept cell {i} that radius {} dropped",
+                    pair[1],
+                    pair[0]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn erode_zero_is_identity() {
+        let mut rng = Lcg(5);
+        let bits = rand_grid(&mut rng, 77, 53, 60);
+        let out = erode(&bits, 0.0, 4);
+        assert_eq!(out.data, bits.data);
+        assert_eq!((out.width, out.height), (bits.width, bits.height));
+    }
+
+    /// Staged erosion is *conservative*, not composable: each stage rounds
+    /// toward more erosion, so `erode(a)` then `erode(b)` is a strict
+    /// subset of `erode(a + b)`. Asserting equality here would be wrong.
+    #[test]
+    fn erode_staged_is_subset_but_not_equal() {
+        let mut rng = Lcg(2024);
+        let bits = rand_grid(&mut rng, 150, 150, 92);
+        let staged = erode(&erode(&bits, 2.0, 1), 2.0, 1);
+        let direct = erode(&bits, 4.0, 1);
+        for i in 0..staged.data.len() {
+            assert!(
+                !staged.data[i] || direct.data[i],
+                "staged erosion kept cell {i} that erode(4.0) dropped"
+            );
+        }
+        assert_ne!(
+            staged.data, direct.data,
+            "staged erosion is expected to lose cells versus a single pass"
+        );
+    }
+
+    /// Everything outside the grid is wall, so any positive radius eats the
+    /// outermost ring — and radius 1 eats exactly that ring, nothing more.
+    #[test]
+    fn erode_one_peels_exactly_the_border_ring() {
+        let (w, h) = (23u32, 17u32);
+        let bits = Bitfield::new(w, h, vec![true; (w * h) as usize]).expect("dims");
+        let out = erode(&bits, 1.0, 1);
+        for r in 0..h {
+            for c in 0..w {
+                let interior = c > 0 && r > 0 && c + 1 < w && r + 1 < h;
+                assert_eq!(
+                    out.at(c as i64, r as i64),
+                    interior,
+                    "cell ({c},{r}) on a fully walkable {w}×{h} grid at radius 1"
+                );
+            }
+        }
+        let kept = out.data.iter().filter(|b| **b).count();
+        assert_eq!(kept, ((w - 2) * (h - 2)) as usize);
+    }
+
+    #[test]
+    fn erode_beyond_half_the_grid_removes_everything() {
+        let (w, h) = (32u32, 24u32);
+        let bits = Bitfield::new(w, h, vec![true; (w * h) as usize]).expect("dims");
+        let out = erode(&bits, 12.0, 1);
+        assert!(out.data.iter().all(|b| !b), "radius >= min(w,h)/2 must empty the grid");
+    }
+
+    /// Pin the square-to-square definition of clearance against future
+    /// refactors: a single wall cell in an open field.
+    #[test]
+    fn clearance_is_square_to_square_distance() {
+        let (w, h) = (41u32, 41u32);
+        let mut bits = Bitfield::new(w, h, vec![true; (w * h) as usize]).expect("dims");
+        bits.set(20, 20, false);
+        let field = bits.clearance(1);
+        for dy in -5i64..=5 {
+            for dx in -5i64..=5 {
+                let want = (dx.abs() - 1).max(0).pow(2) + (dy.abs() - 1).max(0).pow(2);
+                let got = field.sq_at((20 + dx) as u32, (20 + dy) as u32);
+                assert_eq!(
+                    i64::from(got),
+                    want,
+                    "sq_at offset ({dx},{dy}) from the wall cell"
+                );
+            }
+        }
+        // The wall cell itself, and out-of-range reads, are zero.
+        assert_eq!(field.sq_at(20, 20), 0);
+        assert_eq!(field.sq_at(w, 0), 0);
+    }
+
+    /// `clearance().threshold(r)` and `eroded(r)` are the same predicate —
+    /// `eroded` just fuses the threshold into the column pass so it never
+    /// materializes the field.
+    #[test]
+    fn threshold_agrees_with_eroded() {
+        let mut rng = Lcg(777);
+        let bits = rand_grid(&mut rng, 111, 87, 78);
+        let field = bits.clearance(1);
+        for &r in &[0.5f64, 1.0, 1.5, 2.0, 3.0, 4.5] {
+            let a = field.threshold(r).expect("valid radius");
+            let b = erode(&bits, r, 1);
+            assert_eq!(a.data, b.data, "threshold vs eroded disagree at radius {r}");
+        }
+        // Documented quirk: radius 0 keeps everything, walls included.
+        let all = field.threshold(0.0).expect("valid radius");
+        assert!(all.data.iter().all(|b| *b));
+        // ...but any radius > 0 drops walls, including radii so small that
+        // `radius * radius` underflows to zero in f64. The quirk is exactly
+        // at zero, not "near" zero.
+        for &tiny in &[1e-9f64, 1e-200, f64::MIN_POSITIVE] {
+            assert!(tiny * tiny == 0.0 || tiny == 1e-9, "underflow assumption");
+            let a = field.threshold(tiny).expect("valid radius");
+            let b = erode(&bits, tiny, 1);
+            assert_eq!(a.data, b.data, "threshold vs eroded disagree at {tiny}");
+            assert!(
+                a.data.iter().zip(&bits.data).all(|(k, w)| !*k || *w),
+                "radius {tiny} kept a wall cell"
+            );
+        }
+    }
+
+    /// The transform is thread-count invariant by construction (exact
+    /// integer distances, one worker per column, disjoint output bands).
+    /// Run it above `PAR_MIN_CELLS` so the parallel path is actually taken.
+    #[test]
+    fn erode_is_thread_count_deterministic() {
+        let (w, h) = (900u32, 700u32); // 630k cells > PAR_MIN_CELLS
+        let mut rng = Lcg(99);
+        let mut bits = Bitfield::new(w, h, vec![true; (w * h) as usize]).expect("dims");
+        for _ in 0..((w * h) / 400) {
+            let cx = (rng.next_u64() % u64::from(w)) as u32;
+            let cy = (rng.next_u64() % u64::from(h)) as u32;
+            for dy in 0..6u32 {
+                for dx in 0..6u32 {
+                    if cx + dx < w && cy + dy < h {
+                        bits.set(cx + dx, cy + dy, false);
+                    }
+                }
+            }
+        }
+        for &r in &[1.0f64, 2.5, 6.0] {
+            let base = erode(&bits, r, 1);
+            for &t in &[2usize, 4, 8, 16] {
+                assert_eq!(
+                    erode(&bits, r, t).data,
+                    base.data,
+                    "thread count {t} changed the output at radius {r}"
+                );
+            }
+            // ...and the parallel path still agrees with the oracle.
+            if r == 2.5 {
+                assert_eq!(brute_erode(&bits, r).data, base.data);
+            }
+        }
+        let f1 = bits.clearance(1);
+        let f8 = bits.clearance(8);
+        assert_eq!(f1.sq, f8.sq, "clearance field must not depend on thread count");
+    }
+
+    #[test]
+    fn erode_rejects_invalid_radius() {
+        let bits = Bitfield::empty(4, 4);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, -0.0001] {
+            let err = bits
+                .eroded(&ErodeOptions {
+                    radius: bad,
+                    threads: 1,
+                })
+                .expect_err("invalid radius must be rejected");
+            match err {
+                ErodeError::InvalidRadius(r) => assert!(r.is_nan() || r == bad),
+            }
+        }
+        // -0.0 is not negative and squares to 0: valid, and an identity.
+        assert!(bits
+            .eroded(&ErodeOptions {
+                radius: -0.0,
+                threads: 1
+            })
+            .is_ok());
+    }
+
+    #[test]
+    fn erode_handles_degenerate_dimensions() {
+        for (w, h) in [(0u32, 0u32), (0, 5), (5, 0), (1, 1), (1, 40), (40, 1)] {
+            let bits = Bitfield::new(w, h, vec![true; (w as usize) * (h as usize)]).expect("dims");
+            for &r in &[0.0f64, 0.5, 1.0, 2.0] {
+                let out = erode(&bits, r, 4);
+                assert_eq!((out.width, out.height), (w, h));
+                assert_eq!(out.data, brute_erode(&bits, r).data, "{w}×{h} at radius {r}");
+            }
+        }
+    }
+
+    #[test]
+    fn subgrid_copies_and_pads_with_wall() {
+        let mut rng = Lcg(1234);
+        let bits = rand_grid(&mut rng, 30, 20, 55);
+        let sub = bits.subgrid(7, 3, 9, 6);
+        assert_eq!((sub.width, sub.height), (9, 6));
+        for r in 0..6i64 {
+            for c in 0..9i64 {
+                assert_eq!(sub.at(c, r), bits.at(7 + c, 3 + r));
+            }
+        }
+        // An over-hanging request keeps the requested size, padded false.
+        let over = bits.subgrid(28, 18, 5, 5);
+        assert_eq!((over.width, over.height), (5, 5));
+        for r in 0..5i64 {
+            for c in 0..5i64 {
+                assert_eq!(over.at(c, r), bits.at(28 + c, 18 + r));
+                if c >= 2 || r >= 2 {
+                    assert!(!over.at(c, r), "outside the source must read as wall");
+                }
+            }
+        }
+    }
+
+    /// The reuse story: one transform, several agent sizes. Slicing the
+    /// eroded grid must equal eroding-then-slicing, never slicing-then-
+    /// eroding (which would eat the tile border).
+    #[test]
+    fn erode_then_subgrid_beats_subgrid_then_erode_at_the_seam() {
+        let (w, h) = (32u32, 8u32);
+        let mut bits = Bitfield::new(w, h, vec![true; (w * h) as usize]).expect("dims");
+        for c in 0..w {
+            bits.set(c, 0, false);
+            bits.set(c, h - 1, false);
+        }
+        let global = erode(&bits, 2.0, 1);
+        let right_of_global = global.subgrid(16, 0, 16, h);
+        let eroded_tile = erode(&bits.subgrid(16, 0, 16, h), 2.0, 1);
+        // The correct order keeps the column adjacent to the seam...
+        assert!(
+            (0..h as i64).any(|r| right_of_global.at(0, r)),
+            "erode-then-slice must keep walkable cells on the seam column"
+        );
+        // ...the wrong order eats it.
+        assert!(
+            (0..h as i64).all(|r| !eroded_tile.at(0, r)),
+            "slice-then-erode is expected to eat the seam column"
+        );
     }
 }

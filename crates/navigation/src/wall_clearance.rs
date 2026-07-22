@@ -15,6 +15,27 @@
 //! close to a wall they may sit. Because `radius` is a per-call argument, one
 //! `WallClearance` serves agents of every size — no per-radius mesh.
 //!
+//! **Baked-erosion interaction:** when the mesh was built with a baked
+//! erosion of `r`, the walls already sit `r` inside the true geometry.
+//! Pass `max(0.0, agent_radius - r)` here — and to
+//! `PathOptions::distance_from_wall` — or the clearance is counted twice.
+//! Both baking routes count:
+//!
+//! * **Contour inset** (`rsnav_dynamic::BuildOptions::inset`, or the
+//!   triangle crate's `build_cdt_with_inset`): the effective `r` is
+//!   exactly the requested inset.
+//! * **Grid erosion** (`rsnav_polygon_extract::Bitfield::eroded`): the
+//!   effective `r` is the requested radius *only when*
+//!   `ExtractOptions::diagonal_smoothing` is `false`. Smoothing runs after
+//!   erosion and is not area-preserving — at reflex corners it replaces a
+//!   stair pair with a diagonal that bulges into the wall — so with it on
+//!   the guaranteed clearance drops to `max(0.0, r - 0.708)` (√2/2 per
+//!   corner). Use that figure, or disable smoothing, or erode by
+//!   `r + 0.708`.
+//!
+//! If a caller combines grid erosion `a` with contour inset `b`, the two
+//! add: the effective baked clearance is `a + b`.
+//!
 //! ```no_run
 //! # use rsnav_common::Vertex;
 //! # use rsnav_navmesh::NavMesh;

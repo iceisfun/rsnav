@@ -5,8 +5,12 @@
 //!   - Add perimeter: left-click drops vertices; right-click (or "Close")
 //!     closes the polygon.
 //!   - Add hole: same flow, but the closed polygon becomes a hole.
-//!   - Create: runs delaunay → form_skeleton → carve_holes → build_from_cdt
-//!     → Bsp::build, then switches to exploration.
+//!   - Inset slider: agent-radius erosion baked into the mesh at Create
+//!     time (perimeters shrink, holes grow).
+//!   - Create: runs the inset pipeline (offset → planarize →
+//!     build_cdt_with_inset's winding cull) → build_from_cdt →
+//!     Bsp::build, then switches to exploration. Crossing-tolerant:
+//!     holes may straddle perimeters, even at inset 0.
 //!
 //! Exploration tools:
 //!   - Right-click: pick path source (snapped to navmesh).
@@ -22,19 +26,14 @@ use egui::{Color32, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
 
 use rsnav_bsp::Bsp;
-use rsnav_common::{Aabb, Polygon as CommonPolygon, TriangleId, Vertex};
+use rsnav_common::{Aabb, TriangleId, Vertex};
 use rsnav_navigation::{
     find_path_with_walls, line_of_sight, nearest_point, nearest_portal_edge, visibility_region,
     zone_crossings, DoorId, DoorSet, DoorState, LineOfSightResult, PathOptions, PathResult,
     WallInfo,
 };
 use rsnav_navmesh::{build_from_cdt, NavMesh};
-use rsnav_triangle::{
-    carve_holes, delaunay,
-    form_skeleton,
-    pslg::{Pslg, PslgHole, PslgSegment, PslgVertex},
-    CdtMesh, DivConqOptions, VertexSlot,
-};
+use rsnav_triangle::{build_cdt_with_inset, InsetError, InsetOptions, InsetRing, RingKind};
 
 /// File the Save / Load buttons read and write. Kept in CWD so it's easy
 /// to find next to the binary; rename interesting captures to keep them.
@@ -73,6 +72,9 @@ struct DemoApp {
     holes: Vec<Polygon>,
     drawing: Option<Drawing>,
     next_marker: i32,
+    /// Agent-radius erosion applied at Create-navmesh time (world
+    /// units, 0 = off): perimeters shrink and holes grow by this much.
+    inset: f64,
 
     // Build artefacts
     navmesh: Option<NavMesh>,
@@ -208,6 +210,7 @@ impl Default for DemoApp {
             holes: Vec::new(),
             drawing: None,
             next_marker: 0,
+            inset: 0.0,
             navmesh: None,
             bsp: None,
             last_build_error: None,
@@ -276,6 +279,7 @@ impl DemoApp {
                 .iter()
                 .map(|p| p.verts.iter().map(Point::from).collect())
                 .collect(),
+            inset: self.inset,
         };
         match serde_json::to_string_pretty(&file) {
             Ok(json) => {
@@ -349,6 +353,9 @@ impl DemoApp {
             })
             .collect();
         new_app.next_marker = 2000;
+        // Easy to miss: the whole app state is replaced below, so the
+        // loaded inset must be carried explicitly or Load resets it.
+        new_app.inset = parsed.inset;
         new_app.fixtures_dir = fixtures_dir;
         new_app.fixture_listing = fixture_listing;
         new_app.fixtures_scanned_from = fixtures_scanned_from;
@@ -427,62 +434,19 @@ impl DemoApp {
             return;
         }
 
-        // Compose a Pslg out of all authored polygons.
-        let mut pslg = Pslg::new();
-        let mut next_idx = 0u32;
-        for poly in self.perimeters.iter().chain(self.holes.iter()) {
-            let start = next_idx;
-            for v in &poly.verts {
-                pslg.vertices.push(PslgVertex::new(*v));
-                next_idx += 1;
-            }
-            // Close the ring with segments.
-            let n = poly.verts.len() as u32;
-            for i in 0..n {
-                let a = start + i;
-                let b = start + (i + 1) % n;
-                pslg.segments.push(PslgSegment {
-                    a,
-                    b,
-                    marker: poly.marker,
-                });
-            }
-        }
-
-        // Hole seed points — must be STRICTLY INSIDE each hole polygon.
-        // The arithmetic centroid is NOT safe for concave polygons (e.g. a
-        // C-shape's centroid falls outside the polygon), so use the
-        // ear-based interior-point finder instead. If a hole turns out to
-        // be degenerate we just skip it; carve_holes silently ignores
-        // missing seeds.
-        for hole in &self.holes {
-            let cp = CommonPolygon::from_vertices(hole.verts.clone());
-            if let Some(seed) = cp.interior_point() {
-                pslg.holes.push(PslgHole { point: seed });
-            }
-        }
-
-        // Build pipeline. form_skeleton auto-handles duplicate-position
-        // vertices internally; no need to pre-dedupe here.
-        let mut cdt = CdtMesh::new();
-        for v in &pslg.vertices {
-            cdt.push_vertex(VertexSlot::new(v.position, 0));
-        }
-        delaunay(&mut cdt, DivConqOptions::default());
-        if let Err(e) = form_skeleton(&mut cdt, &pslg, None) {
-            self.last_build_error = Some(format!("Segment insertion failed: {e}"));
-            return;
-        }
-        carve_holes(&mut cdt, &pslg, false);
-        let nav = build_from_cdt(&cdt);
-        let bsp = Bsp::build(&nav);
-
-        if nav.triangle_count() == 0 {
-            self.last_build_error = Some(
-                "Build produced 0 triangles — check your polygon winding and hole placement."
-                    .into(),
-            );
-            return;
+        let (nav, bsp, skipped_holes) =
+            match build_navmesh_from_rings(&self.perimeters, &self.holes, self.inset) {
+                Ok(result) => result,
+                Err(e) => {
+                    self.last_build_error = Some(e);
+                    return;
+                }
+            };
+        if !skipped_holes.is_empty() {
+            self.status = Some(format!(
+                "skipped degenerate hole(s): {:?}",
+                skipped_holes
+            ));
         }
 
         self.navmesh = Some(nav);
@@ -671,6 +635,19 @@ impl DemoApp {
                 ));
             }
 
+            ui.add_space(8.0);
+            ui.label("Build");
+            ui.add(
+                egui::Slider::new(&mut self.inset, 0.0..=40.0)
+                    .text("inset (agent radius)")
+                    .step_by(0.5),
+            )
+            .on_hover_text(
+                "World-unit erosion baked into the mesh at Create time: \
+                 perimeters shrink and holes grow by this much. (Bitfield \
+                 pipelines measure inset in cell units instead.)",
+            );
+
             ui.add_space(12.0);
             let create_enabled = !self.perimeters.is_empty() && self.drawing.is_none();
             if ui
@@ -694,6 +671,7 @@ impl DemoApp {
                 nav.triangle_count(),
                 nav.region_count
             ));
+            ui.label(format!("built with inset {:.1}", self.inset));
 
             ui.add_space(8.0);
             if ui
@@ -1378,6 +1356,72 @@ impl DemoApp {
 // Helpers
 // =========================================================================
 
+// --- Build pipeline ------------------------------------------------------
+
+/// Build a navmesh from the authored rings through the inset pipeline
+/// (offset -> planarize -> winding cull) — crossing-tolerant even at
+/// inset 0, so holes may straddle perimeters. Returns the mesh, its
+/// BSP, and the indices of degenerate holes that were skipped (a
+/// degenerate *perimeter* is a hard error instead: silently losing one
+/// changes the walkable area).
+fn build_navmesh_from_rings(
+    perimeters: &[Polygon],
+    holes: &[Polygon],
+    inset: f64,
+) -> Result<(NavMesh, Bsp, Vec<usize>), String> {
+    if !inset.is_finite() || inset < 0.0 {
+        return Err("inset must be a finite value >= 0".into());
+    }
+    let mut rings: Vec<InsetRing<'_>> = Vec::with_capacity(perimeters.len() + holes.len());
+    for p in perimeters {
+        rings.push(InsetRing {
+            points: &p.verts,
+            kind: RingKind::Perimeter,
+            marker: p.marker,
+        });
+    }
+    for h in holes {
+        rings.push(InsetRing {
+            points: &h.verts,
+            kind: RingKind::Hole,
+            marker: h.marker,
+        });
+    }
+
+    let built = build_cdt_with_inset(&rings, inset, &InsetOptions::default()).map_err(|e| {
+        match e {
+            InsetError::Planarize(pe) => format!("planarize failed: {pe}"),
+            InsetError::Segment(se) => {
+                format!("internal: planarized segments still crossed: {se}")
+            }
+        }
+    })?;
+
+    let mut skipped_holes = Vec::new();
+    for &(idx, kind) in &built.skipped_rings {
+        match kind {
+            RingKind::Perimeter => {
+                return Err(format!(
+                    "perimeter ring {idx} is degenerate (< 3 distinct points)"
+                ));
+            }
+            RingKind::Hole => skipped_holes.push(idx - perimeters.len()),
+        }
+    }
+
+    let nav = build_from_cdt(&built.mesh);
+    if nav.triangle_count() == 0 {
+        return Err(if inset > 0.0 {
+            format!("navmesh is empty — inset {inset} eroded all walkable area")
+        } else {
+            "Build produced 0 triangles — check your polygon winding and hole placement."
+                .into()
+        });
+    }
+    let bsp = Bsp::build(&nav);
+    Ok((nav, bsp, skipped_holes))
+}
+
 // --- Save / Load JSON schema --------------------------------------------
 
 #[derive(Serialize, Deserialize)]
@@ -1391,6 +1435,11 @@ struct SaveFile {
     outer_polygon: Option<Vec<Point>>,
     #[serde(default)]
     holes: Vec<Vec<Point>>,
+    /// Baked agent-radius erosion. Added post-version-1; old files
+    /// without the field default to 0.0 (no version bump needed — load
+    /// never checks `version`, serde ignores unknown fields).
+    #[serde(default)]
+    inset: f64,
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize)]
@@ -1478,4 +1527,126 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Color32 {
         _ => (v, p, q),
     };
     Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+}
+
+// =========================================================================
+// Tests
+// =========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn poly(pts: &[(f64, f64)], marker: i32) -> Polygon {
+        Polygon {
+            verts: pts.iter().map(|&(x, y)| Vertex::new(x, y)).collect(),
+            marker,
+        }
+    }
+
+    /// The rsnav-debug.json scene (hole straddling the perimeter) builds
+    /// through the demo's build path at inset 0 — this is the bug the
+    /// inset pipeline was introduced to fix.
+    #[test]
+    fn hole_crossing_perimeter_builds() {
+        let perimeter = poly(
+            &[
+                (291.708984375, 319.86065673828125),
+                (601.40625, 206.9029541015625),
+                (1065.7698974609375, 165.7528076171875),
+                (1359.2867431640625, 317.6336364746094),
+                (1440.446533203125, 654.1515502929688),
+                (1411.012939453125, 840.80078125),
+                (1196.244873046875, 905.8601684570312),
+                (887.9534912109375, 924.484375),
+                (476.42303466796875, 849.0909423828125),
+                (272.90509033203125, 708.6752319335938),
+                (177.515625, 536.4886474609375),
+                (227.685546875, 391.5384826660156),
+            ],
+            10,
+        );
+        let hole = poly(
+            &[
+                (581.4324340820312, 375.1197204589844),
+                (495.76171875, 351.59271240234375),
+                (441.1597900390625, 304.02117919921875),
+                (418.80078125, 215.89840698242188),
+                (506.1546630859375, 118.7509994506836),
+                (596.4187622070312, 113.93620300292969),
+                (720.9847412109375, 166.8599090576172),
+                (738.1031494140625, 248.88311767578125),
+                (647.4683837890625, 376.462158203125),
+            ],
+            1000,
+        );
+        let (nav, _bsp, skipped) =
+            build_navmesh_from_rings(&[perimeter.clone()], &[hole.clone()], 0.0)
+                .expect("inset-0 build must succeed on the crossing scene");
+        assert!(skipped.is_empty());
+        assert!(nav.triangle_count() > 10);
+        assert_eq!(nav.region_count, 1);
+
+        // And with erosion on the same scene.
+        let (nav15, _, _) = build_navmesh_from_rings(&[perimeter], &[hole], 15.0)
+            .expect("inset-15 build must succeed");
+        assert!(nav15.triangle_count() > 0);
+    }
+
+    #[test]
+    fn invalid_inset_is_rejected() {
+        let p = poly(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)], 10);
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            let err = build_navmesh_from_rings(&[p.clone()], &[], bad).unwrap_err();
+            assert!(err.contains("finite"), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn degenerate_perimeter_is_an_error_at_every_radius() {
+        let bad = poly(&[(0.0, 0.0), (10.0, 0.0)], 10);
+        for inset in [0.0, 5.0] {
+            let err = build_navmesh_from_rings(&[bad.clone()], &[], inset).unwrap_err();
+            assert!(err.contains("degenerate"), "inset {inset}: {err}");
+        }
+    }
+
+    #[test]
+    fn degenerate_hole_is_skipped_and_reported() {
+        let p = poly(&[(0.0, 0.0), (40.0, 0.0), (40.0, 40.0), (0.0, 40.0)], 10);
+        let bad_hole = poly(&[(10.0, 10.0), (12.0, 10.0)], 1000);
+        for inset in [0.0, 5.0] {
+            let (nav, _, skipped) =
+                build_navmesh_from_rings(&[p.clone()], &[bad_hole.clone()], inset).unwrap();
+            assert!(nav.triangle_count() > 0);
+            assert_eq!(skipped, vec![0], "inset {inset}");
+        }
+    }
+
+    #[test]
+    fn over_erosion_is_a_clear_error() {
+        let p = poly(&[(0.0, 0.0), (40.0, 0.0), (40.0, 40.0), (0.0, 40.0)], 10);
+        let err = build_navmesh_from_rings(&[p], &[], 40.0).unwrap_err();
+        assert!(err.contains("eroded all walkable area"), "got: {err}");
+    }
+
+    /// Save-file round trip: `inset` survives serialization, and old
+    /// version-1 files without the field deserialize to 0.0.
+    #[test]
+    fn save_file_inset_round_trip() {
+        let file = SaveFile {
+            version: 1,
+            perimeters: vec![vec![Point { x: 1.0, y: 2.0 }]],
+            outer_polygon: None,
+            holes: Vec::new(),
+            inset: 12.5,
+        };
+        let json = serde_json::to_string(&file).unwrap();
+        let back: SaveFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.inset, 12.5);
+
+        let old = r#"{"version":1,"perimeters":[[{"x":1.0,"y":2.0}]],"holes":[]}"#;
+        let back: SaveFile = serde_json::from_str(old).unwrap();
+        assert_eq!(back.inset, 0.0);
+    }
 }
