@@ -674,8 +674,8 @@ pub struct ErodeOptions {
     /// allowed only so a caller can pass a world-space agent radius
     /// straight through without pre-quantizing.
     ///
-    /// Concretely: `BuildOptions::inset` defaults to 0.128 cells, and
-    /// eroding at 0.128 removes the whole first ring of wall-adjacent
+    /// Concretely: a typical agent radius is 0.128 cells (`BuildOptions::inset`
+    /// itself defaults to `None`), and eroding at 0.128 removes the whole first ring of wall-adjacent
     /// cells — a guaranteed clearance of 1.0, **7.8× more erosion than
     /// asked for**. Sub-cell radii belong to the contour path,
     /// permanently.

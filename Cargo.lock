@@ -1733,6 +1733,7 @@ dependencies = [
  "rsnav-common",
  "rsnav-dynamic",
  "rsnav-navmesh",
+ "rsnav-pathing",
  "rsnav-polygon-extract",
  "rsnav-triangle",
 ]

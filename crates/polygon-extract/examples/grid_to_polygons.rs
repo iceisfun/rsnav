@@ -7,8 +7,9 @@
 use rsnav_polygon_extract::{extract, Bitfield, ExtractOptions};
 
 fn main() {
-    // A 12×8 walkable area with an isolated single cell on the right side
-    // and an enclosed hole in the middle.
+    // A 12×8 walkable slab with three enclosed holes: a 5×2 room, a 1×2
+    // slot to its right, and a 4×1 pocket lower down. The bottom row is
+    // solid wall across the full width, so it is boundary, not a hole.
     //
     //   ############
     //   ###.....#.##
@@ -20,7 +21,7 @@ fn main() {
     //   ............    ← solid wall row separates the speck below
     //
     // (Rows passed top-down for readability; grid() flips to math-up.)
-    let grid = grid(12, &[
+    let bits = grid(12, &[
         "############",
         "###.....#.##",
         "###.....#.##",
@@ -32,13 +33,14 @@ fn main() {
     ]);
 
     println!("grid is {} × {}, {} walkable cells",
-        grid.width,
-        grid.height,
-        grid.data.iter().filter(|c| **c).count()
+        bits.width,
+        bits.height,
+        bits.data.iter().filter(|c| **c).count()
     );
 
-    // Default options: 4-connectivity, remove_collinear=true, no smoothing.
-    let regions = extract(&grid, &ExtractOptions::default());
+    // Default options: 4-connectivity, remove_collinear = true, and
+    // diagonal_smoothing = true (it defaults to ON; see ExtractOptions).
+    let regions = extract(&bits, &ExtractOptions::default());
 
     println!("\nextracted {} region(s):", regions.len());
     for (i, r) in regions.iter().enumerate() {
@@ -59,16 +61,48 @@ fn main() {
         }
     }
 
-    // Same input, but with diagonal smoothing turned on. Won't change
-    // anything for axis-aligned input like this — try it on a stair-step
-    // shape to see the effect.
+    // Same input with diagonal smoothing turned OFF, which is the only way
+    // to see what the default does. On axis-aligned input like this the two
+    // agree; smoothing only rewrites stair-step zigzags into diagonals.
     let mut opts = ExtractOptions::default();
-    opts.diagonal_smoothing = true;
-    let smoothed = extract(&grid, &opts);
+    opts.diagonal_smoothing = false;
+    let unsmoothed = extract(&bits, &opts);
     println!(
-        "\nwith diagonal_smoothing: {} region(s), outer of region 0 has {} verts",
-        smoothed.len(),
-        smoothed.first().map_or(0, |r| r.outer.vertices.len())
+        "\ndiagonal_smoothing = false: {} region(s), outer of region 0 has {} verts",
+        unsmoothed.len(),
+        unsmoothed.first().map_or(0, |r| r.outer.vertices.len())
+    );
+
+    // A staircase, where smoothing does change the trace. Each step is one
+    // cell; the default replaces the zigzag with diagonals and drops
+    // vertices, at the cost of not being area-preserving (it can bulge up
+    // to sqrt(2)/2 ~= 0.708 cells into the wall at a reflex corner).
+    let stair = grid(8, &[
+        "#.......",
+        "##......",
+        "###.....",
+        "####....",
+        "#####...",
+        "######..",
+        "#######.",
+        "########",
+    ]);
+    let smooth_on = extract(&stair, &ExtractOptions::default());
+    let mut off = ExtractOptions::default();
+    off.diagonal_smoothing = false;
+    let smooth_off = extract(&stair, &off);
+    println!(
+        "\nstaircase: smoothing on -> {} verts, off -> {} verts",
+        smooth_on.first().map_or(0, |r| r.outer.vertices.len()),
+        smooth_off.first().map_or(0, |r| r.outer.vertices.len()),
+    );
+
+    // Corner-touching cells are 4-connected only, so two cells meeting at a
+    // corner are two separate regions, never one.
+    let diag = grid(2, &["#.", ".#"]);
+    println!(
+        "corner-touching pair: {} region(s)",
+        extract(&diag, &ExtractOptions::default()).len()
     );
 }
 

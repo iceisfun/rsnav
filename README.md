@@ -2,7 +2,9 @@
 
 > A Rust constrained-Delaunay triangulator (port of Jonathan Shewchuk's *Triangle*) plus the runtime pieces you actually need to ship navigation: a navmesh binary format, A* + funnel path search with wall-clearance, a BVH for fast point queries, a background worker for dynamic obstacles, a multi-agent crowd with local avoidance, and authoring/probing demos.
 
-This is a **pure-Rust** reimplementation — no FFI, no C dependencies.
+This is a **pure-Rust** reimplementation — no FFI, no C dependencies, no `unsafe`.
+Every crate but one is also free of external Rust dependencies; `rsnav-dynamic` takes
+`arc-swap` for the lock-free `poll_swap` handoff.
 Built around a CDT port faithful enough that the included `A.poly` round-trips
 byte-for-byte against the `triangle` binary's `.ele` output (29 triangles).
 
@@ -48,6 +50,15 @@ byte-for-byte against the `triangle` binary's `.ele` output (29 triangles).
                                                               └────────────────────┘
 ```
 
+That diagram is the **legacy path**: polygons go to the CDT as-is. There is a second,
+crossing-tolerant path through `triangle`, taken when `BuildOptions::inset` is set — the
+contours are first offset inward (`common::offset`), the resulting self- and
+mutually-crossing rings are planarized into a non-crossing arrangement
+(`common::planarize`), and the interior is selected by winding number rather than by
+hole-seed flood fill (`triangle::winding`). It is the only path that accepts input rings
+that cross. See [docs/13-authored-geometry.md](docs/13-authored-geometry.md) for when to
+use it and [docs/06-clearance.md](docs/06-clearance.md) for what it costs.
+
 For game-loop integration with dynamic obstacles, `rsnav-dynamic` wraps the
 pipeline in a background-thread worker that consumes `Bitfield` snapshots
 and publishes results lock-free:
@@ -79,6 +90,38 @@ the corridor while side-stepping other agents.
                        └── set_nav(Arc<NavBuild>)   ◀── only invalidates corridors
                                                        that the new mesh broke
 ```
+
+## Documentation
+
+Full prose documentation lives in **[docs/README.md](docs/README.md)**, which routes by who
+you are and by what went wrong. Three entry points:
+
+- **Never written pathfinding** — [01-quickstart](docs/01-quickstart.md), then
+  [02-concepts](docs/02-concepts.md).
+- **You have grid A\*, Recast, or a waypoint graph** — [01-quickstart](docs/01-quickstart.md),
+  then [03-from-grid-astar](docs/03-from-grid-astar.md), which names the habits that will
+  mislead you here.
+- **You know navmeshes and want the API** — [17-api-map](docs/17-api-map.md), then the
+  decision table in [06-clearance](docs/06-clearance.md).
+
+All three converge on [04-units-and-conventions](docs/04-units-and-conventions.md) and
+[06-clearance](docs/06-clearance.md). Those two pages carry the material that costs people
+days: `false` means wall, `BuildOptions::inset` is in **cells** while
+`PathOptions::distance_from_wall` is in **world units**, grid erosion quantizes a 0.128
+request to a full 1.0 peel, and `distance_from_wall` is a portal shift rather than a
+Euclidean clearance guarantee.
+
+One choice is worth making before you write any code, because reversing it later means
+rebuilding your whole content pipeline: **`BuildOptions::inset` cannot be used with
+`TiledWorld`.** Per-tile contour erosion pulls each tile's boundary off the seam line, so
+`stitch_all` matches nothing and cross-seam paths silently fail. If your world will ever be
+tiled, clearance has to come from global grid erosion applied *before* slicing, which is
+cell-quantized — so sub-cell agent radii and tiling are mutually exclusive in v1. See
+[06-clearance](docs/06-clearance.md) and [12-large-worlds](docs/12-large-worlds.md).
+
+Something already broken? [docs/README.md](docs/README.md) opens with a symptom index —
+nearly every failure mode here is silent, producing wrong geometry rather than an error —
+and [16-troubleshooting](docs/16-troubleshooting.md) is written to be entered cold.
 
 ## Quick start
 
@@ -133,26 +176,22 @@ Place independent navmesh tiles in a shared world and path across the seams. Spa
 
 ### Programmatic use
 
-Each crate ships a runnable example (`cargo run -p <crate> --example <name>`):
+Every crate ships runnable examples. The complete, maintained inventory — 23 examples with
+their exact `cargo run` lines — lives in
+[docs/README.md § Runnable examples](docs/README.md#runnable-examples). Start with:
 
-| crate | example | demonstrates |
-| --- | --- | --- |
-| `rsnav-triangle` | `triangulate_pslg` | Build a CDT from a hand-coded PSLG, carve holes. |
-| `rsnav-polygon-extract` | `grid_to_polygons` | Turn a `true/false` bitfield into polygons + holes. |
-| `rsnav-navmesh` | `save_and_load` | Build a navmesh, serialize to bytes, reload, compare. |
-| `rsnav-bsp` | `locate_and_nearest` | BVH point-in-mesh + nearest-point queries. |
-| `rsnav-navigation` | `find_path` | A* + funnel with `distance_from_wall`. |
-| `rsnav-navigation` | `visibility_region` | Star-shaped visibility polygon from a point (sampled). |
-| `rsnav-navigation` | `tiled_world` | Place 3 tiles in a row, stitch the seams, path across all of them around an obstacle. |
-| `rsnav-pathing` | `follow_path` | Simulated agent walking a polyline with lookahead + anti-shortcut. |
-| `rsnav-dynamic` | `live_worker` | Spawn a `NavWorker`, place + demolish an obstacle, print telemetry events. |
-| `rsnav-crowd` | `two_agents_pass` | Two agents head-on on an open arena; print per-tick positions and verify the sampled-VO never overlapped them. |
+```
+cargo run -p rsnav-navigation --example first_path
+```
+
+Bitfield in, path polyline out, in forty lines — walked through in
+[docs/01-quickstart.md](docs/01-quickstart.md).
 
 ## Crates
 
 | name | what it provides |
 | --- | --- |
-| `rsnav-common` | `Vertex`, `Polygon`, `Triangle`, `Aabb`, `Mesh2d`, IDs. Geometry helpers (`orient2d`, `incircle`, segment intersection, `Polygon::interior_point` — used for safe hole seeds on concave polygons). |
+| `rsnav-common` | `Vertex`, `Polygon`, `Triangle`, `Aabb`, `Mesh2d`, IDs. Geometry helpers (`orient2d`, `incircle`, segment intersection, `Polygon::interior_point` — used for safe hole seeds on concave polygons). Also `offset` (contour offsetting, no arc joins), `planarize` (snap-rounded arrangement of crossing rings), `par` (the hand-rolled work-splitting used by every parallel stage) and `rng` (deterministic sampling). |
 | `rsnav-triangle` | Constrained Delaunay triangulator. Faithful Rust port of Shewchuk's `triangle.c` restricted to the `-DCDT_ONLY` subset (no Steiner-point quality refinement, no Voronoi). D&C Delaunay, segment insertion, hole carving, `.poly`/`.node`/`.ele` I/O. |
 | `rsnav-polygon-extract` | Bitfield → `PolygonWithHoles`. 4-connectivity region detection, optional collinear-vertex removal, optional zigzag → diagonal smoothing, min-area culling. |
 | `rsnav-navmesh` | Runtime mesh: flat vertices + triangles, per-triangle adjacency, edge constraint markers, area, centroid, connected-component region IDs. Per-region accessors (triangles / area / centroid / bounds), area-weighted `random_point` sampling for spawns, `boundary_edges` outline iteration. Versioned little-endian binary format ([FORMAT.md](crates/navmesh/FORMAT.md)). |
@@ -188,7 +227,7 @@ Working and tested (~205 tests pass workspace-wide):
 Deliberate v1 omissions:
 
 - Steiner point quality refinement (`-q` switch in `triangle`) — no facility for it.
-- Self-intersecting PSLG segments (`segmentintersection` in `triangle`) — `form_skeleton` returns `Err(SelfIntersection)` rather than splitting the crossing.
+- Self-intersecting PSLG segments (`segmentintersection` in `triangle`) — on the legacy path, `form_skeleton` returns `Err(SelfIntersection)` rather than splitting the crossing. This is no longer the whole story: `build_cdt_with_inset` exists precisely to accept crossing rings, resolving them by snap-rounded planarization plus a winding-number interior test instead of by segment splitting. Crossing input is supported *there*, not in `form_skeleton`. See [docs/13-authored-geometry.md](docs/13-authored-geometry.md).
 - Conforming-Delaunay midpoint splitting (`conformingedge` in `triangle`).
 - Visibility-region exact (Asano/Suri sweep). The shipped `visibility_region` uses uniform angular sampling — exact enough for visualization at typical resolutions.
 - Interactive pan/zoom in the demo (only auto-fit + Fit-view button).
