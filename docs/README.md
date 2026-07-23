@@ -82,6 +82,7 @@ specific problem.
 | 15 | [Threads, determinism, and costs](15-performance-and-determinism.md) | Shipping at scale, or you need reproducible output | — |
 | 16 | [It's not working](16-troubleshooting.md) | Entered cold, never read linearly | — |
 | 17 | [Where everything lives](17-api-map.md) | You know what you want and need the path | — |
+| 18 | [Sending a navmesh over the wire](18-interop.md) | A server ships a mesh to clients, or you move one between processes | 14 |
 
 ## Elsewhere
 
@@ -124,6 +125,7 @@ path run a per-triangle brute-force cross-check.
 | [tiled_world](../crates/navigation/examples/tiled_world.rs) | `cargo run -p rsnav-navigation --example tiled_world` |
 | [tiled_build](../crates/navigation/examples/tiled_build.rs) | `cargo run --release -p rsnav-navigation --example tiled_build` |
 | [translate_vs_tiled](../crates/navigation/examples/translate_vs_tiled.rs) | `cargo run -p rsnav-navigation --example translate_vs_tiled` |
+| [tcp_interop](../crates/navigation/examples/tcp_interop.rs) | `cargo run -p rsnav-navigation --example tcp_interop` |
 | [grid_to_polygons](../crates/polygon-extract/examples/grid_to_polygons.rs) | `cargo run -p rsnav-polygon-extract --example grid_to_polygons` |
 | [erode_and_clearance](../crates/polygon-extract/examples/erode_and_clearance.rs) | `cargo run --release -p rsnav-polygon-extract --example erode_and_clearance` |
 | [triangulate_pslg](../crates/triangle/examples/triangulate_pslg.rs) | `cargo run -p rsnav-triangle --example triangulate_pslg` |

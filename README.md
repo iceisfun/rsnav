@@ -119,6 +119,10 @@ tiled, clearance has to come from global grid erosion applied *before* slicing, 
 cell-quantized — so sub-cell agent radii and tiling are mutually exclusive in v1. See
 [06-clearance](docs/06-clearance.md) and [12-large-worlds](docs/12-large-worlds.md).
 
+Shipping a baked mesh to clients or between processes? [14-saving-and-loading](docs/14-saving-and-loading.md)
+covers encode/decode; [18-interop](docs/18-interop.md) is the same two calls over a socket,
+with a runnable plain-TCP demonstration.
+
 Something already broken? [docs/README.md](docs/README.md) opens with a symptom index —
 nearly every failure mode here is silent, producing wrong geometry rather than an error —
 and [16-troubleshooting](docs/16-troubleshooting.md) is written to be entered cold.
@@ -212,6 +216,8 @@ Bitfield in, path polyline out, in forty lines — walked through in
 `navmesh` v1 is a section-based little-endian binary format. The full normative spec is in [`crates/navmesh/FORMAT.md`](crates/navmesh/FORMAT.md). It's designed to be implementable in any language — fixed-width records, no varints/compression/alignment-tricks, unknown section types silently skipped for forward compatibility.
 
 Required sections: `META`, `VERTICES`, `TRIANGLES`. Optional (recomputed if absent): `ADJACENCY`, `EDGE_MARKERS`, `TRI_INFO`. The minimum portable file is `META + VERTICES + TRIANGLES + EDGE_MARKERS` (the markers can't be re-derived without losing the wall information).
+
+Same bytes go **over the wire**: `NavMesh::to_bytes` / `from_bytes` are all you need to ship a mesh from a server to clients or between processes. rsnav stops at encode/decode — the framing and protocol are your game's. See [docs/18-interop.md](docs/18-interop.md), with a runnable plain-TCP demonstration.
 
 ## Status
 
