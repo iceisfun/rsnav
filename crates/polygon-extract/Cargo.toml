@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Extract polygon regions (with holes) from a 2D occupancy bitfield."
+keywords = ["polygon", "navmesh", "bitfield", "erosion", "gamedev"]
+categories = ["game-development", "algorithms", "data-structures"]
+readme = "README.md"
 
 [dependencies]
 rsnav-common.workspace = true

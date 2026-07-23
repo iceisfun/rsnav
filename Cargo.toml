@@ -26,15 +26,15 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/iceisfun/rsnav"
 
 [workspace.dependencies]
-rsnav-common = { path = "crates/common" }
-rsnav-triangle = { path = "crates/triangle" }
-rsnav-polygon-extract = { path = "crates/polygon-extract" }
-rsnav-navmesh = { path = "crates/navmesh" }
-rsnav-bsp = { path = "crates/bsp" }
-rsnav-navigation = { path = "crates/navigation" }
-rsnav-pathing = { path = "crates/pathing" }
-rsnav-dynamic = { path = "crates/dynamic" }
-rsnav-crowd = { path = "crates/crowd" }
+rsnav-common = { path = "crates/common", version = "0.1.0" }
+rsnav-triangle = { path = "crates/triangle", version = "0.1.0" }
+rsnav-polygon-extract = { path = "crates/polygon-extract", version = "0.1.0" }
+rsnav-navmesh = { path = "crates/navmesh", version = "0.1.0" }
+rsnav-bsp = { path = "crates/bsp", version = "0.1.0" }
+rsnav-navigation = { path = "crates/navigation", version = "0.1.0" }
+rsnav-pathing = { path = "crates/pathing", version = "0.1.0" }
+rsnav-dynamic = { path = "crates/dynamic", version = "0.1.0" }
+rsnav-crowd = { path = "crates/crowd", version = "0.1.0" }
 arc-swap = "1"
 
 [profile.release]

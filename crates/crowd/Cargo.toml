@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Multi-agent crowd simulation: per-agent corridors over a NavMesh + sampled velocity-obstacle local avoidance."
+keywords = ["crowd", "navigation", "steering", "gamedev", "pathfinding"]
+categories = ["game-development", "simulation", "algorithms"]
+readme = "README.md"
 
 [dependencies]
 rsnav-common.workspace = true

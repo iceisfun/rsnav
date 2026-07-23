@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Path-following helpers (lookahead, anti-shortcutting)."
+keywords = ["pathfinding", "steering", "navigation", "gamedev", "path-following"]
+categories = ["game-development", "algorithms"]
+readme = "README.md"
 
 [dependencies]
 rsnav-common.workspace = true

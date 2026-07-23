@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Constrained Delaunay triangulation (Rust port of Shewchuk's Triangle 1.6, CDT subset)."
+keywords = ["triangulation", "delaunay", "cdt", "geometry", "pslg"]
+categories = ["algorithms", "mathematics", "game-development"]
+readme = "README.md"
 
 [dependencies]
 rsnav-common.workspace = true

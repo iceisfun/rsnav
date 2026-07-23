@@ -6,3 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Shared 2D geometry primitives (Vertex, Polygon, Triangle, Mesh) for rsnav."
+keywords = ["geometry", "navmesh", "gamedev", "mesh", "2d"]
+categories = ["game-development", "data-structures", "mathematics"]
+readme = "README.md"

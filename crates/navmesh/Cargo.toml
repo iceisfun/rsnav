@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Navmesh construction, serialization (versioned binary), and adjacency."
+keywords = ["navmesh", "navigation", "pathfinding", "gamedev", "serialization"]
+categories = ["game-development", "data-structures"]
+readme = "README.md"
 
 [dependencies]
 rsnav-common.workspace = true

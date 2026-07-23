@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Binary space partitioning over 2D polygon sets."
+keywords = ["bvh", "bsp", "spatial-index", "aabb", "navmesh"]
+categories = ["algorithms", "data-structures", "game-development"]
+readme = "README.md"
 
 [dependencies]
 rsnav-common.workspace = true

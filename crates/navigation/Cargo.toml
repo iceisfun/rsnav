@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Path search, funnel/string-pull, line-of-sight, visibility, nearest-point on a navmesh."
+keywords = ["pathfinding", "navigation", "astar", "funnel", "navmesh"]
+categories = ["game-development", "algorithms"]
+readme = "README.md"
 
 [dependencies]
 rsnav-common.workspace = true
