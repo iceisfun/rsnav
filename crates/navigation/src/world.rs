@@ -236,15 +236,17 @@ impl<M: NavMetadata> NavWorld<M> {
     }
 
     /// Add a door on one named portal edge; see [`DoorSet::add_edge`].
+    /// Returns `None` (and adds nothing) if `va` or `vb` is not a vertex of
+    /// this world's mesh.
     pub fn add_door_edge(
         &mut self,
         va: rsnav_common::VertexId,
         vb: rsnav_common::VertexId,
         state: DoorState,
-    ) -> DoorId {
-        let id = self.doors.add_edge(&self.nav, va, vb, state);
+    ) -> Option<DoorId> {
+        let id = self.doors.add_edge(&self.nav, va, vb, state)?;
         self.rebuild_walls();
-        id
+        Some(id)
     }
 
     pub fn set_door(&mut self, id: DoorId, state: DoorState) {

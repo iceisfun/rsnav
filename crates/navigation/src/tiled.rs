@@ -167,32 +167,38 @@ impl TiledWorld {
         &self.links
     }
 
-    /// World-space bounds of a tile, for culling / rendering.
-    pub fn tile_world_aabb(&self, tile: TileId) -> Aabb {
-        self.tiles[tile.0 as usize].world_aabb
+    /// World-space bounds of a tile, for culling / rendering. `None` if
+    /// `tile` is not in this world.
+    pub fn tile_world_aabb(&self, tile: TileId) -> Option<Aabb> {
+        self.tiles.get(tile.0 as usize).map(|t| t.world_aabb)
     }
 
     /// A tile's navmesh (local coordinates), for rendering its triangles.
-    pub fn tile_nav(&self, tile: TileId) -> &NavMesh {
-        &self.tiles[tile.0 as usize].nav
+    /// `None` if `tile` is not in this world.
+    pub fn tile_nav(&self, tile: TileId) -> Option<&NavMesh> {
+        self.tiles.get(tile.0 as usize).map(|t| &t.nav)
     }
 
-    /// A tile's current world offset.
-    pub fn tile_offset(&self, tile: TileId) -> Vertex {
-        self.tiles[tile.0 as usize].offset
+    /// A tile's current world offset. `None` if `tile` is not in this world.
+    pub fn tile_offset(&self, tile: TileId) -> Option<Vertex> {
+        self.tiles.get(tile.0 as usize).map(|t| t.offset)
     }
 
     /// Move a tile to a new world `offset`. Invalidates the links — call
     /// [`stitch_all`](Self::stitch_all) afterward to reconnect seams at the
-    /// new position.
-    pub fn set_tile_offset(&mut self, tile: TileId, offset: Vertex) {
-        let t = &mut self.tiles[tile.0 as usize];
+    /// new position. Returns `false` (and does nothing) if `tile` is not in
+    /// this world.
+    pub fn set_tile_offset(&mut self, tile: TileId, offset: Vertex) -> bool {
+        let Some(t) = self.tiles.get_mut(tile.0 as usize) else {
+            return false;
+        };
         let local = t.nav.aabb;
         t.offset = offset;
         t.world_aabb = Aabb {
             min: Vertex::new(local.min.x + offset.x, local.min.y + offset.y),
             max: Vertex::new(local.max.x + offset.x, local.max.y + offset.y),
         };
+        true
     }
 
     /// Rebuild every cross-tile link from scratch. `tol` is the world-space

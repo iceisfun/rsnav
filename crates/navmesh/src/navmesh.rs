@@ -99,6 +99,21 @@ impl NavMesh {
         &self.triangles[id.index()]
     }
 
+    /// Read a vertex position by ID, or `None` if `id` is out of range.
+    /// The checked counterpart to [`vertex`](Self::vertex) — prefer it
+    /// when the ID may be stale or from a different mesh.
+    #[inline]
+    pub fn get_vertex(&self, id: VertexId) -> Option<Vertex> {
+        self.vertices.get(id.index()).copied()
+    }
+
+    /// Read a triangle by ID, or `None` if `id` is out of range. Checked
+    /// counterpart to [`triangle`](Self::triangle).
+    #[inline]
+    pub fn get_triangle(&self, id: TriangleId) -> Option<&NavTriangle> {
+        self.triangles.get(id.index())
+    }
+
     /// `true` if the two triangles are in the same reachability region.
     /// Cheap pre-check before running A*.
     #[inline]

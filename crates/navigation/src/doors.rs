@@ -142,23 +142,28 @@ impl DoorSet {
     /// responsible for `(va, vb)` being a real unconstrained portal; a
     /// non-portal key simply never matches any traversal and the door is
     /// inert.
+    ///
+    /// Returns `None` if either `va` or `vb` is not a vertex of `nav` —
+    /// most often a stale ID after a rebuild, or one issued by a different
+    /// mesh. No door is added in that case.
     pub fn add_edge(
         &mut self,
         nav: &NavMesh,
         va: VertexId,
         vb: VertexId,
         state: DoorState,
-    ) -> DoorId {
+    ) -> Option<DoorId> {
+        let line = (nav.get_vertex(va)?, nav.get_vertex(vb)?);
         let id = DoorId(self.next_id);
         self.next_id += 1;
         self.doors.push(Door {
             id,
-            line: (nav.vertex(va), nav.vertex(vb)),
+            line,
             state,
             edges: vec![edge_key(va, vb)],
         });
         self.generation += 1;
-        id
+        Some(id)
     }
 
     /// Remove a door. Returns whether it existed.
@@ -407,7 +412,9 @@ mod tests {
             .expect("a portal edge near the centre");
 
         let mut doors = DoorSet::new();
-        let id = doors.add_edge(&nav, va, vb, DoorState::Closed);
+        let id = doors
+            .add_edge(&nav, va, vb, DoorState::Closed)
+            .expect("va/vb are real vertices of nav");
         assert_eq!(doors.get(id).unwrap().edge_count(), 1);
 
         // Closed edge-door blocks the corridor just like the segment door.

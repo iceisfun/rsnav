@@ -1394,6 +1394,8 @@ fn build_navmesh_from_rings(
             InsetError::Segment(se) => {
                 format!("internal: planarized segments still crossed: {se}")
             }
+            // Invalid inset / snap_cell / non-finite vertex — surfaced via Display.
+            other => other.to_string(),
         }
     })?;
 

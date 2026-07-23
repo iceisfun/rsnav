@@ -171,7 +171,9 @@ fn main() {
     let cursor = Vertex::new(9.5, 5.0);
     let (va, vb) = nearest_portal_edge(world.nav(), world.bsp(), cursor)
         .expect("an internal portal edge in the doorway");
-    let edge_door = world.add_door_edge(va, vb, DoorState::Closed);
+    let edge_door = world
+        .add_door_edge(va, vb, DoorState::Closed)
+        .expect("va/vb name a real portal edge of the mesh");
     println!(
         "\n[edge door] gates {} edge; find_path now: {:?}",
         world.doors().get(edge_door).unwrap().edge_count(),

@@ -128,7 +128,10 @@ impl WorldDemo {
         }
         let mut aabb = Aabb::EMPTY;
         for i in 0..self.tile_count {
-            let b = self.world.tile_world_aabb(TileId(i as u32));
+            let b = self
+                .world
+                .tile_world_aabb(TileId(i as u32))
+                .expect("tile id in range");
             aabb.extend(b.min);
             aabb.extend(b.max);
         }
@@ -226,7 +229,7 @@ impl WorldDemo {
                 if response.drag_started() {
                     if let Some(w) = pointer_world {
                         if let Some(tile) = self.tile_at(w) {
-                            let off = self.world.tile_offset(tile);
+                            let off = self.world.tile_offset(tile).expect("tile from hit-test");
                             self.drag = Some((tile, Vertex::new(w.x - off.x, w.y - off.y)));
                         }
                     }
@@ -264,15 +267,19 @@ impl WorldDemo {
         (0..self.tile_count)
             .rev()
             .map(|i| TileId(i as u32))
-            .find(|&t| self.world.tile_world_aabb(t).contains(p))
+            .find(|&t| {
+                self.world
+                    .tile_world_aabb(t)
+                    .is_some_and(|b| b.contains(p))
+            })
     }
 
     fn draw(&self, painter: &egui::Painter, rect: Rect) {
         // Tiles: fill triangles tinted per tile, wall edges in muted red.
         for i in 0..self.tile_count {
             let tile = TileId(i as u32);
-            let off = self.world.tile_offset(tile);
-            let nav = self.world.tile_nav(tile);
+            let off = self.world.tile_offset(tile).expect("tile id in range");
+            let nav = self.world.tile_nav(tile).expect("tile id in range");
             let fill = tile_color(i).gamma_multiply(0.16);
             for tri in &nav.triangles {
                 let pts: Vec<Pos2> = (0..3)
@@ -293,7 +300,7 @@ impl WorldDemo {
                 }
             }
             // Tile bounds + label.
-            let b = self.world.tile_world_aabb(tile);
+            let b = self.world.tile_world_aabb(tile).expect("tile id in range");
             let r = Rect::from_min_max(
                 self.w2s(rect, b.min, Vertex::new(0.0, 0.0)),
                 self.w2s(rect, b.max, Vertex::new(0.0, 0.0)),
