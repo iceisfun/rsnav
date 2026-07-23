@@ -52,6 +52,25 @@ pub enum PathError {
     Unreachable,
 }
 
+impl std::fmt::Display for PathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            PathError::StartOutsideMesh => {
+                "start point is not inside any triangle of the mesh"
+            }
+            PathError::GoalOutsideMesh => {
+                "goal point is not inside any triangle of the mesh"
+            }
+            PathError::Unreachable => {
+                "both endpoints are on the mesh but no path connects them"
+            }
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::error::Error for PathError {}
+
 #[derive(Clone, Debug)]
 pub struct PathResult {
     /// Polyline from `start` to `goal`, inclusive.

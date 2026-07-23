@@ -55,7 +55,7 @@ pub struct InsetRing<'a> {
 }
 
 /// Options for [`build_cdt_with_inset`].
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct InsetOptions {
     /// Join behavior for the offset stage.
     pub offset: OffsetOptions,
@@ -65,18 +65,16 @@ pub struct InsetOptions {
     pub snap_cell: Option<f64>,
 }
 
-impl Default for InsetOptions {
-    fn default() -> Self {
-        Self {
-            offset: OffsetOptions::default(),
-            snap_cell: None,
-        }
-    }
-}
-
 /// Failure modes of [`build_cdt_with_inset`].
 #[derive(Debug)]
 pub enum InsetError {
+    /// `inset` was not finite and `>= 0` (i.e. NaN, negative, or infinite).
+    InvalidInset(f64),
+    /// `InsetOptions::snap_cell` was `Some(v)` with `v` not a positive,
+    /// finite, normal number.
+    InvalidSnapCell(f64),
+    /// A ring vertex coordinate was not finite (NaN or infinite).
+    NonFiniteVertex,
     /// Planarization failed (degenerate input or non-convergence).
     Planarize(PlanarizeError),
     /// `form_skeleton` rejected a planarized segment. The planarizer's
@@ -89,6 +87,13 @@ pub enum InsetError {
 impl std::fmt::Display for InsetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidInset(v) => write!(f, "inset must be finite and >= 0, got {v}"),
+            Self::InvalidSnapCell(v) => {
+                write!(f, "snap_cell must be a positive finite number, got {v}")
+            }
+            Self::NonFiniteVertex => {
+                write!(f, "ring vertex coordinate was not finite (NaN or infinite)")
+            }
             Self::Planarize(e) => write!(f, "planarize: {e}"),
             Self::Segment(e) => write!(f, "internal: planarized segments still crossed: {e}"),
         }
@@ -123,10 +128,16 @@ pub fn build_cdt_with_inset(
     inset: f64,
     opts: &InsetOptions,
 ) -> Result<InsetBuild, InsetError> {
-    assert!(
-        inset.is_finite() && inset >= 0.0,
-        "inset must be finite and >= 0, got {inset}"
-    );
+    if !(inset.is_finite() && inset >= 0.0) {
+        return Err(InsetError::InvalidInset(inset));
+    }
+    // A non-finite ring coordinate would otherwise slip through to the
+    // snap-grid sizing and panic there; reject it up front instead.
+    for ring in rings {
+        if ring.points.iter().any(|v| !v.x.is_finite() || !v.y.is_finite()) {
+            return Err(InsetError::NonFiniteVertex);
+        }
+    }
 
     // Entry policy: normalize and skip degenerate rings, identically
     // for every inset value.
@@ -180,7 +191,12 @@ pub fn build_cdt_with_inset(
 
     // Snap grid from explicit target or the soup's bounding box.
     let grid = match opts.snap_cell {
-        Some(cell) => SnapGrid::from_target(cell),
+        Some(cell) => {
+            if !(cell.is_normal() && cell > 0.0) {
+                return Err(InsetError::InvalidSnapCell(cell));
+            }
+            SnapGrid::from_target(cell)
+        }
         None => {
             let bbox = Aabb::from_points(soup.iter().flat_map(|c| c.points.iter().copied()));
             SnapGrid::auto(&bbox, inset)

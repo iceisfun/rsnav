@@ -389,8 +389,15 @@ fn build_region_navmesh(
             }
             let built = build_cdt_with_inset(&rings, r, &InsetOptions::default())
                 .map_err(|e| match e {
+                    InsetError::InvalidInset(v) => BuildError::InvalidInset(v),
                     InsetError::Planarize(pe) => BuildError::Planarize(pe),
                     InsetError::Segment(se) => BuildError::SegmentInsertion(se),
+                    // Unreachable from the bitfield path (snap_cell is the
+                    // default `None` and grid coordinates are always finite),
+                    // but surfaced rather than dropped for defensiveness.
+                    e @ (InsetError::InvalidSnapCell(_) | InsetError::NonFiniteVertex) => {
+                        BuildError::Panicked(format!("unexpected inset error: {e}"))
+                    }
                 })?;
             // A fully-eroded region is a legitimately empty part; the
             // extraction-order merge appends it as a no-op.

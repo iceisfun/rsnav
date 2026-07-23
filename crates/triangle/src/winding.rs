@@ -97,7 +97,7 @@ fn contrib(a: Vertex, b: Vertex, p: Vertex) -> i32 {
 #[inline]
 fn bin(y: f64, y0: f64, inv_h: f64, nb: usize) -> usize {
     let k = ((y - y0) * inv_h).floor();
-    if !(k >= 0.0) {
+    if k < 0.0 || k.is_nan() {
         0
     } else if k >= nb as f64 {
         nb - 1
@@ -197,7 +197,7 @@ impl WindingIndex {
         }
         let mut nb = nb_override.unwrap_or((n / 16).clamp(1, 4096));
         let mut inv_h;
-        if !(y1 > y0) {
+        if y1 <= y0 || y1.is_nan() || y0.is_nan() {
             // Zero (or degenerate) y extent: one bin, and no reciprocal
             // — `1.0/0.0` is inf and `0.0 * inf` is NaN.
             nb = 1;

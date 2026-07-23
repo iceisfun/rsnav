@@ -67,12 +67,12 @@ pub fn build_from_cdt(cdt: &CdtMesh) -> NavMesh {
         // the edge whose apex is `vertices[i]`. That maps directly to our
         // "edge i = edge opposite vertices[i]" convention.
         let mut edge_markers = [0i32; 3];
-        for orient in 0..3usize {
+        for (orient, marker) in edge_markers.iter_mut().enumerate() {
             let enc_sub = slot.subsegs[orient];
             if enc_sub.sub() != DUMMY_SUB {
                 let s = &cdt.subsegs[enc_sub.sub() as usize];
                 if !s.is_dead() {
-                    edge_markers[orient] = s.marker;
+                    *marker = s.marker;
                 }
             }
         }

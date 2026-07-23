@@ -202,7 +202,7 @@ pub fn extract(bits: &Bitfield, opts: &ExtractOptions) -> Vec<PolygonWithHoles> 
     }
 
     let pairs: Vec<(Polygon, Vec<Polygon>)> =
-        outers.drain(..).zip(outer_holes.into_iter()).collect();
+        outers.drain(..).zip(outer_holes).collect();
     let par = threads.min(POST_MAX_THREADS);
     let mut regions: Vec<PolygonWithHoles> = if pairs.len() >= PAR_MIN_REGIONS && par > 1 {
         // Smoothing is per-region-independent; the clone is one pass over

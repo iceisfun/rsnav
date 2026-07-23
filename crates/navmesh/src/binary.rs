@@ -389,11 +389,11 @@ impl NavMesh {
                     found: len as u64,
                 });
             }
-            for i in 0..tcount {
+            for (i, tri) in triangles.iter_mut().enumerate() {
                 let base = off + i * 12;
                 for k in 0..3 {
                     let raw = read_u32(bytes, base + k * 4)?;
-                    triangles[i].neighbors[k] = if raw == u32::MAX {
+                    tri.neighbors[k] = if raw == u32::MAX {
                         TriangleId::INVALID
                     } else if (raw as usize) >= tcount {
                         return Err(LoadError::BadIndex {
@@ -420,10 +420,10 @@ impl NavMesh {
                     found: len as u64,
                 });
             }
-            for i in 0..tcount {
+            for (i, tri) in triangles.iter_mut().enumerate() {
                 let base = off + i * 12;
                 for k in 0..3 {
-                    triangles[i].edge_markers[k] = read_i32(bytes, base + k * 4)?;
+                    tri.edge_markers[k] = read_i32(bytes, base + k * 4)?;
                 }
             }
         }
@@ -439,14 +439,14 @@ impl NavMesh {
                     found: len as u64,
                 });
             }
-            for i in 0..tcount {
+            for (i, tri) in triangles.iter_mut().enumerate() {
                 let base = off + i * 28;
-                triangles[i].area = read_f64(bytes, base)?;
-                triangles[i].centroid = Vertex::new(
+                tri.area = read_f64(bytes, base)?;
+                tri.centroid = Vertex::new(
                     read_f64(bytes, base + 8)?,
                     read_f64(bytes, base + 16)?,
                 );
-                triangles[i].region = read_u32(bytes, base + 24)?;
+                tri.region = read_u32(bytes, base + 24)?;
             }
             have_tri_info = true;
         }

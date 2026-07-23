@@ -43,6 +43,22 @@ pub enum AstarError {
     Unreachable,
 }
 
+impl std::fmt::Display for AstarError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            AstarError::UnreachableRegion => {
+                "start and goal are in different reachability regions"
+            }
+            AstarError::Unreachable => {
+                "no traversable path connects start and goal"
+            }
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::error::Error for AstarError {}
+
 /// Find the sequence of triangles A* walks from `start` to `goal`.
 ///
 /// The search runs on the triangle adjacency graph, but step costs are

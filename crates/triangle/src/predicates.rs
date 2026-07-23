@@ -13,6 +13,11 @@
 //! The error-free transform primitives are exposed as `#[inline]`
 //! functions returning tuples instead of the C macros' output parameters.
 
+// Names (`_0`, `_1`, ...) and index-based expansion loops mirror Shewchuk's
+// reference `predicates.c` verbatim; kept as-is for faithful auditing against
+// the source rather than reshaped to satisfy style lints.
+#![allow(clippy::just_underscores_and_digits, clippy::needless_range_loop)]
+
 use rsnav_common::Vertex;
 
 // --- Machine constants ----------------------------------------------------

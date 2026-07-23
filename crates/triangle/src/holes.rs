@@ -105,15 +105,14 @@ fn seed_holes(
     };
     // Infect in original hole order so the plague worklist ends up
     // identical to a per-hole locate_triangle pass, regardless of the
-    // order the gridded pass discovered the seeds in.
-    for seed in seeds {
-        if let Some(tri) = seed {
-            if !infected[tri as usize] {
-                infected[tri as usize] = true;
-                worklist.push_back(tri);
-            }
+    // order the gridded pass discovered the seeds in. Holes that located
+    // outside the mesh produced a `None` seed and are silently skipped,
+    // matching triangle.c.
+    for tri in seeds.into_iter().flatten() {
+        if !infected[tri as usize] {
+            infected[tri as usize] = true;
+            worklist.push_back(tri);
         }
-        // Holes outside the mesh are silently ignored, matching triangle.c.
     }
 }
 
