@@ -4,7 +4,7 @@
 //!
 //! - [`make_vertex_map`] (precondition): give every vertex a pointer to an
 //!   incident triangle so segment endpoints can be located in O(1).
-//! - [`insert_subseg`] (utility): glue a subseg onto a triangle edge if no
+//! - `insert_subseg` (utility): glue a subseg onto a triangle edge if no
 //!   subseg is there yet.
 //! - [`find_direction`]: from a triangle handle at one endpoint, find the
 //!   first triangle that the directed segment to the second endpoint enters.
@@ -40,8 +40,8 @@ use crate::pslg::Pslg;
 pub enum SegmentInsertError {
     /// The PSLG segment from `endpoint1` to `endpoint2` would cross an
     /// existing constrained subsegment. v1 doesn't support self-
-    /// intersecting PSLG input (the [`segmentintersection`] /
-    /// [`conformingedge`] paths from triangle.c are not ported).
+    /// intersecting PSLG input (the `segmentintersection` /
+    /// `conformingedge` paths from triangle.c are not ported).
     /// The CDT is left in a valid state but the segment was not inserted.
     SelfIntersection {
         endpoint1: VertexId,
@@ -547,9 +547,9 @@ fn locate_vertex(mesh: &mut CdtMesh, v: VertexId) -> Result<Otri, VertexId> {
 /// valid state up to that point — callers can either bail or strip the
 /// bad segment from the PSLG and retry.
 ///
-/// Auto-handles duplicate-position vertices: [`delaunay()`] silently
+/// Auto-handles duplicate-position vertices: [`delaunay()`](crate::delaunay) silently
 /// drops bit-exact duplicates, so a segment that references a dropped
-/// ID would otherwise crash in [`locate_vertex`]. This function builds a
+/// ID would otherwise crash in `locate_vertex`. This function builds a
 /// position → first-occurrence-ID remap from the mesh's own vertex pool
 /// and rewrites each segment's endpoints through it. Degenerate
 /// (canonically-self-loop) segments after remap are silently skipped.

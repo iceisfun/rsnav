@@ -1,7 +1,7 @@
 //! Multi-tile worlds: place independent navmeshes in one world space and path
 //! across the seams.
 //!
-//! Each [`Tile`] is a self-contained [`NavMesh`] + [`Bsp`] placed at a world
+//! Each `Tile` is a self-contained [`NavMesh`] + [`Bsp`] placed at a world
 //! `offset` (translation only — overworld tiles are axis-aligned). Tiles are
 //! never merged or re-triangulated; instead a thin **link** layer connects
 //! them. This is the tiled-navmesh model: streaming a tile in or out is an

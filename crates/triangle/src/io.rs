@@ -1,6 +1,6 @@
 //! Readers and writers for Triangle's `.node`, `.poly`, and `.ele` ASCII files.
 //!
-//! Format reference: https://www.cs.cmu.edu/~quake/triangle.html
+//! Format reference: <https://www.cs.cmu.edu/~quake/triangle.html>
 //!
 //! The format treats `#` as a comment marker (to end of line); blank lines
 //! are skipped. Vertex IDs in a file are *self-consistent* in their base

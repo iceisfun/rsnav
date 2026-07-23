@@ -10,7 +10,7 @@
 //!   the current mesh; the cheap "do I need to replan?" check after the
 //!   navmesh has changed.
 //! - [`nearest_point`] — thin wrapper around [`rsnav_bsp::Bsp::nearest`]
-//!   that exposes the result as a [`Vertex`] plus the triangle it landed in.
+//!   that exposes the result as a [`Vertex`](rsnav_common::Vertex) plus the triangle it landed in.
 //! - [`visibility_region`] — an approximate visibility polygon from a
 //!   point, ray-cast at a configurable angular resolution.
 //!

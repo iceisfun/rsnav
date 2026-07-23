@@ -97,7 +97,7 @@ pub struct BuildOptions {
     /// 0–40). Erosion only ever shrinks a region, so per-region builds
     /// stay disjoint and the deterministic merge is unaffected.
     ///
-    /// Tiled builds ([`rsnav_navigation::TiledWorld`]) must keep `None`:
+    /// Tiled builds (`rsnav_navigation::TiledWorld`) must keep `None`:
     /// per-tile erosion recedes seam edges by `r` and breaks
     /// `stitch_all`'s collinear-overlap matching. Use
     /// [`rsnav_polygon_extract::Bitfield::eroded`] instead — it erodes the

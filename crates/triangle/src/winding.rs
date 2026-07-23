@@ -15,7 +15,7 @@
 //! [`winding_number`] call per live triangle, and that call walks every
 //! edge of every soup contour, so the cost is `triangles x soup_edges`
 //! (on `act3-town`: 40k x 22.6k robust orientation tests, ~1.5s).
-//! [`WindingIndex`] collapses it to the edges that can actually
+//! `WindingIndex` collapses it to the edges that can actually
 //! contribute, and does so *exactly*: the accumulator in
 //! [`winding_number`] is an `i32` incremented by literal `+/-1`, never a
 //! float, so dropping terms that are provably zero — and visiting the

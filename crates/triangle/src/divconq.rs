@@ -10,7 +10,7 @@
 //! triangulation is bounded by a ring of *ghost* triangles whose apex is
 //! `VertexId::INVALID`. These are real allocated triangles, used as
 //! sentinels so the half-edge machinery has somewhere to point on the
-//! exterior of the hull. After merging completes, [`remove_ghosts`]
+//! exterior of the hull. After merging completes, `remove_ghosts`
 //! deallocates them and binds the real boundary edges to `EncodedTri::DUMMY`.
 
 use rsnav_common::VertexId;
@@ -39,7 +39,7 @@ impl Default for DivConqOptions {
 /// `mesh` must contain only its dummy triangle (i.e. be fresh aside from
 /// the input vertices). On return the mesh contains real triangles only
 /// (ghosts have been removed); the convex hull edges have their outside
-/// neighbor set to [`EncodedTri::DUMMY`]. Returns the number of edges
+/// neighbor set to `EncodedTri::DUMMY`. Returns the number of edges
 /// on the convex hull.
 pub fn delaunay(mesh: &mut CdtMesh, opts: DivConqOptions) -> u32 {
     // Build the working ID array (one ID per input vertex).

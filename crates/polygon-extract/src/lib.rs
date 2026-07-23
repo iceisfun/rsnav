@@ -817,7 +817,7 @@ impl Bitfield {
     ///
     /// It runs on the **grid**, so it can run once globally *before* the
     /// grid is sliced into tiles, which makes it the only erosion that
-    /// works with [`rsnav_navigation::TiledWorld`] seams:
+    /// works with `rsnav_navigation::TiledWorld` seams:
     ///
     /// ```no_run
     /// # use rsnav_polygon_extract::{Bitfield, ErodeOptions};

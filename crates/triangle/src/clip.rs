@@ -15,7 +15,7 @@
 //! one ear can turn a neighbor into a new ear, so the pass iterates until
 //! no clip is performed.
 //!
-//! Run this after [`carve_holes`] and before [`build_from_cdt`](../../navmesh/build/fn.build_from_cdt.html).
+//! Run this after [`carve_holes`](crate::carve_holes) and before [`build_from_cdt`](../../navmesh/build/fn.build_from_cdt.html).
 
 use rsnav_common::geom::signed_area2;
 
