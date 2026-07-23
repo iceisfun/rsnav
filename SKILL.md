@@ -3,8 +3,17 @@
 Pure-Rust 2D navigation stack: constrained Delaunay triangulator (Shewchuk
 *Triangle* port) plus a navmesh runtime — A* + funnel pathing, BVH point
 queries, line of sight, visibility region, and a steering-target path
-follower. No FFI, no C deps, `f64` throughout, `#![forbid(unsafe_code)]`
-on every runtime crate.
+follower. No FFI and no C deps, `f64` throughout, and no `unsafe` anywhere
+on the runtime query path. Two accuracy notes to set expectations:
+
+- **Not zero-dependency.** `rsnav-dynamic` depends on `arc-swap`
+  (`arc_swap::ArcSwapOption`, the lock-free build hand-off between the
+  worker thread and the game loop). Every other library crate is
+  dependency-free.
+- **`#![forbid(unsafe_code)]` is on 7 of the 9 library crates** —
+  `common`, `polygon-extract`, `navmesh`, `bsp`, `navigation`, `pathing`,
+  `crowd`. It is **not** present on `rsnav-triangle` or `rsnav-dynamic`
+  (neither actually uses `unsafe`; the attribute is simply not declared).
 
 This file is for AI assistants integrating against the crates. It covers
 the public API surface, the standard data flow, idiomatic recipes, and
@@ -147,7 +156,7 @@ Runtime mesh, `rsnav_navmesh`:
 
 | Type | Notes |
 | --- | --- |
-| `NavMesh { vertices, triangles, aabb, region_count }` | Flat parallel arrays. `to_bytes`/`from_bytes` round-trip exact. Use `nav.reachable(a, b)` as a cheap O(1) "do A* at all?" pre-check. |
+| `NavMesh { vertices, triangles, aabb, region_count }` | Flat parallel arrays. `to_bytes`/`from_bytes` round-trip exact. Use `nav.reachable(a, b)` as a cheap O(1) "do A* at all?" pre-check. `vertex(id) -> Vertex` / `triangle(id) -> &NavTriangle` **panic** on an out-of-range id; `get_vertex(id) -> Option<Vertex>` / `get_triangle(id) -> Option<&NavTriangle>` are the checked variants — prefer them for ids that may be stale or from another mesh. |
 | `NavTriangle { vertices, neighbors, edge_markers, area, centroid, region }` | CCW order. `neighbors[i] == TriangleId::INVALID` ⇒ boundary. `edge_markers[i] != 0` ⇒ constrained edge (the PSLG marker is preserved). `region` is the connected component under "non-wall neighbor". `edge_vertices(i)`, `is_edge_constrained(i)`, `is_edge_boundary(i)`. |
 | `NavMesh::region_triangles(id)` / `region_area(id)` / `region_centroid(id)` / `region_bounds(id)` | Per-region views over the connected-component `region` field: a `TriangleId` iterator, the summed area, the area-weighted centroid, and an `Aabb`. An out-of-range region id is graceful — empty iterator / `0.0` / `None` / `None`. |
 | `NavMesh::random_point(rng)` / `random_point_in_region(region, rng)` | Uniform *area-weighted* random point inside the whole mesh / one region — ideal for spawn placement. `rng` is any `impl FnMut() -> f64` yielding `[0, 1)` (no `rand` dependency); `O(n)` per call. `None` when the (region's) area is zero. |
@@ -171,7 +180,7 @@ Pathing + queries, `rsnav_navigation`:
 | `find_path_with_walls(&nav, &bsp, &walls, start, goal, &PathOptions) -> Result<PathResult, PathError>` | Same, against a caller-provided `WallInfo`. Pass one built with `WallInfo::from_navmesh_with_doors` to route around closed doors; or reuse one `WallInfo` across many queries instead of rebuilding it per call. |
 | `PathOptions { distance_from_wall }` | `0.0` = point agent. `> 0`: A* rejects portals shorter than this, and funnel pulls portal endpoints on wall vertices inward by this amount. Models an agent radius. |
 | `PathResult { points: Vec<Vertex>, triangles: Vec<TriangleId> }` | Polyline includes `start` and `goal`; `triangles` is the A* corridor. |
-| `PathError::{StartOutsideMesh, GoalOutsideMesh, Unreachable}` | `Unreachable` covers both "different region" and "every connecting portal too narrow". |
+| `PathError::{StartOutsideMesh, GoalOutsideMesh, Unreachable}` | `Unreachable` covers both "different region" and "every connecting portal too narrow". Impls Display + `std::error::Error`, so it composes with `?` (as does `astar::AstarError::{UnreachableRegion, Unreachable}`, which `find_path` maps into `PathError::Unreachable`). |
 | `line_of_sight(&nav, &walls, start_tri, from, to) -> LineOfSightResult` | Walks the segment triangle-by-triangle, stopping at the first wall the `&WallInfo` reports (static walls, plus closed doors when `walls` was built with them). `start_tri` must contain `from`. Returns `Clear`, `Blocked { point }`, `SourceOutsideMesh`, or `Indeterminate` (a numerical-degeneracy walk — treat as "not clear"). |
 | `path_clear(&nav, &bsp, &walls, &[Vertex]) -> bool` | Segment-by-segment line-of-sight check over a polyline — `true` if every leg can be walked on the current mesh. The cheap way to revalidate a planned path after the navmesh (or a door) changed: pass `[agent_pos, remaining_corners..]`; `false` ⇒ replan. Catches a new obstacle that landed *between* two still-on-mesh corners, which a corner-only test misses. |
 | `nearest_point(&nav, &bsp, p) -> Option<NearestPoint>` | Convenience wrapper over `Bsp::nearest`. |
@@ -184,7 +193,7 @@ Doors — runtime edge-cuts, `rsnav_navigation` (no mesh or BSP rebuild):
 | Type / fn | Notes |
 | --- | --- |
 | `WallInfo` | The shared wall oracle consumed by A*, the funnel, LOS, visibility, and `WallClearance`. `WallInfo::from_navmesh(&nav)` = static walls only; `WallInfo::from_navmesh_with_doors(&nav, &doors)` folds every *closed* door's edges in. `O(triangles)`; rebuild whenever the mesh or any door state changes. |
-| `DoorSet` | The doors in a world, and the source of truth for which edges are gated shut. `add(&nav, &bsp, a, b, state)` resolves an authoring **segment** to the internal portal edges it crosses; `add_edge(&nav, va, vb, state)` gates one named edge (unambiguous — use with `nearest_portal_edge`). `open/close/toggle/set_state(id)`, `remove(id)`, `clear()`. `generation()` bumps on every change — your repath signal. |
+| `DoorSet` | The doors in a world, and the source of truth for which edges are gated shut. `add(&nav, &bsp, a, b, state) -> DoorId` resolves an authoring **segment** to the internal portal edges it crosses; `add_edge(&nav, va, vb, state) -> Option<DoorId>` gates one named edge (unambiguous — use with `nearest_portal_edge`), returning `None` if either `VertexId` is out of range for `nav` (stale id / different mesh — no door is added). `open/close/toggle/set_state(id)`, `remove(id)`, `clear()`. `generation()` bumps on every change — your repath signal. |
 | `DoorState::{Open, Closed}` | Closed = the cut edges behave as walls; open = ordinary portals. |
 | `Door { id, line, state, .. }` | `is_closed()`, `edge_count()` (0 ⇒ the segment cut no portal — drawn off-mesh or only over walls). |
 | `nearest_portal_edge(&nav, &bsp, p) -> Option<(VertexId, VertexId)>` | The internal portal edge nearest a world point — for "click the edge under the cursor" door authoring. Never returns a wall/boundary edge. |
@@ -192,12 +201,20 @@ Doors — runtime edge-cuts, `rsnav_navigation` (no mesh or BSP rebuild):
 
 A door is **not** a region of triangles or a geometry patch — it's a set of internal portal *edges* a closed door promotes to walls. The mesh, triangle IDs, and BSP never change; opening/closing only flips which edges the traversal code treats as impassable. Insetting (`distance_from_wall`) keeps working: the door endpoints are wall vertices while closed, so the funnel insets around them. Existing paths are never mutated — clients compare `DoorSet::generation()` and repath when it differs.
 
+Wall clearance for hand-moved agents, `rsnav_navigation` (`crates/navigation/src/wall_clearance.rs`):
+
+| Type / fn | Notes |
+| --- | --- |
+| `WallClearance` | Precomputes the mesh's wall segments (every constrained-or-boundary edge — the same set A*/funnel treat as impassable, deduped once) so an agent you move *by hand* (WASD, steering, knockback — anything that isn't the planner) can be held off the walls. `find_path` already insets planned paths via `distance_from_wall`; this is that same boundary invariant for free movement, with no second geometrically-inset mesh. |
+| `WallClearance::from_navmesh(&nav)` / `from_navmesh_with_doors(&nav, &doors)` / `from_walls(&nav, &walls)` | Build once per mesh+door-state; `O(triangles)`. The `_with_doors` form also holds the agent off *closed* doors. Rebuild whenever the mesh or a door changes (same lifecycle as `Bsp`). |
+| `clamp(pos, radius) -> Vertex` | Push `pos` out until its center is `>= radius` from every wall (a few relaxation passes settle concave corners); a point already clear is returned unchanged. `radius <= 0.0` is a no-op. Pair with a `Bsp::nearest` snap *first* to also keep the agent on-mesh. In a channel narrower than `2 * radius` the agent is pinned toward the center — consistent with A* refusing that portal. `segment_count()` for diagnostics. |
+
 `NavWorld<M>` — the owning container, `rsnav_navigation`:
 
 | Type / fn | Notes |
 | --- | --- |
 | `NavWorld<M = NoMetadata>` | Owns `(NavMesh, Bsp, DoorSet, WallInfo)` + your metadata `M`. `new(nav, meta)` builds the BSP and oracle; `without_metadata(nav)` for `M = NoMetadata`. Removes the "rebuild `walls` when a door changes" footgun — every door mutator does it for you. |
-| `add_door / add_door_edge / open_door / close_door / toggle_door / set_door / remove_door / clear_doors` | Door authoring + toggling; each rebuilds the wall oracle internally. |
+| `add_door / add_door_edge / open_door / close_door / toggle_door / set_door / remove_door / clear_doors` | Door authoring + toggling; each rebuilds the wall oracle internally. `add_door(a, b, state) -> DoorId`; `add_door_edge(va, vb, state) -> Option<DoorId>` (mirrors `DoorSet::add_edge` — `None` if `va`/`vb` isn't a vertex of this world's mesh, and nothing is added). |
 | `find_path / line_of_sight / path_clear / visibility / nearest_point / locate` | Door-aware queries against the owned oracle. `line_of_sight(from, to)` locates the start triangle for you. |
 | `generation()` | Mirrors the door generation — a path planned at `g` is stale once this differs. |
 | `meta() / meta_mut()` | Access your metadata store. |
@@ -213,11 +230,12 @@ A door is **not** a region of triangles or a geometry patch — it's a set of in
 | `TiledWorld` | A set of independent navmesh tiles placed in one world space, plus links stitched between them. Tiles are never merged or re-triangulated. |
 | `add_tile(nav, offset) -> TileId` | Emplace `nav` at a world translation. Call `stitch_all` afterward. |
 | `stitch_all(tol)` | (Re)build every cross-tile link by finding boundary edges that are **collinear and overlap** in world space. Vertices need not match — one long edge links to the several short ones it overlaps. `tol` is the world-space slack (e.g. `1e-6` for exact grids). |
-| `set_tile_offset(tile, offset)` | Move a tile; invalidates links — re-`stitch_all`. |
+| `set_tile_offset(tile, offset) -> bool` | Move a tile; invalidates links — re-`stitch_all`. Returns `false` (no-op) if `tile` is not a valid `TileId`. |
 | `find_path(start, goal) -> Option<Vec<Vertex>>` | Cross-tile A* (intra-tile adjacency + links) in world space, then world-space funnel. |
 | `line_of_sight(from, to) -> LineOfSightResult` | Walks across tiles, crossing open seam links, stopping at the first wall or *unlinked* boundary. |
 | `locate(p) -> Option<GlobalTri>` | Which tile + triangle a world point lands in. |
-| `tile_count() / links() / tile_world_aabb / tile_nav / tile_offset` | Inspection + rendering accessors. |
+| `tile_count() -> usize / links() -> &[Link]` | Inspection + rendering accessors. |
+| `tile_nav(tile) -> Option<&NavMesh>` / `tile_offset(tile) -> Option<Vertex>` / `tile_world_aabb(tile) -> Option<Aabb>` | Per-tile accessors; each returns `None` for an invalid `TileId`. |
 | `GlobalTri { tile: TileId, tri: TriangleId }`, `Link { a, b, portal }` | Namespaced triangle handle; a cross-tile connection with its world-space portal segment. |
 
 v1 limits: translation-only offsets, links always open (no per-seam doors yet), no cross-seam clearance, and a slight funnel soft-corner where one edge links to two (aligned grids are exact). A door is conceptually "a link you can close" — the planned unification of the two overlays.
@@ -236,17 +254,49 @@ Bitfield → polygons, `rsnav_polygon_extract`:
 | Type / fn | Notes |
 | --- | --- |
 | `Bitfield { width, height, data: Vec<bool> }` | Row-major, `true` = walkable. Cell (col, row) covers `[col, col+1] × [row, row+1]` with y-up (row 0 at bottom). Construct via `Bitfield::new(w, h, data) -> Result<Self, BitfieldError>` (returns `BadDataLength` if `data.len() != w * h`) or the infallible `Bitfield::empty(w, h)`. |
-| `ExtractOptions { min_area, remove_collinear, diagonal_smoothing }` | Defaults: keep all, strip collinear vertices, smoothing **on**. `diagonal_smoothing` iterates to a fixed point and collapses *any* run of unit-perpendicular zigzag corners whose flanking direction is preserved — handles multi-step stairs adjacent to longer straight runs. Set `diagonal_smoothing = false` to keep the exact cell-aligned boundary. |
+| `ExtractOptions { min_area, remove_collinear, diagonal_smoothing, threads }` | Defaults: keep all (`min_area = 0.0`), strip collinear vertices, smoothing **on**, `threads = 0`. `diagonal_smoothing` iterates to a fixed point and collapses *any* run of unit-perpendicular zigzag corners whose flanking direction is preserved — handles multi-step stairs adjacent to longer straight runs. Set `diagonal_smoothing = false` to keep the exact cell-aligned boundary. `threads`: worker count for the parallelizable phases (`0` = one per core, `1` = fully serial); output is identical for every setting, and small inputs stay serial regardless. |
 | `extract(&bits, &opts) -> Vec<PolygonWithHoles>` | Outer rings CCW, holes CW. 4-connectivity (diagonal-only touch = disconnected). |
+
+Grid erosion (agent radius baked into the *grid*, before extraction), `rsnav_polygon_extract`:
+
+| Type / fn | Notes |
+| --- | --- |
+| `Bitfield::eroded(&ErodeOptions) -> Result<Bitfield, ErodeError>` | Exact Euclidean morphological erosion: keep exactly the cells an agent of `radius` fits *anywhere within*. `O(cells)` regardless of boundary complexity. Feed the result to `extract` / `build_navmesh_from_bitfield` with `inset: None` and the clearance is baked in. `radius == 0.0` clones. |
+| `ErodeOptions { radius, threads }` | `radius` in **bitfield cells** (one cell = 1.0). Defaults `radius = 0.0`, `threads = 0`. Radii are **cell-quantized** — every radius in `(0, 1]` gives the same one-cell peel; achievable clearances are `{0, 1, √2, 2, √5, …}`. Sub-cell radii belong to the contour inset. `threads`: `0` = one per core, `1` = serial; byte-identical output either way. |
+| `ErodeError::InvalidRadius(f64)` | `radius` NaN / infinite / negative. Impls Display + Error. |
+| `Bitfield::clearance(threads) -> ClearanceField` | The exact squared-clearance field alone (the expensive transform), so you can `threshold` it at several radii to get small/medium/large-agent grids for the price of one transform. |
+| `ClearanceField { width, height, sq }` (`sq` private) | `sq_at(col, row) -> i32`: squared clearance in cells² (outside-grid counts as wall; `0` for walls and wall-adjacent cells; exact integers, bit-reproducible). `threshold(radius) -> Result<Bitfield, ErodeError>`: the cells whose clearance is `>= radius`. **`radius == 0.0` keeps every cell, walls included.** |
+| `Bitfield::subgrid(col0, row0, width, height) -> Bitfield` | Copy a sub-rectangle (out-of-range cells padded as wall). The second half of the tiled workflow: **erode the global grid, then `subgrid` it into tiles** — slicing after eroding keeps every seam edge exactly on the tile border line so `TiledWorld::stitch_all` links it. Never erode a tile. |
+
+Grid erosion is the only clearance strategy compatible with `TiledWorld` seams — it runs once, globally, *before* the grid is sliced, so seam edges keep identical integer coordinates in both neighbours. (Contour inset would recede each tile's seam by `r` and break the collinear-overlap matching.)
+
+Contour inset (agent radius baked into the *contours*, crossing-tolerant CDT), `rsnav_triangle` (`crates/triangle/src/inset.rs`, re-exported from the crate root):
+
+| Type / fn | Notes |
+| --- | --- |
+| `build_cdt_with_inset(&[InsetRing], inset, &InsetOptions) -> Result<InsetBuild, InsetError>` | Offset → planarize → CDT → winding cull. Replaces the `delaunay`/`form_skeleton`/`carve_holes` sequence for authored perimeter+hole scenes, and (unlike that path) **tolerates holes that cross the perimeter**. `inset` must be finite and `>= 0` (`0` = no erosion but still the crossing-tolerant path). Fully-eroded input is `Ok` with zero live triangles, not an error. It no longer panics on bad inset / snap_cell / non-finite input — those are `Err`. |
+| `InsetRing { points: &[Vertex], kind: RingKind, marker: i32 }` | One input ring, any winding (normalized internally). |
+| `RingKind::{Perimeter, Hole}` | Passed structurally, never inferred from markers. |
+| `InsetOptions { offset: OffsetOptions, snap_cell: Option<f64> }` (derives `Default`) | `snap_cell = None` auto-picks the planarize grid from the soup bbox + inset; `Some(v)` must be positive finite. |
+| `InsetBuild { mesh: CdtMesh, soup, skipped_rings }` | `mesh` is ready for `build_from_cdt` (optionally after `clip_ears`). `skipped_rings: Vec<(usize, RingKind)>` reports degenerate rings dropped at entry — surface a skipped *perimeter* as a build error, don't silently ship missing geometry. |
+| `InsetError::{InvalidInset(f64), InvalidSnapCell(f64), NonFiniteVertex, Planarize(PlanarizeError), Segment(SegmentInsertError)}` | Impls Display + Error, so it composes with `?`. `build_cdt_with_inset` returns these rather than panicking. |
+
+**Three clearance strategies, and when each applies:**
+
+- **Grid erosion** (`Bitfield::eroded`) — cell-quantized, `O(cells)`, **tiles** (the only one that survives `TiledWorld` seams). Bake into the bitfield, build with `inset: None`.
+- **Contour inset** (`build_cdt_with_inset`, or `BuildOptions::inset`) — works in cell units with **sub-cell precision** and on authored (non-grid) polygons, but **cannot tile** (recedes seam edges). The only option for sub-cell radii.
+- **Query-time** (`WallClearance::clamp` / `PathOptions::distance_from_wall`) — no baked mesh at all; one mesh serves agents of every radius.
+
+They **compose additively**: grid-erode the integer part `a`, contour-inset the sub-cell remainder `b`, for a guaranteed clearance of `a + b`. When a clearance of `r` is baked into the mesh, pass `max(0, agent_radius - r)` at query time (`WallClearance` / `distance_from_wall`) so it isn't counted twice.
 
 Dynamic obstacles + telemetry, `rsnav_dynamic`:
 
 | Type / fn | Notes |
 | --- | --- |
 | `NavWorker` | Owns a background thread that turns `Arc<Bitfield>` snapshots into `Arc<NavBuild>`. `spawn(BuildOptions)` for no-telemetry; `spawn_with_listener(opts, Arc<dyn NavListener>)` for typed events. `Drop` joins the thread cleanly; `shutdown()` joins explicitly. |
-| `BuildOptions { extract: ExtractOptions, perimeter_marker, hole_marker, clip_ears_max_area }` | Knobs forwarded to the per-snapshot pipeline. Defaults: extract defaults (smoothing on), marker 1 / 2, `clip_ears_max_area = 0.6` (catches half-cell stair ears on unit-cell bitfields). Set `clip_ears_max_area = 0.0` to disable the pass for hand-authored PSLGs where small ears are intentional. |
+| `BuildOptions { extract: ExtractOptions, perimeter_marker, hole_marker, threads, clip_ears_max_area, inset }` | Six fields. Knobs forwarded to the per-snapshot pipeline. Defaults: extract defaults (smoothing on), marker 1 / 2, `threads = 0`, `clip_ears_max_area = 0.6` (catches half-cell stair ears on unit-cell bitfields), `inset = None`. `threads`: worker count governing the whole build — per-region CDT plus `extract`'s phases when `extract.threads == 0` (`0` = one per core, `1` = fully serial end-to-end); output is identical for every setting. Set `clip_ears_max_area = 0.0` to disable the ear pass for hand-authored PSLGs. `inset: Option<f64>` bakes a contour agent-radius erosion (cells): `None` = the legacy `carve_holes` path (bit-identical / digest-stable); `Some(r)` = the offset/planarize/winding path (`Some(0.0)` erodes nothing but uses the crossing-tolerant classification). Builder: `BuildOptions::default().with_inset(r)`. **Tiled builds must keep `inset: None`** — per-tile contour erosion breaks `stitch_all`; use `Bitfield::eroded` on the global grid instead. |
 | `NavBuild { navmesh, bsp, build_ms, generation }` | One successful build. `generation` increases monotonically per worker. The first published build is `generation = 1`. |
-| `BuildError::{NoPerimeter, SegmentInsertion(SegmentInsertError), EmptyMesh}` | Why a rebuild failed. Worker keeps the previous published build intact and reports via `last_error()` / `NavEvent::BuildFailed`. |
+| `BuildError::{NoPerimeter, SegmentInsertion(SegmentInsertError), EmptyMesh, InvalidInset(f64), Planarize(PlanarizeError), Panicked(String)}` | Why a rebuild failed; impls Display + Error. `InvalidInset` = `inset` was `Some(r)` with `r` negative/NaN/infinite; `Planarize` = the inset path's planarizer failed on adversarial contours; `Panicked` = the pipeline unwound (only produced by `NavWorker`, which catches it so one poisoned snapshot degrades to a failed build instead of killing the thread — direct `build_navmesh_from_bitfield` callers see the panic itself). Worker keeps the previous published build intact and reports via `last_error()` / `NavEvent::BuildFailed`. |
 | `submit_snapshot(Arc<Bitfield>)` | Non-blocking. If another snapshot is already queued, the worker silently keeps only the newest one (counted in `NavStats::snapshots_coalesced`). |
 | `poll_swap() -> bool` | Call once per frame, before any system reads `current()`. Returns true if a newer build was atomically swapped in this call. |
 | `current() -> Option<Arc<NavBuild>>` | The build presented to game systems this frame. `None` until the first build publishes. |
@@ -770,8 +820,12 @@ let los  = world.line_of_sight(Vertex::new(3.0, 5.0), Vertex::new(17.0, 5.0));
   `Polygon::ensure_winding(Winding::CounterClockwise)` (or `Clockwise`
   for holes) before handing off.
 
-- **`#![forbid(unsafe_code)]`** on every runtime crate. No FFI surface
-  to worry about.
+- **`#![forbid(unsafe_code)]`** on 7 of the 9 library crates (`common`,
+  `polygon-extract`, `navmesh`, `bsp`, `navigation`, `pathing`, `crowd`).
+  It is *not* declared on `rsnav-triangle` or `rsnav-dynamic` — neither uses
+  `unsafe`, the attribute is just absent. No FFI surface to worry about
+  anywhere. (`rsnav-dynamic` is also the one crate with a third-party
+  dependency, `arc-swap`; see the header.)
 
 - **Tests are authoritative.** Each module has a `#[cfg(test)] mod tests`
   with end-to-end fixtures. When unsure how an API is meant to be
@@ -910,21 +964,32 @@ All run as `cargo run -p <crate> --example <name>`.
   orient/incircle predicates, segment intersection, point-in-triangle,
   nearest point on segment/triangle.
 - `crates/triangle/src/lib.rs` — re-exports the user-facing surface
-  (`delaunay`, `form_skeleton`, `carve_holes`, `clip_ears`, the `Pslg`
-  types).
+  (`delaunay`, `form_skeleton`, `carve_holes`, `clip_ears`, the contour-inset
+  surface `build_cdt_with_inset` / `InsetRing` / `RingKind` / `InsetOptions` /
+  `InsetBuild` / `InsetError`, and the `Pslg` types).
 - `crates/triangle/src/clip.rs` — `clip_ears` ear-removal post-pass.
+- `crates/triangle/src/inset.rs` — the crossing-tolerant
+  offset → planarize → CDT → winding-cull inset pipeline.
+- `crates/triangle/src/winding.rs` — `carve_by_winding` /
+  `drop_interior_constraints` used by the inset cull.
 - `crates/navmesh/src/{navmesh,build,binary}.rs` — runtime mesh, CDT
   conversion, serialization.
 - `crates/navmesh/FORMAT.md` — normative binary spec.
 - `crates/navigation/src/{path,los,visibility,astar,funnel,wall}.rs` —
   pathing + queries. `wall.rs` is the `WallInfo` oracle (the single
   "is this edge impassable?" chokepoint all traversal routes through).
+  `path.rs`/`astar.rs` hold `PathError`/`AstarError` (both Display + Error).
+- `crates/navigation/src/wall_clearance.rs` — `WallClearance`, the
+  hold-a-hand-moved-agent-off-the-walls helper.
 - `crates/navigation/src/doors.rs` — `DoorSet`, the segment/edge resolver,
   `nearest_portal_edge`. Runtime edge-cut doors, no rebuild.
 - `crates/navigation/src/world.rs` — `NavWorld<M>` owning container,
   `NavMetadata` trait, `zone_crossings`.
 - `crates/navigation/src/tiled.rs` — `TiledWorld`: tiles, auto-stitch link
   discovery, cross-tile A* + world-space funnel + LOS.
+- `crates/polygon-extract/src/lib.rs` — bitfield → polygons trace, plus
+  the grid-erosion surface (`Bitfield::eroded` / `clearance` / `subgrid`,
+  `ErodeOptions`, `ClearanceField`, `ErodeError`).
 - `crates/bsp/src/lib.rs` — BVH index.
 - `crates/pathing/src/lib.rs` — steering follower.
 - `crates/crowd/src/lib.rs` — `Agent` / `Crowd` / `CrowdConfig`,
@@ -938,3 +1003,9 @@ All run as `cargo run -p <crate> --example <name>`.
 
 Tests in each file cover the canonical use shape end-to-end and are
 small enough to read top-to-bottom.
+
+---
+
+## References
+
+- Author / project home: <https://iceisfun.com/>
