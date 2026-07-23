@@ -1,7 +1,8 @@
 # rsnav — Skill Reference
 
-Pure-Rust 2D navigation stack: constrained Delaunay triangulator (Shewchuk
-*Triangle* port) plus a navmesh runtime — A* + funnel pathing, BVH point
+Pure-Rust 2D navigation stack: constrained Delaunay triangulator (an
+independent implementation inspired by Shewchuk's *Triangle*, not a port of
+it) plus a navmesh runtime — A* + funnel pathing, BVH point
 queries, line of sight, visibility region, and a steering-target path
 follower. No FFI and no C deps, `f64` throughout, and no `unsafe` anywhere
 on the runtime query path. Two accuracy notes to set expectations:
@@ -50,7 +51,7 @@ Not in scope for v1:
 ```
 crates/
   common/          rsnav-common          shared geometry primitives
-  triangle/        rsnav-triangle        CDT builder (Shewchuk port)
+  triangle/        rsnav-triangle        CDT builder (Shewchuk-inspired, not a port)
   polygon-extract/ rsnav-polygon-extract bitfield -> polygons + holes
   navmesh/         rsnav-navmesh         runtime mesh + binary format
   bsp/             rsnav-bsp             BVH over a NavMesh

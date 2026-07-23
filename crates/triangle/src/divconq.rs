@@ -1,6 +1,6 @@
 //! Divide-and-conquer Delaunay triangulation.
 //!
-//! Translation of triangle.c's `divconqdelaunay`, `divconqrecurse`,
+//! Counterparts to triangle.c's `divconqdelaunay`, `divconqrecurse`,
 //! `mergehulls`, and `removeghosts` — the default Triangle algorithm,
 //! with Dwyer's alternating-axis cuts enabled by default.
 //!

@@ -1,9 +1,10 @@
 //! Robust adaptive geometric predicates.
 //!
-//! Direct port of the `predicates.c` portion of Shewchuk's `triangle.c`
-//! (the `counterclockwise` / `incircle` routines together with the
-//! `fast_expansion_sum_zeroelim`, `scale_expansion_zeroelim`, `estimate`
-//! supporting machinery and the error-free transforms).
+//! Implements Shewchuk's public-domain robust geometric predicates — the
+//! adaptive-precision method from his predicates work — following the
+//! published approach (the `counterclockwise` / `incircle` routines together
+//! with the `fast_expansion_sum_zeroelim`, `scale_expansion_zeroelim`,
+//! `estimate` supporting machinery and the error-free transforms).
 //!
 //! These routines compute the *exact sign* of the orientation and
 //! in-circle determinants using IEEE 754 `f64` arithmetic. They are about
@@ -14,8 +15,8 @@
 //! functions returning tuples instead of the C macros' output parameters.
 
 // Names (`_0`, `_1`, ...) and index-based expansion loops mirror Shewchuk's
-// reference `predicates.c` verbatim; kept as-is for faithful auditing against
-// the source rather than reshaped to satisfy style lints.
+// reference predicates for cross-checking; kept as-is rather than reshaped
+// to satisfy style lints.
 #![allow(clippy::just_underscores_and_digits, clippy::needless_range_loop)]
 
 use rsnav_common::Vertex;
@@ -43,7 +44,7 @@ const ICCERRBOUND_A: f64 = (10.0 + 96.0 * EPSILON) * EPSILON;
 const ICCERRBOUND_B: f64 = (4.0 + 48.0 * EPSILON) * EPSILON;
 const ICCERRBOUND_C: f64 = (44.0 + 576.0 * EPSILON) * EPSILON * EPSILON;
 
-// --- Error-free transforms (Shewchuk macros translated) ------------------
+// --- Error-free transforms (Shewchuk's approach) -------------------------
 //
 // These compute the exact mathematical result of a single f64 operation as
 // the unevaluated sum of two f64 values (an "expansion" of length 2).
@@ -174,7 +175,7 @@ fn two_two_diff(a1: f64, a0: f64, b1: f64, b0: f64) -> (f64, f64, f64, f64) {
 /// Sum two zero-eliminated expansions: `h = e + f`. Writes the result into
 /// `h` and returns its length. `h` must have capacity >= `e.len() + f.len()`.
 ///
-/// Port of `fast_expansion_sum_zeroelim`. `h` must not alias `e` or `f`.
+/// Counterpart to `fast_expansion_sum_zeroelim`. `h` must not alias `e` or `f`.
 fn fast_expansion_sum_zeroelim(e: &[f64], f: &[f64], h: &mut [f64]) -> usize {
     let elen = e.len();
     let flen = f.len();
@@ -569,7 +570,7 @@ fn incircle_adapt(pa: Vertex, pb: Vertex, pc: Vertex, pd: Vertex, permanent: f64
     // moderate coordinate magnitudes) the earlier filters catch effectively
     // all cases. Returning the most refined approximation here gives the
     // correct sign in every test we have; if a cocircular pathological case
-    // is ever observed in the wild we'll port the remaining exact path.
+    // is ever observed in the wild we'll implement the remaining exact path.
     det
 }
 

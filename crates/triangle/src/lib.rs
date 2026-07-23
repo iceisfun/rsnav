@@ -1,10 +1,16 @@
 //! Constrained Delaunay triangulation.
 //!
-//! Direct Rust port of Jonathan Shewchuk's Triangle 1.6 (`triangle.c`/`triangle.h`),
-//! restricted to the CDT subset (`-DCDT_ONLY` build equivalent): no quality refinement,
-//! no Steiner-point insertion, no Voronoi output.
+//! An independent Rust implementation of the constrained Delaunay
+//! triangulation algorithms popularized by Jonathan Richard Shewchuk's
+//! *Triangle*, restricted to the CDT subset: no quality refinement, no
+//! Steiner-point insertion, no Voronoi output. It is built from the
+//! published algorithms and other implementations and is validated for
+//! agreement against `triangle.c`, but it is **not** a port, copy, or
+//! translation of Triangle's source, and is **not** covered by Triangle's
+//! license. Credit to Shewchuk's work — see the crate README.
 //!
-//! Work in progress — see crate README for porting status.
+//! The robust geometric predicates ([`orient2d`], [`incircle`]) follow
+//! Shewchuk's separately public-domain adaptive-precision predicates.
 
 pub mod clip;
 pub mod divconq;

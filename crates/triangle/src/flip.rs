@@ -1,6 +1,6 @@
 //! Edge-flip primitives.
 //!
-//! Direct translations of `flip()` and `unflip()` from triangle.c. Both
+//! Counterparts to triangle.c's `flip()` and `unflip()`. Both
 //! transform two triangles sharing an edge into the other diagonal of their
 //! quadrilateral. They reuse the existing slots in place — handles into
 //! either triangle remain valid (though their orientation changes).

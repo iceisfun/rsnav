@@ -76,9 +76,10 @@ detail is.
    24 cells to search                    2 triangles to search
 ```
 
-The triangulator is a faithful Rust port of Jonathan Shewchuk's
-Triangle 1.6, restricted to the constrained-Delaunay subset (see the crate
-header at [`crates/triangle/src/lib.rs`](../crates/triangle/src/lib.rs)). Its
+The triangulator is an independent Rust implementation of the
+constrained-Delaunay algorithms popularized by Jonathan Shewchuk's Triangle —
+validated for agreement against `triangle.c`, but not a port or copy of it (see
+the crate header at [`crates/triangle/src/lib.rs`](../crates/triangle/src/lib.rs)). Its
 internals — the divide-and-conquer sweep, the flip machinery, circumcircle
 predicates — are deliberately not documented in this set. You do not need them
 to use the library, and the module headers already own that material.

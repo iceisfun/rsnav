@@ -2,9 +2,9 @@
 //! unbounded exterior concavities) from a constrained Delaunay
 //! triangulation.
 //!
-//! Port of triangle.c's `infecthull`, `plague`, and the hole-handling
+//! Counterparts to triangle.c's `infecthull`, `plague`, and the hole-handling
 //! portion of `carveholes`. Regional attribute spreading
-//! (`regionplague`) and area constraints are intentionally not ported in
+//! (`regionplague`) and area constraints are intentionally not implemented in
 //! v1 — we just identify hole/concavity triangles and delete them.
 //!
 //! ## Algorithm

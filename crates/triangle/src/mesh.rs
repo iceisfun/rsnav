@@ -1,7 +1,7 @@
 //! In-memory CDT mesh: triangle pool, subsegment pool, vertex pool, and the
 //! [`Otri`]/[`Osub`] handles for navigating them.
 //!
-//! Translation of triangle.c's `struct triangle`, `struct subseg`, and the
+//! Counterparts to triangle.c's `struct triangle`, `struct subseg`, and the
 //! `otri`/`osub` manipulation primitives. Where the C version packs metadata
 //! into the low bits of pointers (orient, infect, dead), we keep separate
 //! flag bytes on each slot — safe and easier to debug, marginally larger.
@@ -379,7 +379,7 @@ impl CdtMesh {
     // -- triangle pool --------------------------------------------------
 
     /// Allocate a fresh triangle. Returns a handle to edge 0 of the new
-    /// triangle. Translation of `maketriangle()`.
+    /// triangle. Counterpart to `maketriangle()`.
     pub fn make_triangle(&mut self) -> Otri {
         let tri = if let Some(idx) = self.free_tris.pop() {
             // Reset the recycled slot.
@@ -395,7 +395,7 @@ impl CdtMesh {
     }
 
     /// Mark a triangle as dead and put its slot on the free list.
-    /// Translation of `triangledealloc()`. The caller is responsible for
+    /// Counterpart to `triangledealloc()`. The caller is responsible for
     /// having torn down any bonds first.
     pub fn kill_triangle(&mut self, tri: u32) {
         debug_assert!(tri != DUMMY_TRI, "must not kill the dummy triangle");

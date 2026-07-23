@@ -1,12 +1,14 @@
 # rsnav
 
-> A Rust constrained-Delaunay triangulator (port of Jonathan Shewchuk's *Triangle*) plus the runtime pieces you actually need to ship navigation: a navmesh binary format, A* + funnel path search with wall-clearance, a BVH for fast point queries, a background worker for dynamic obstacles, a multi-agent crowd with local avoidance, and authoring/probing demos.
+> A Rust constrained-Delaunay triangulator (an independent implementation inspired by Jonathan Shewchuk's *Triangle*, not a port of it) plus the runtime pieces you actually need to ship navigation: a navmesh binary format, A* + funnel path search with wall-clearance, a BVH for fast point queries, a background worker for dynamic obstacles, a multi-agent crowd with local avoidance, and authoring/probing demos.
 
 This is a **pure-Rust** reimplementation — no FFI, no C dependencies, no `unsafe`.
 Every crate but one is also free of external Rust dependencies; `rsnav-dynamic` takes
 `arc-swap` for the lock-free `poll_swap` handoff.
-Built around a CDT port faithful enough that the included `A.poly` round-trips
-byte-for-byte against the `triangle` binary's `.ele` output (29 triangles).
+Built around an independent CDT implementation, validated for agreement against
+Shewchuk's `triangle.c` — the included `A.poly` round-trips byte-for-byte against
+the `triangle` binary's `.ele` output (29 triangles) — but not derived from its
+source. See [References](#references) for the attribution and the license note.
 
 ## At a glance
 
@@ -19,8 +21,8 @@ byte-for-byte against the `triangle` binary's `.ele` output (29 triangles).
               └────────────────────────┘           ▼
                                           ┌──────────────────────┐
                                           │      triangle        │
-                                          │  (Shewchuk port,     │
-                                          │   CDT_ONLY subset:   │
+                                          │  (Shewchuk-inspired, │
+                                          │   CDT-only subset:   │
                                           │   D&C Delaunay,      │
                                           │   constrained edges, │
                                           │   hole carving)      │
@@ -196,7 +198,7 @@ Bitfield in, path polyline out, in forty lines — walked through in
 | name | what it provides |
 | --- | --- |
 | `rsnav-common` | `Vertex`, `Polygon`, `Triangle`, `Aabb`, `Mesh2d`, IDs. Geometry helpers (`orient2d`, `incircle`, segment intersection, `Polygon::interior_point` — used for safe hole seeds on concave polygons). Also `offset` (contour offsetting, no arc joins), `planarize` (snap-rounded arrangement of crossing rings), `par` (the hand-rolled work-splitting used by every parallel stage) and `rng` (deterministic sampling). |
-| `rsnav-triangle` | Constrained Delaunay triangulator. Faithful Rust port of Shewchuk's `triangle.c` restricted to the `-DCDT_ONLY` subset (no Steiner-point quality refinement, no Voronoi). D&C Delaunay, segment insertion, hole carving, `.poly`/`.node`/`.ele` I/O. |
+| `rsnav-triangle` | Constrained Delaunay triangulator. Independent implementation of the CDT algorithms inspired by Shewchuk's *Triangle* (no Steiner-point quality refinement, no Voronoi), validated against `triangle.c` but not derived from it. D&C Delaunay, segment insertion, hole carving, `.poly`/`.node`/`.ele` I/O. |
 | `rsnav-polygon-extract` | Bitfield → `PolygonWithHoles`. 4-connectivity region detection, optional collinear-vertex removal, optional zigzag → diagonal smoothing, min-area culling. |
 | `rsnav-navmesh` | Runtime mesh: flat vertices + triangles, per-triangle adjacency, edge constraint markers, area, centroid, connected-component region IDs. Per-region accessors (triangles / area / centroid / bounds), area-weighted `random_point` sampling for spawns, `boundary_edges` outline iteration. Versioned little-endian binary format ([FORMAT.md](crates/navmesh/FORMAT.md)). |
 | `rsnav-bsp` | BVH (AABB-tree) over a `NavMesh`. `locate(point)` and `nearest(point)`, both `O(log n)` average, plus `query_aabb` broad-phase range queries. |
@@ -241,7 +243,7 @@ Deliberate v1 omissions:
 
 ## References
 
-- **Triangle**: Jonathan Richard Shewchuk, *"Triangle: Engineering a 2D Quality Mesh Generator and Delaunay Triangulator,"* in *Applied Computational Geometry: Towards Geometric Engineering*, vol. 1148 of LNCS, pp. 203–222, Springer, 1996. [`https://www.cs.cmu.edu/~quake/triangle.html`](https://www.cs.cmu.edu/~quake/triangle.html)
+- **Triangle**: Jonathan Richard Shewchuk, *"Triangle: Engineering a 2D Quality Mesh Generator and Delaunay Triangulator,"* in *Applied Computational Geometry: Towards Geometric Engineering*, vol. 1148 of LNCS, pp. 203–222, Springer, 1996. [`https://www.cs.cmu.edu/~quake/triangle.html`](https://www.cs.cmu.edu/~quake/triangle.html) — rsnav's CDT is an **independent implementation** inspired by this work and validated against `triangle.c`; it is **not** a port or copy of Triangle's source and is **not** covered by [Triangle's license](https://www.cs.cmu.edu/~quake/triangle.html). Credit gladly given.
 - **Robust predicates**: Shewchuk, *"Adaptive Precision Floating-Point Arithmetic and Fast Robust Geometric Predicates,"* Discrete & Computational Geometry 18:305–363, 1997.
 - **Simple Stupid Funnel**: Mikko Mononen, *"Simple Stupid Funnel Algorithm,"* 2010. [`https://digestingduck.blogspot.com/2010/03/simple-stupid-funnel-algorithm.html`](https://digestingduck.blogspot.com/2010/03/simple-stupid-funnel-algorithm.html)
 

@@ -17,9 +17,9 @@ Most rsnav users never open this page. The documented pipeline takes a `Bitfield
 | Rings that cross | **Cannot build.** `SegmentInsertError::SelfIntersection` | Builds |
 | Hole seed points | Required, one strictly inside every hole | Not used at all |
 | Erosion by agent radius | Not available | Built in, any `inset >= 0.0` |
-| Failure mode on bad input | Typed `Err` from `form_skeleton` | `Err` for planarizer failures; **panics** on a bad `inset` |
+| Failure mode on bad input | Typed `Err` from `form_skeleton` | `Err` for planarizer failures and for a bad `inset` / `snap_cell` / non-finite vertex |
 
-The rule: **if your authored rings can ever cross each other, or if you want an agent radius baked in, use `build_cdt_with_inset`.** It is worth reaching for at `inset = 0.0` purely for the crossing tolerance — at zero the offset stage is skipped entirely and planarization is the whole value. The legacy path stays because it is the direct port of `triangle.c`, it is what the bitfield pipeline uses when `BuildOptions::inset` is `None`, and it is bit-identical to earlier releases.
+The rule: **if your authored rings can ever cross each other, or if you want an agent radius baked in, use `build_cdt_with_inset`.** It is worth reaching for at `inset = 0.0` purely for the crossing tolerance — at zero the offset stage is skipped entirely and planarization is the whole value. The legacy path stays because it follows `triangle.c`'s algorithm closely (and is validated against it), it is what the bitfield pipeline uses when `BuildOptions::inset` is `None`, and it is bit-identical to earlier releases.
 
 ---
 

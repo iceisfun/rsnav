@@ -1,6 +1,6 @@
 //! Segment insertion: force PSLG segments into a Delaunay triangulation.
 //!
-//! Port of triangle.c's segment-insertion machinery:
+//! Counterpart to triangle.c's segment-insertion machinery:
 //!
 //! - [`make_vertex_map`] (precondition): give every vertex a pointer to an
 //!   incident triangle so segment endpoints can be located in O(1).
@@ -19,7 +19,7 @@
 //!
 //! `segmentintersection` (handles self-intersecting PSLGs by inserting a
 //! Steiner point at the crossing) and `conformingedge` (forces conformity
-//! by recursive midpoint splitting) are intentionally **not** ported in v1.
+//! by recursive midpoint splitting) are intentionally **not** implemented in v1.
 //! Each function returns [`SegmentInsertError::SelfIntersection`] when it
 //! would need them — only invalid input (a user-drawn self-crossing
 //! polygon) or the `-q`/`-Y` quality-refinement modes need them.
@@ -41,7 +41,7 @@ pub enum SegmentInsertError {
     /// The PSLG segment from `endpoint1` to `endpoint2` would cross an
     /// existing constrained subsegment. v1 doesn't support self-
     /// intersecting PSLG input (the `segmentintersection` /
-    /// `conformingedge` paths from triangle.c are not ported).
+    /// `conformingedge` paths from triangle.c are not implemented).
     /// The CDT is left in a valid state but the segment was not inserted.
     SelfIntersection {
         endpoint1: VertexId,
@@ -83,7 +83,7 @@ impl std::error::Error for SegmentInsertError {}
 /// *some* triangle that has it as a corner. Used by [`insert_segment`] to
 /// locate segment endpoints in O(1).
 ///
-/// Port of `makevertexmap()`.
+/// Counterpart to `makevertexmap()`.
 pub fn make_vertex_map(mesh: &mut CdtMesh) {
     for tri_idx in 1..mesh.triangles.len() as u32 {
         if mesh.triangle(tri_idx).is_dead() {
@@ -104,7 +104,7 @@ pub fn make_vertex_map(mesh: &mut CdtMesh) {
 /// Glue a fresh subseg onto the edge held by `tri`. If a subseg is already
 /// there, just promote its marker if it was unmarked.
 ///
-/// Port of `insertsubseg()`. Also used by the winding cull's boundary
+/// Counterpart to `insertsubseg()`. Also used by the winding cull's boundary
 /// backfill (`carve_by_winding`).
 pub(crate) fn insert_subseg(mesh: &mut CdtMesh, tri: Otri, subsegmark: i32) {
     let triorg = mesh.org(tri);
@@ -158,7 +158,7 @@ pub enum FindDirection {
 /// its dest-edge (`RightCollinear`), or runs along its apex-edge
 /// (`LeftCollinear`).
 ///
-/// Port of `finddirection()`.
+/// Counterpart to `finddirection()`.
 pub fn find_direction(
     mesh: &CdtMesh,
     searchtri: &mut Otri,
@@ -265,7 +265,7 @@ fn oprevself(mesh: &CdtMesh, o: &mut Otri) {
 /// path crosses an existing constrained subsegment — v1 doesn't support
 /// self-intersecting PSLG input.
 ///
-/// Port of `scoutsegment()`.
+/// Counterpart to `scoutsegment()`.
 pub fn scout_segment(
     mesh: &mut CdtMesh,
     searchtri: &mut Otri,
@@ -327,7 +327,7 @@ pub fn scout_segment(
 /// vertices via a "stack" of inverted triangles (no actual stack — just
 /// the natural recursion).
 ///
-/// Port of `delaunayfixup()`.
+/// Counterpart to `delaunayfixup()`.
 pub fn delaunay_fixup(mesh: &mut CdtMesh, fixuptri: &mut Otri, leftside: bool) {
     let mut neartri = fixuptri.lnext();
     let fartri = mesh.sym(neartri);
@@ -385,7 +385,7 @@ pub fn delaunay_fixup(mesh: &mut CdtMesh, fixuptri: &mut Otri, leftside: bool) {
 /// Returns [`SegmentInsertError::SelfIntersection`] if the dig would
 /// have to flip an existing constrained subsegment.
 ///
-/// Port of `constrainededge()`.
+/// Counterpart to `constrainededge()`.
 pub fn constrained_edge(
     mesh: &mut CdtMesh,
     starttri: &mut Otri,
@@ -459,7 +459,7 @@ pub fn constrained_edge(
 // --- insertsegment -------------------------------------------------------
 
 /// Insert one PSLG segment connecting two vertices that already exist in
-/// the mesh. Port of `insertsegment()`.
+/// the mesh. Counterpart to `insertsegment()`.
 ///
 /// Returns [`SegmentInsertError::SelfIntersection`] if the segment would
 /// cross an existing constrained subseg, or
@@ -554,7 +554,7 @@ fn locate_vertex(mesh: &mut CdtMesh, v: VertexId) -> Result<Otri, VertexId> {
 /// and rewrites each segment's endpoints through it. Degenerate
 /// (canonically-self-loop) segments after remap are silently skipped.
 ///
-/// Port of `formskeleton()`.
+/// Counterpart to `formskeleton()`.
 pub fn form_skeleton(
     mesh: &mut CdtMesh,
     pslg: &Pslg,
@@ -609,7 +609,7 @@ fn canonical_remap(mesh: &CdtMesh) -> Vec<VertexId> {
 }
 
 /// Cover every convex-hull edge with a subseg if it isn't already
-/// constrained. Port of `markhull()`.
+/// constrained. Counterpart to `markhull()`.
 pub fn mark_hull(mesh: &mut CdtMesh, marker: i32) {
     // Start at the dummy: its neighbors[0] points at a real hull edge.
     let mut hulltri = mesh.sym(Otri::new(DUMMY_TRI, 0));
